@@ -156,6 +156,52 @@ class TestYoutubeToMp3:
         assert written_metadata["source_url"] == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
         assert written_metadata["year"] == "2009"
 
+    def test_successful_conversion_uses_youtube_title_when_output_tags_fall_back_to_filename(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("tools.youtube_audio_tool.get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr("tools.youtube_audio_tool.check_youtube_audio_requirements", lambda: True)
+        monkeypatch.setattr("tools.youtube_audio_tool._mutagen_available", lambda: True)
+
+        def fake_run(command, capture_output, text, timeout):
+            if command[0] == "yt-dlp" and "--dump-single-json" in command:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "id": "dQw4w9WgXcQ",
+                            "title": "Rick Astley - Never Gonna Give You Up (Official Video)",
+                            "uploader": "Rick Astley",
+                            "channel": "Rick Astley",
+                            "upload_date": "20091025",
+                        }
+                    ),
+                    stderr="",
+                )
+            if command[0] == "yt-dlp":
+                output_path = Path(command[command.index("-o") + 1])
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(b"raw-audio")
+                return subprocess.CompletedProcess(command, 0, stdout="downloaded", stderr="")
+            if command[0] == "ffmpeg":
+                output_path = Path(command[-1])
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(b"mp3-audio")
+                return subprocess.CompletedProcess(command, 0, stdout="converted", stderr="")
+            raise AssertionError(f"unexpected command: {command}")
+
+        monkeypatch.setattr("tools.youtube_audio_tool.subprocess.run", fake_run)
+        monkeypatch.setattr(
+            "tools.youtube_audio_tool._extract_media_info",
+            lambda path: {"title": path.stem, "artist": None, "warnings": []},
+        )
+        monkeypatch.setattr("tools.youtube_audio_tool._write_id3_tags", lambda path, metadata: None)
+
+        result = json.loads(youtube_to_mp3("https://www.youtube.com/watch?v=dQw4w9WgXcQ"))
+
+        assert result["success"] is True
+        assert result["title"] == "Never Gonna Give You Up"
+        assert result["artist"] == "Rick Astley"
+
     def test_conversion_failure_returns_structured_error(self, monkeypatch, tmp_path):
         monkeypatch.setattr("tools.youtube_audio_tool.get_hermes_home", lambda: tmp_path)
         monkeypatch.setattr("tools.youtube_audio_tool.check_youtube_audio_requirements", lambda: True)

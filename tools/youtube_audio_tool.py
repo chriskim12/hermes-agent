@@ -333,7 +333,16 @@ def youtube_to_mp3(url: str, preferred_bitrate: str = "320k", task_id: str | Non
 
         media_info = _extract_media_info(processed_path)
         warnings = metadata_warnings + list(media_info.get("warnings", []))
-        title = media_info.get("title") or metadata_title or processed_path.stem
+        raw_title = media_info.get("title")
+        derived_title = None
+        if raw_title:
+            normalized_raw_title = cleanup_youtube_title(str(raw_title).strip())
+            if normalized_raw_title != processed_path.stem:
+                derived_title = normalized_raw_title
+        if not derived_title and metadata_title:
+            inferred_from_metadata = infer_artist_title(metadata_title)
+            derived_title = inferred_from_metadata["title"] or metadata_title
+        title = derived_title or processed_path.stem
         artist = media_info.get("artist") or metadata_artist
         artist_inferred = bool(media_info.get("artist_inferred", False))
         if not media_info.get("artist") and metadata_artist:
