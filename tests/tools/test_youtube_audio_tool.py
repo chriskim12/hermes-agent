@@ -93,6 +93,21 @@ class TestYoutubeToMp3:
         monkeypatch.setattr("tools.youtube_audio_tool._mutagen_available", lambda: True)
 
         def fake_run(command, capture_output, text, timeout):
+            if command[0] == "yt-dlp" and "--dump-single-json" in command:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "id": "dQw4w9WgXcQ",
+                            "title": "Rick Astley - Never Gonna Give You Up (Official Video)",
+                            "uploader": "Rick Astley",
+                            "channel": "Rick Astley",
+                            "upload_date": "20091025",
+                        }
+                    ),
+                    stderr="",
+                )
             if command[0] == "yt-dlp":
                 output_path = Path(command[command.index("-o") + 1])
                 output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -105,10 +120,17 @@ class TestYoutubeToMp3:
                 return subprocess.CompletedProcess(command, 0, stdout="converted", stderr="")
             raise AssertionError(f"unexpected command: {command}")
 
+        metadata_calls = []
+
         monkeypatch.setattr("tools.youtube_audio_tool.subprocess.run", fake_run)
         monkeypatch.setattr(
             "tools.youtube_audio_tool._extract_media_info",
-            lambda path: {"title": "Never Gonna Give You Up", "artist": "Rick Astley", "warnings": []},
+            lambda path: {"title": "Never Gonna Give You Up", "artist": None, "warnings": []},
+        )
+        monkeypatch.setattr(
+            "tools.youtube_audio_tool._write_id3_tags",
+            lambda path, metadata: metadata_calls.append((path, metadata)),
+            raising=False,
         )
 
         result = json.loads(
@@ -121,13 +143,18 @@ class TestYoutubeToMp3:
         assert result["success"] is True
         assert result["title"] == "Never Gonna Give You Up"
         assert result["artist"] == "Rick Astley"
-        assert result["artist_inferred"] is False
+        assert result["artist_inferred"] is True
         assert result["source_url"] == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
         assert result["video_id"] == "dQw4w9WgXcQ"
-        assert result["warnings"] == []
-        assert result["file_path"].endswith(".mp3")
         assert Path(result["file_path"]).exists()
         assert Path(result["file_path"]).parent == tmp_path / "media_cache" / "youtube-audio" / "processed"
+        assert metadata_calls, "expected ID3 tag writer to be called"
+        written_path, written_metadata = metadata_calls[0]
+        assert Path(written_path) == Path(result["file_path"])
+        assert written_metadata["artist"] == "Rick Astley"
+        assert written_metadata["title"] == "Never Gonna Give You Up"
+        assert written_metadata["source_url"] == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        assert written_metadata["year"] == "2009"
 
     def test_conversion_failure_returns_structured_error(self, monkeypatch, tmp_path):
         monkeypatch.setattr("tools.youtube_audio_tool.get_hermes_home", lambda: tmp_path)
@@ -135,6 +162,13 @@ class TestYoutubeToMp3:
         monkeypatch.setattr("tools.youtube_audio_tool._mutagen_available", lambda: True)
 
         def fake_run(command, capture_output, text, timeout):
+            if command[0] == "yt-dlp" and "--dump-single-json" in command:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=json.dumps({"id": "dQw4w9WgXcQ", "title": "Song", "uploader": "Uploader"}),
+                    stderr="",
+                )
             if command[0] == "yt-dlp":
                 output_path = Path(command[command.index("-o") + 1])
                 output_path.parent.mkdir(parents=True, exist_ok=True)

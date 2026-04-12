@@ -170,6 +170,63 @@ def _extract_media_info(path: Path) -> dict[str, Any]:
     }
 
 
+def _fetch_youtube_metadata(url: str, video_id: str) -> dict[str, Any]:
+    result = subprocess.run(
+        ["yt-dlp", "--dump-single-json", "--no-playlist", url],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        return {
+            "id": video_id,
+            "warnings": [
+                (result.stderr or result.stdout or "yt-dlp metadata lookup failed").strip()
+            ],
+        }
+    try:
+        payload = json.loads(result.stdout or "{}")
+        if not isinstance(payload, dict):
+            raise ValueError("metadata payload was not an object")
+        payload.setdefault("id", video_id)
+        return payload
+    except Exception as exc:
+        return {"id": video_id, "warnings": [f"metadata lookup parse failed: {exc}"]}
+
+
+def _year_from_upload_date(upload_date: Any) -> str | None:
+    if not upload_date:
+        return None
+    text = str(upload_date).strip()
+    if len(text) >= 4 and text[:4].isdigit():
+        return text[:4]
+    return None
+
+
+def _write_id3_tags(path: Path, metadata: dict[str, Any]) -> None:
+    from mutagen.id3 import ID3, COMM, TALB, TDRC, TIT2, TPE1
+
+    tags = ID3()
+    title = (metadata.get("title") or "").strip()
+    artist = (metadata.get("artist") or "").strip()
+    album = (metadata.get("album") or "").strip()
+    source_url = (metadata.get("source_url") or "").strip()
+    year = (metadata.get("year") or "").strip()
+
+    if title:
+        tags.add(TIT2(encoding=3, text=title))
+    if artist:
+        tags.add(TPE1(encoding=3, text=artist))
+    if album:
+        tags.add(TALB(encoding=3, text=album))
+    if year:
+        tags.add(TDRC(encoding=3, text=year))
+    if source_url:
+        tags.add(COMM(encoding=3, lang="eng", desc="source_url", text=source_url))
+
+    tags.save(path)
+
+
 def youtube_to_mp3(url: str, preferred_bitrate: str = "320k", task_id: str | None = None) -> str:
     del task_id
     if not is_supported_youtube_url(url):
@@ -205,6 +262,13 @@ def youtube_to_mp3(url: str, preferred_bitrate: str = "320k", task_id: str | Non
     incoming_path = paths["incoming"] / f"{video_id}.source"
     processed_path = paths["processed"] / f"{video_id}-{preferred_bitrate}.mp3"
     failed_path = paths["failed"] / f"{video_id}-{preferred_bitrate}.source"
+    youtube_metadata = _fetch_youtube_metadata(url, video_id)
+    metadata_warnings = list(youtube_metadata.get("warnings") or [])
+    metadata_title = cleanup_youtube_title(str(youtube_metadata.get("title") or "").strip())
+    metadata_artist = (
+        str(youtube_metadata.get("uploader") or youtube_metadata.get("channel") or "").strip() or None
+    )
+    metadata_year = _year_from_upload_date(youtube_metadata.get("upload_date"))
 
     try:
         download_result = subprocess.run(
@@ -259,12 +323,6 @@ def youtube_to_mp3(url: str, preferred_bitrate: str = "320k", task_id: str | Non
         if incoming_path.exists():
             incoming_path.unlink()
 
-        media_info = _extract_media_info(processed_path)
-        warnings = list(media_info.get("warnings", []))
-        title = media_info.get("title") or processed_path.stem
-        artist = media_info.get("artist")
-        artist_inferred = bool(media_info.get("artist_inferred", False))
-
         if not processed_path.exists():
             return _error_payload(
                 "missing_output",
@@ -272,6 +330,25 @@ def youtube_to_mp3(url: str, preferred_bitrate: str = "320k", task_id: str | Non
                 source_url=url,
                 video_id=video_id,
             )
+
+        media_info = _extract_media_info(processed_path)
+        warnings = metadata_warnings + list(media_info.get("warnings", []))
+        title = media_info.get("title") or metadata_title or processed_path.stem
+        artist = media_info.get("artist") or metadata_artist
+        artist_inferred = bool(media_info.get("artist_inferred", False))
+        if not media_info.get("artist") and metadata_artist:
+            artist_inferred = True
+            warnings.append("artist inferred from uploader/channel metadata")
+
+        _write_id3_tags(
+            processed_path,
+            {
+                "title": title,
+                "artist": artist,
+                "source_url": url,
+                "year": metadata_year,
+            },
+        )
 
         return json.dumps(
             {
