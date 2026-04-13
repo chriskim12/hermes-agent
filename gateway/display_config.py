@@ -30,6 +30,7 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
     "show_reasoning": False,
     "tool_preview_length": 0,
+    "iteration_report_every": 0,
     "streaming": None,  # None = follow top-level streaming config
 }
 
@@ -45,6 +46,7 @@ _TIER_HIGH = {
     "tool_progress": "all",
     "show_reasoning": False,
     "tool_preview_length": 40,
+    "iteration_report_every": 0,
     "streaming": None,  # follow global
 }
 
@@ -52,6 +54,7 @@ _TIER_MEDIUM = {
     "tool_progress": "new",
     "show_reasoning": False,
     "tool_preview_length": 40,
+    "iteration_report_every": 0,
     "streaming": None,
 }
 
@@ -59,6 +62,7 @@ _TIER_LOW = {
     "tool_progress": "off",
     "show_reasoning": False,
     "tool_preview_length": 40,
+    "iteration_report_every": 0,
     "streaming": False,
 }
 
@@ -66,6 +70,7 @@ _TIER_MINIMAL = {
     "tool_progress": "off",
     "show_reasoning": False,
     "tool_preview_length": 0,
+    "iteration_report_every": 0,
     "streaming": False,
 }
 
@@ -198,7 +203,7 @@ def _normalise(setting: str, value: Any) -> Any:
         if isinstance(value, str):
             return value.lower() in ("true", "1", "yes", "on")
         return bool(value)
-    if setting == "tool_preview_length":
+    if setting in ("tool_preview_length", "iteration_report_every"):
         try:
             return int(value)
         except (TypeError, ValueError):

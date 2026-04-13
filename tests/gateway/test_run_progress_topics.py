@@ -362,6 +362,22 @@ class CommentaryAgent:
         }
 
 
+class IterationReportingAgent:
+    def __init__(self, **kwargs):
+        self.step_callback = kwargs.get("step_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        for iteration in range(1, 12):
+            if self.step_callback:
+                self.step_callback(iteration, [{"name": "read_file", "result": '{"content": "ok"}'}])
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 11,
+        }
+
+
 class PreviewedResponseAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -405,6 +421,8 @@ async def _run_with_agent(
     pending_text=None,
     config_data=None,
 ):
+    monkeypatch.setenv("HERMES_MAX_ITERATIONS", "90")
+
     if config_data:
         import yaml
 
@@ -543,6 +561,22 @@ async def test_run_agent_interim_commentary_works_with_tool_progress_off(monkeyp
 
     assert result.get("already_sent") is not True
     assert any(call["content"] == "I'll inspect the repo first." for call in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_surfaces_iteration_reports_every_ten_steps(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        IterationReportingAgent,
+        session_id="sess-iteration-report",
+        config_data={"display": {"iteration_report_every": 10}},
+    )
+
+    assert result.get("already_sent") is not True
+    reports = [call["content"] for call in adapter.sent if "10/90" in call["content"]]
+    assert reports, adapter.sent
+    assert any("iteration" in report.lower() for report in reports)
 
 
 @pytest.mark.asyncio
