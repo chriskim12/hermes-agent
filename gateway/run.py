@@ -3670,7 +3670,7 @@ class GatewayRunner:
                     synth_text = _format_gateway_process_notification(evt)
                     if synth_text:
                         try:
-                            await self._inject_watch_notification(synth_text, event)
+                            await self._inject_watch_notification(synth_text, evt, event)
                         except Exception as e2:
                             logger.error("Watch notification injection error: %s", e2)
             except Exception as e:
@@ -7142,21 +7142,42 @@ class GatewayRunner:
             return prefix
         return user_text
 
-    async def _inject_watch_notification(self, synth_text: str, original_event) -> None:
-        """Inject a watch-pattern notification as a synthetic message event.
+    def _resolve_watch_notification_source(self, evt: dict, fallback_event):
+        """Resolve the routing source for a watch notification.
 
-        Uses the source from the original user event to route the notification
-        back to the correct chat/adapter.
+        Prefer the owning process session's watcher metadata so watch-pattern
+        alerts return to the thread that started the process. Fall back to the
+        currently handled event only when the process owner cannot be resolved.
         """
-        source = getattr(original_event, "source", None)
+        session_id = evt.get("session_id", "") if evt else ""
+        if session_id:
+            try:
+                from gateway.config import Platform
+                from gateway.session import SessionSource
+                from tools.process_registry import process_registry
+
+                session = process_registry.get(session_id)
+                platform_name = getattr(session, "watcher_platform", "") if session else ""
+                chat_id = getattr(session, "watcher_chat_id", "") if session else ""
+                if platform_name and chat_id:
+                    return SessionSource(
+                        platform=Platform(platform_name),
+                        chat_id=str(chat_id),
+                        thread_id=getattr(session, "watcher_thread_id", "") or None,
+                        user_id=getattr(session, "watcher_user_id", "") or None,
+                        user_name=getattr(session, "watcher_user_name", "") or None,
+                    )
+            except Exception as e:
+                logger.debug("Failed to resolve watch notification owner for %s: %s", session_id, e)
+
+        return getattr(fallback_event, "source", None)
+
+    async def _inject_watch_notification(self, synth_text: str, evt: dict, fallback_event) -> None:
+        """Inject a watch-pattern notification as a synthetic message event."""
+        source = self._resolve_watch_notification_source(evt, fallback_event)
         if not source:
             return
-        platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        adapter = None
-        for p, a in self.adapters.items():
-            if p.value == platform_name:
-                adapter = a
-                break
+        adapter = self.adapters.get(source.platform)
         if not adapter:
             return
         try:
@@ -7167,7 +7188,12 @@ class GatewayRunner:
                 source=source,
                 internal=True,
             )
-            logger.info("Watch pattern notification — injecting for %s", platform_name)
+            logger.info(
+                "Watch pattern notification — injecting for %s chat=%s thread=%s",
+                source.platform.value,
+                source.chat_id,
+                source.thread_id,
+            )
             await adapter.handle_message(synth_event)
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
