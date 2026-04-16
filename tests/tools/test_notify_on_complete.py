@@ -12,10 +12,13 @@ import json
 import os
 import queue
 import time
-import pytest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from gateway.work_state import WorkRecord, WorkStateStore
 from tools.process_registry import (
     ProcessRegistry,
     ProcessSession,
@@ -328,6 +331,47 @@ class TestCompletionConsumed:
         result = registry.poll("proc_poll")
         assert result["status"] == "exited"
         assert registry.is_completion_consumed("proc_poll")
+
+    def test_poll_updates_matching_delegated_work_record_on_exit(self, registry, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        store = WorkStateStore(tmp_path / "gateway_work_state.json")
+        now = datetime.now(timezone.utc)
+        store.upsert(
+            WorkRecord(
+                work_id="wk-delegated-poll-1",
+                title="delegated poll finish",
+                objective="poll should close delegated work on exited process observation",
+                owner="hermes",
+                executor="omx",
+                mode="delegated",
+                owner_session_id="agent:discord:thread:test",
+                state="blocked",
+                started_at=now,
+                last_progress_at=now,
+                next_action="Resume delegated run",
+                executor_session_id="proc_poll_finish",
+                repo_path="/repo/demo",
+                worktree_path="/repo/demo",
+                proof="clawhip:session.blocked",
+            )
+        )
+
+        s = _make_session(sid="proc_poll_finish", notify_on_complete=True, output="done")
+        s.exited = True
+        s.exit_code = 0
+        registry._finished[s.id] = s
+
+        result = registry.poll("proc_poll_finish")
+        assert result["status"] == "exited"
+
+        refreshed = WorkStateStore(tmp_path / "gateway_work_state.json")
+        record = refreshed.resolve_delegated_signal_candidate(
+            work_id="wk-delegated-poll-1",
+            live_only=False,
+        )["record"]
+        assert record.state == "finished"
+        assert record.proof == "background_process_exit:0"
+        assert record.next_action == "Inspect the completed OMX run"
 
     def test_log_marks_completion_consumed(self, registry):
         """read_log() on exited session marks as consumed."""

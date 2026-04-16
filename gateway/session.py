@@ -376,6 +376,15 @@ class SessionEntry:
     # this session (create a new session_id) so the user starts fresh.
     # Set by /stop to break stuck-resume loops (#7536).
     suspended: bool = False
+
+    # Persisted crash/restart recovery marker. Unlike ``suspended``, interrupted
+    # sessions keep the same session_id/transcript and resume on the next turn.
+    interrupted: bool = False
+    interrupted_reason: Optional[str] = None
+
+    # One-shot in-memory signal consumed by the message handler to inject a
+    # resume note into the next prompt. Not persisted.
+    was_interrupted: bool = False
     
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -396,6 +405,8 @@ class SessionEntry:
             "cost_status": self.cost_status,
             "memory_flushed": self.memory_flushed,
             "suspended": self.suspended,
+            "interrupted": self.interrupted,
+            "interrupted_reason": self.interrupted_reason,
         }
         if self.origin:
             result["origin"] = self.origin.to_dict()
@@ -433,6 +444,8 @@ class SessionEntry:
             cost_status=data.get("cost_status", "unknown"),
             memory_flushed=data.get("memory_flushed", False),
             suspended=data.get("suspended", False),
+            interrupted=data.get("interrupted", False),
+            interrupted_reason=data.get("interrupted_reason"),
         )
 
 
@@ -715,6 +728,12 @@ class SessionStore:
                 else:
                     reset_reason = self._should_reset(entry, source)
                 if not reset_reason:
+                    if entry.interrupted:
+                        entry.updated_at = now
+                        entry.interrupted = False
+                        entry.was_interrupted = True
+                        self._save()
+                        return entry
                     entry.updated_at = now
                     self._save()
                     return entry
@@ -785,6 +804,45 @@ class SessionStore:
                 if last_prompt_tokens is not None:
                     entry.last_prompt_tokens = last_prompt_tokens
                 self._save()
+
+    def get_session_entry(self, session_key: str) -> Optional[SessionEntry]:
+        """Return a copy of the persisted session entry for *session_key*."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if not entry:
+                return None
+            return SessionEntry.from_dict(entry.to_dict())
+
+    def mark_interrupted_sessions(
+        self,
+        session_keys: list[str],
+        reason: str = "restart",
+    ) -> int:
+        """Mark exact sessions as interrupted so the next turn resumes them.
+
+        Used for gateway restart/crash recovery. Interrupted sessions preserve
+        their session_id and transcript; the next access clears the persisted
+        flag and exposes a one-shot ``was_interrupted`` marker to the caller.
+        """
+        count = 0
+        keys = {key for key in session_keys if key}
+        if not keys:
+            return 0
+
+        with self._lock:
+            self._ensure_loaded_locked()
+            for key in keys:
+                entry = self._entries.get(key)
+                if not entry:
+                    continue
+                entry.interrupted = True
+                entry.interrupted_reason = reason
+                entry.was_interrupted = False
+                count += 1
+            if count:
+                self._save()
+        return count
 
     def suspend_session(self, session_key: str) -> bool:
         """Mark a session as suspended so it auto-resets on next access.

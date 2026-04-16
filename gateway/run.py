@@ -268,6 +268,7 @@ from gateway.session import (
     build_session_key,
 )
 from gateway.delivery import DeliveryRouter
+from gateway.work_state import WorkRecord, WorkStateStore
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -596,6 +597,7 @@ class GatewayRunner:
             self.config.sessions_dir, self.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(key),
         )
+        self.work_state_store = WorkStateStore()
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
         self._shutdown_event = asyncio.Event()
@@ -1368,6 +1370,611 @@ class GatewayRunner:
             if agent is not _AGENT_PENDING_SENTINEL
         }
 
+    def _running_sessions_checkpoint_path(self):
+        return _hermes_home / ".running_sessions.json"
+
+    def _persist_running_sessions_checkpoint(self) -> None:
+        """Persist the exact in-flight gateway session keys for crash recovery."""
+        path = self._running_sessions_checkpoint_path()
+        session_keys = sorted(str(key) for key in self._running_agents.keys() if key)
+        if not session_keys:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                logger.debug("Failed removing running-session checkpoint: %s", e)
+            return
+
+        payload = {"session_keys": session_keys}
+        try:
+            path.write_text(json.dumps(payload), encoding="utf-8")
+        except Exception as e:
+            logger.debug("Failed writing running-session checkpoint: %s", e)
+
+    def _set_running_agent_entry(
+        self,
+        session_key: str,
+        agent: Any,
+        *,
+        update_timestamp: bool = True,
+    ) -> None:
+        self._running_agents[session_key] = agent
+        if update_timestamp:
+            self._running_agents_ts[session_key] = time.time()
+        self._persist_running_sessions_checkpoint()
+
+    def _clear_running_agent_entry(
+        self,
+        session_key: str,
+        *,
+        clear_timestamp: bool = True,
+    ) -> None:
+        if session_key in self._running_agents:
+            del self._running_agents[session_key]
+        if clear_timestamp:
+            self._running_agents_ts.pop(session_key, None)
+        self._persist_running_sessions_checkpoint()
+
+    def _recover_interrupted_sessions_from_checkpoint(self) -> int:
+        """Recover exact interrupted session keys from the previous gateway run."""
+        path = self._running_sessions_checkpoint_path()
+        if not path.exists():
+            return 0
+
+        session_keys: list[str] = []
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                raw_keys = payload.get("session_keys", [])
+                if isinstance(raw_keys, list):
+                    session_keys = [str(key) for key in raw_keys if key]
+        except Exception as e:
+            logger.warning("Failed reading running-session checkpoint: %s", e)
+        finally:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                logger.debug("Failed removing running-session checkpoint: %s", e)
+
+        if not session_keys:
+            return 0
+        recovered = self.session_store.mark_interrupted_sessions(session_keys, reason="restart")
+        try:
+            work_state_store = getattr(self, "work_state_store", None)
+            if work_state_store is not None:
+                work_state_store.mark_owner_sessions_blocked(
+                    session_keys,
+                    next_action="Continue the interrupted turn",
+                    proof="gateway_restart_checkpoint",
+                )
+        except Exception:
+            logger.debug("Failed to mark blocked work-state records during restart recovery", exc_info=True)
+        return recovered
+
+    async def handle_owner_ingress_packet(
+        self,
+        payload: dict,
+        *,
+        route_name: str = "",
+        delivery_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Validate and inject a bounded owner-ingress wake packet."""
+        payload = payload or {}
+        work_id = str(payload.get("work_id", "")).strip()
+        owner = str(payload.get("owner", "")).strip()
+        owner_session_id = str(payload.get("owner_session_id", "")).strip() or None
+        state = str(payload.get("state", "")).strip()
+        next_action = str(payload.get("next_action", "")).strip()
+        proof = str(payload.get("proof", "")).strip()
+
+        if not work_id or owner != "hermes" or not next_action or not proof:
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": "invalid_owner_ingress_packet",
+                "resolution": "invalid",
+                "http_status": 400,
+            }
+
+        from gateway.work_state import WAKE_STATES
+
+        if state not in WAKE_STATES:
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": "invalid_owner_ingress_state",
+                "resolution": "invalid",
+                "http_status": 400,
+            }
+
+        work_state_store = getattr(self, "work_state_store", None)
+        if work_state_store is None:
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": "work_state_unavailable",
+                "resolution": "invalid",
+                "http_status": 503,
+            }
+
+        resolution = work_state_store.resolve_owner_ingress_candidate(
+            work_id,
+            owner_session_id=owner_session_id,
+        )
+        status = resolution.get("status")
+        if status == "missing":
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": resolution.get("reason", "missing_or_closed_work_record"),
+                "resolution": "missing",
+                "http_status": 404,
+            }
+        if status == "ambiguous":
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": resolution.get("reason", "ambiguous_owner_resolution"),
+                "resolution": "ambiguous",
+                "http_status": 409,
+            }
+
+        record = resolution.get("record")
+        if record is None:
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": "missing_or_closed_work_record",
+                "resolution": "missing",
+                "http_status": 404,
+            }
+
+        session_entry = self.session_store.get_session_entry(record.owner_session_id)
+        if not session_entry or not getattr(session_entry, "origin", None):
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": "missing_owner_session_source",
+                "resolution": "missing",
+                "http_status": 404,
+            }
+
+        target_source = session_entry.origin
+        if getattr(target_source, "chat_type", "") == "thread" and not getattr(target_source, "thread_id", None):
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": "missing_owner_thread_source",
+                "resolution": "missing",
+                "http_status": 404,
+            }
+
+        adapter = self.adapters.get(target_source.platform)
+        if adapter is None or not hasattr(adapter, "handle_message"):
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": "target_platform_unavailable",
+                "resolution": "missing",
+                "http_status": 503,
+            }
+
+        ingress_message = (
+            "[System note: Owner ingress signal accepted. "
+            f"route={route_name or 'owner-ingress'} "
+            f"work_id={work_id} state={state} "
+            f"next_action={next_action} "
+            f"proof={proof}. "
+            "Resume only this targeted owner work record and do not broad-wake any other session.]"
+        )
+        internal_event = MessageEvent(
+            text=ingress_message,
+            message_type=MessageType.TEXT,
+            source=target_source,
+            message_id=f"owner-ingress:{delivery_id or work_id}",
+            raw_message=payload,
+            internal=True,
+        )
+        await adapter.handle_message(internal_event)
+        return {
+            "status": "accepted",
+            "verdict": "accepted",
+            "reason": "eligible",
+            "resolution": "single_match",
+            "target_session_key": record.owner_session_id,
+            "work_id": work_id,
+            "http_status": 202,
+        }
+
+    async def handle_delegated_ingress_packet(
+        self,
+        payload: dict,
+        *,
+        route_name: str = "",
+        delivery_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Resolve an OMX/clawhip delegated signal back to one owner work record."""
+        payload = payload or {}
+        owner = str(payload.get("owner", "")).strip()
+        executor = str(payload.get("executor", "")).strip() or "omx"
+        work_id = str(payload.get("work_id", "")).strip() or None
+        owner_session_id = str(payload.get("owner_session_id", "")).strip() or None
+        executor_session_id = str(payload.get("executor_session_id", "")).strip() or None
+        tmux_session = str(payload.get("tmux_session", payload.get("tmuxSession", ""))).strip() or None
+        repo_path = str(payload.get("repo_path", "")).strip() or None
+        worktree_path = str(payload.get("worktree_path", "")).strip() or None
+        state = str(payload.get("state", "")).strip() or str(payload.get("normalized_event", "")).strip().replace("-", "_")
+        next_action = str(payload.get("next_action", "")).strip()
+        proof = str(payload.get("proof", "")).strip()
+
+        if owner != "hermes" or executor != "omx" or not next_action or not proof:
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": "invalid_delegated_ingress_packet",
+                "resolution": "invalid",
+                "http_status": 400,
+            }
+
+        from gateway.work_state import WAKE_STATES
+
+        if state not in WAKE_STATES:
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": "invalid_delegated_ingress_state",
+                "resolution": "invalid",
+                "http_status": 400,
+            }
+
+        work_state_store = getattr(self, "work_state_store", None)
+        if work_state_store is None:
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": "work_state_unavailable",
+                "resolution": "invalid",
+                "http_status": 503,
+            }
+
+        resolution = work_state_store.resolve_delegated_signal_candidate(
+            work_id=work_id,
+            owner_session_id=owner_session_id,
+            executor_session_id=executor_session_id,
+            tmux_session=tmux_session,
+            repo_path=repo_path,
+            worktree_path=worktree_path,
+            live_only=True,
+        )
+        status = resolution.get("status")
+        if status == "missing":
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": resolution.get("reason", "missing_or_closed_delegated_work_record"),
+                "resolution": "missing",
+                "http_status": 404,
+            }
+        if status == "ambiguous":
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": resolution.get("reason", "ambiguous_delegated_work_resolution"),
+                "resolution": "ambiguous",
+                "http_status": 409,
+            }
+
+        record = resolution.get("record")
+        if record is None:
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": "missing_or_closed_delegated_work_record",
+                "resolution": "missing",
+                "http_status": 404,
+            }
+
+        now = datetime.now().astimezone()
+        if state == "retry_needed":
+            dispatch_result = self._dispatch_delegated_retry_followup(
+                record,
+                next_action=next_action,
+                proof=proof,
+                route_name=route_name,
+            )
+            if dispatch_result.get("status") == "accepted":
+                dispatch_route = str(dispatch_result.get("route", "executor_surface") or "executor_surface")
+                target_executor_id = (
+                    dispatch_result.get("target")
+                    or executor_session_id
+                    or record.executor_session_id
+                    or tmux_session
+                    or record.tmux_session
+                )
+                work_state_store.update_record(
+                    record.work_id,
+                    record.owner_session_id,
+                    state="running",
+                    last_progress_at=now,
+                    next_action="Wait for delegated executor retry outcome",
+                    proof=f"retry_dispatch:{dispatch_route}|source={proof}",
+                    executor_session_id=executor_session_id or record.executor_session_id,
+                    tmux_session=tmux_session or record.tmux_session,
+                    repo_path=repo_path or record.repo_path,
+                    worktree_path=worktree_path or record.worktree_path,
+                )
+                return {
+                    "status": "accepted",
+                    "verdict": "accepted",
+                    "reason": "eligible",
+                    "resolution": "single_match",
+                    "reaction": "executor_first",
+                    "dispatch_route": dispatch_route,
+                    "target_executor_id": target_executor_id,
+                    "work_id": record.work_id,
+                    "http_status": 202,
+                }
+        else:
+            dispatch_result = None
+
+        work_state_store.update_record(
+            record.work_id,
+            record.owner_session_id,
+            state=state,
+            last_progress_at=now,
+            next_action=next_action,
+            proof=proof,
+            executor_session_id=executor_session_id or record.executor_session_id,
+            tmux_session=tmux_session or record.tmux_session,
+            repo_path=repo_path or record.repo_path,
+            worktree_path=worktree_path or record.worktree_path,
+        )
+
+        owner_result = await self.handle_owner_ingress_packet(
+            {
+                "work_id": record.work_id,
+                "owner": "hermes",
+                "owner_session_id": record.owner_session_id,
+                "state": state,
+                "next_action": next_action,
+                "proof": proof,
+            },
+            route_name=route_name,
+            delivery_id=delivery_id,
+        )
+        owner_result["work_id"] = record.work_id
+        if state == "retry_needed":
+            owner_result["reaction"] = "owner_fallback"
+            if dispatch_result:
+                owner_result["dispatch_reason"] = dispatch_result.get("reason")
+        else:
+            owner_result["reaction"] = "owner_second"
+        return owner_result
+
+    def _dispatch_delegated_retry_followup(
+        self,
+        record,
+        *,
+        next_action: str,
+        proof: str,
+        route_name: str = "",
+    ) -> Dict[str, Any]:
+        message = (
+            "[Hermes system note] retry-needed signal accepted. "
+            f"route={route_name or 'delegated-ingress'} "
+            f"work_id={record.work_id} proof={proof}. "
+            f"Execute exactly one bounded retry/follow-up on this OMX lane. Next action: {next_action}. "
+            "If the issue remains unresolved after this attempt, emit handoff-needed instead of asking the human directly."
+        )
+
+        executor_session_id = getattr(record, "executor_session_id", None)
+        if executor_session_id:
+            try:
+                from tools.process_registry import process_registry
+
+                session = process_registry.get(executor_session_id)
+                if session is not None and not getattr(session, "exited", False):
+                    result = process_registry.submit_stdin(executor_session_id, message)
+                    if result.get("status") == "ok":
+                        return {
+                            "status": "accepted",
+                            "route": "process_stdin",
+                            "target": executor_session_id,
+                        }
+            except Exception:
+                logger.debug(
+                    "Failed to dispatch retry-needed follow-up to executor process %s",
+                    executor_session_id,
+                    exc_info=True,
+                )
+
+        tmux_session = getattr(record, "tmux_session", None)
+        if tmux_session:
+            try:
+                import subprocess
+
+                has_session = subprocess.run(
+                    ["tmux", "has-session", "-t", tmux_session],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if has_session.returncode != 0:
+                    return {
+                        "status": "unavailable",
+                        "reason": "tmux_session_missing",
+                    }
+
+                send = subprocess.run(
+                    ["tmux", "send-keys", "-t", tmux_session, message, "C-m"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if send.returncode == 0:
+                    return {
+                        "status": "accepted",
+                        "route": "tmux_send_keys",
+                        "target": tmux_session,
+                    }
+                return {
+                    "status": "unavailable",
+                    "reason": "tmux_send_failed",
+                }
+            except FileNotFoundError:
+                return {
+                    "status": "unavailable",
+                    "reason": "tmux_unavailable",
+                }
+            except Exception:
+                logger.debug(
+                    "Failed to dispatch retry-needed follow-up to tmux session %s",
+                    tmux_session,
+                    exc_info=True,
+                )
+                return {
+                    "status": "unavailable",
+                    "reason": "tmux_send_failed",
+                }
+
+        return {
+            "status": "unavailable",
+            "reason": "no_live_executor_surface",
+        }
+
+    def _mark_work_record_delegated(
+        self,
+        work_id: Optional[str],
+        session_key: str,
+        *,
+        executor_session_id: Optional[str] = None,
+        tmux_session: Optional[str] = None,
+        repo_path: Optional[str] = None,
+        worktree_path: Optional[str] = None,
+        next_action: str = "Resume the delegated OMX work",
+        proof: str = "delegated_handoff",
+    ) -> bool:
+        if not work_id:
+            return False
+        work_state_store = getattr(self, "work_state_store", None)
+        if work_state_store is None:
+            return False
+        now = datetime.now().astimezone()
+        return work_state_store.update_record(
+            work_id,
+            session_key,
+            executor="omx",
+            mode="delegated",
+            state="running",
+            last_progress_at=now,
+            executor_session_id=executor_session_id,
+            tmux_session=tmux_session,
+            repo_path=repo_path,
+            worktree_path=worktree_path,
+            next_action=next_action,
+            proof=proof,
+        )
+
+    def _update_delegated_work_for_process(
+        self,
+        *,
+        executor_session_id: str,
+        exit_code: Optional[int],
+    ) -> bool:
+        if not executor_session_id:
+            return False
+        work_state_store = getattr(self, "work_state_store", None)
+        if work_state_store is None:
+            return False
+        resolution = work_state_store.resolve_delegated_signal_candidate(
+            executor_session_id=executor_session_id,
+            live_only=True,
+        )
+        if resolution.get("status") != "single_match":
+            return False
+        record = resolution.get("record")
+        if record is None:
+            return False
+        now = datetime.now().astimezone()
+        succeeded = exit_code == 0
+        return work_state_store.update_record(
+            record.work_id,
+            record.owner_session_id,
+            state="finished" if succeeded else "failed",
+            last_progress_at=now,
+            next_action="Inspect the completed OMX run" if succeeded else "Inspect the failed OMX run",
+            proof=f"background_process_exit:{exit_code}",
+        )
+
+    def _begin_direct_work_record(
+        self,
+        *,
+        session_id: str,
+        session_key: str,
+        message_text: str,
+        platform: str,
+        event_message_id: Optional[str] = None,
+    ) -> Optional[str]:
+        work_state_store = getattr(self, "work_state_store", None)
+        if work_state_store is None:
+            return None
+        now = datetime.now().astimezone()
+        raw_token = str(event_message_id or int(now.timestamp() * 1000))
+        safe_token = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw_token).strip("-") or "turn"
+        work_id = f"wk-direct-{session_id}-{safe_token}"[:160]
+        preview = (message_text or "").strip().splitlines()[0] if (message_text or "").strip() else "Gateway direct work"
+        preview = preview[:160]
+        objective = (message_text or preview or "Gateway direct work")[:1000]
+        work_state_store.upsert(
+            WorkRecord(
+                work_id=work_id,
+                title=preview,
+                objective=objective,
+                owner="hermes",
+                executor="hermes",
+                mode="direct",
+                owner_session_id=session_key,
+                state="running",
+                started_at=now,
+                last_progress_at=now,
+                next_action=preview or "Continue the active direct work",
+                proof=f"message_ingress:{platform}",
+            )
+        )
+        return work_id
+
+    def _finish_direct_work_record(
+        self,
+        work_id: Optional[str],
+        session_key: str,
+        *,
+        failed: bool = False,
+    ) -> None:
+        if not work_id:
+            return
+        work_state_store = getattr(self, "work_state_store", None)
+        if work_state_store is None:
+            return
+        existing_records = work_state_store.find_matching_records(
+            work_id,
+            owner_session_id=session_key,
+            live_only=False,
+        )
+        existing = existing_records[0] if existing_records else None
+        if existing and (existing.mode != "direct" or existing.executor != "hermes"):
+            return
+        now = datetime.now().astimezone()
+        work_state_store.update_record(
+            work_id,
+            session_key,
+            state="failed" if failed else "finished",
+            last_progress_at=now,
+            proof="agent_failed" if failed else "agent_completed",
+        )
+
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
@@ -1819,29 +2426,24 @@ class GatewayRunner:
         except Exception as e:
             logger.warning("Process checkpoint recovery: %s", e)
 
-        # Suspend sessions that were active when the gateway last exited.
-        # This prevents stuck sessions from being blindly resumed on restart,
-        # which can create an unrecoverable loop (#7536).  Suspended sessions
-        # auto-reset on the next incoming message, giving the user a clean start.
-        #
-        # SKIP suspension after a clean (graceful) shutdown — the previous
-        # process already drained active agents, so sessions aren't stuck.
-        # This prevents unwanted auto-resets after `hermes update`,
-        # `hermes gateway restart`, or `/restart`.
+        # Recover exact in-flight gateway sessions from the runtime checkpoint.
+        # Unlike the old recently-active heuristic, this only touches sessions
+        # that were actually running when the previous process exited.
         _clean_marker = _hermes_home / ".clean_shutdown"
         if _clean_marker.exists():
-            logger.info("Previous gateway exited cleanly — skipping session suspension")
+            logger.info("Previous gateway exited cleanly — skipping interrupted-session recovery")
             try:
                 _clean_marker.unlink()
             except Exception:
                 pass
+            self._persist_running_sessions_checkpoint()
         else:
             try:
-                suspended = self.session_store.suspend_recently_active()
-                if suspended:
-                    logger.info("Suspended %d in-flight session(s) from previous run", suspended)
+                recovered_sessions = self._recover_interrupted_sessions_from_checkpoint()
+                if recovered_sessions:
+                    logger.info("Recovered %d interrupted session(s) from previous run", recovered_sessions)
             except Exception as e:
-                logger.warning("Session suspension on startup failed: %s", e)
+                logger.warning("Interrupted-session recovery on startup failed: %s", e)
 
         # Stuck-loop detection (#7536): if a session has been active across
         # 3+ consecutive restarts, it's probably stuck in a loop (the same
@@ -2310,6 +2912,7 @@ class GatewayRunner:
 
             timeout = self._restart_drain_timeout
             active_agents, timed_out = await self._drain_active_agents(timeout)
+            interrupted_session_keys = sorted(active_agents.keys()) if timed_out else []
             if timed_out:
                 logger.warning(
                     "Gateway drain timed out after %.1fs with %d active agent(s); interrupting remaining work.",
@@ -2351,6 +2954,7 @@ class GatewayRunner:
 
             self.adapters.clear()
             self._running_agents.clear()
+            self._persist_running_sessions_checkpoint()
             self._pending_messages.clear()
             self._pending_approvals.clear()
             if hasattr(self, '_busy_ack_ts'):
@@ -2378,31 +2982,24 @@ class GatewayRunner:
             from gateway.status import remove_pid_file
             remove_pid_file()
 
-            # Write a clean-shutdown marker so the next startup knows this
-            # wasn't a crash.  suspend_recently_active() only needs to run
-            # after unexpected exits.  However, if the drain timed out and
-            # agents were force-interrupted, their sessions may be in an
-            # incomplete state (trailing tool response, no final assistant
-            # message).  Skip the marker in that case so the next startup
-            # suspends those sessions — giving users a clean slate instead
-            # of resuming a half-finished tool loop.
-            if not timed_out:
-                try:
+            # Mark a truly graceful exit so the next startup skips interrupted
+            # session recovery. If we timed out and interrupted live work, keep
+            # an exact checkpoint instead so only those sessions resume.
+            try:
+                if interrupted_session_keys:
+                    self._running_sessions_checkpoint_path().write_text(
+                        json.dumps({"session_keys": interrupted_session_keys}),
+                        encoding="utf-8",
+                    )
+                else:
                     (_hermes_home / ".clean_shutdown").touch()
-                except Exception:
-                    pass
-            else:
-                logger.info(
-                    "Skipping .clean_shutdown marker — drain timed out with "
-                    "interrupted agents; next startup will suspend recently "
-                    "active sessions."
-                )
+            except Exception:
+                pass
 
             # Track sessions that were active at shutdown for stuck-loop
-            # detection (#7536).  On each restart, the counter increments
-            # for sessions that were running.  If a session hits the
-            # threshold (3 consecutive restarts while active), the next
-            # startup auto-suspends it — breaking the loop.
+            # detection (#7536). On each restart, the counter increments for
+            # sessions that were running. If a session hits the threshold,
+            # the next startup auto-suspends it — breaking the loop.
             if active_agents:
                 self._increment_restart_failure_counts(set(active_agents.keys()))
 
@@ -2837,8 +3434,7 @@ class GatewayRunner:
                     _quick_key[:30], _stale_age, _stale_idle,
                     _raw_stale_timeout, _stale_detail,
                 )
-                del self._running_agents[_quick_key]
-                self._running_agents_ts.pop(_quick_key, None)
+                self._clear_running_agent_entry(_quick_key)
                 self._busy_ack_ts.pop(_quick_key, None)
 
         if _quick_key in self._running_agents:
@@ -2868,7 +3464,7 @@ class GatewayRunner:
                     adapter.get_pending_message(_quick_key)  # consume and discard
                 self._pending_messages.pop(_quick_key, None)
                 if _quick_key in self._running_agents:
-                    del self._running_agents[_quick_key]
+                    self._clear_running_agent_entry(_quick_key)
                 logger.info("STOP for session %s — agent interrupted, session lock released", _quick_key[:20])
                 return "⚡ Stopped. You can continue this session."
 
@@ -2891,7 +3487,7 @@ class GatewayRunner:
                 # Clean up the running agent entry so the reset handler
                 # doesn't think an agent is still active.
                 if _quick_key in self._running_agents:
-                    del self._running_agents[_quick_key]
+                    self._clear_running_agent_entry(_quick_key)
                 return await self._handle_reset_command(event)
 
             # /queue <prompt> — queue without interrupting
@@ -2969,7 +3565,7 @@ class GatewayRunner:
                 if event.get_command() == "stop":
                     # Force-clean the sentinel so the session is unlocked.
                     if _quick_key in self._running_agents:
-                        del self._running_agents[_quick_key]
+                        self._clear_running_agent_entry(_quick_key)
                     logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key[:20])
                     return "⚡ Force-stopped. The agent was still starting — session unlocked."
                 # Queue the message so it will be picked up after the
@@ -3274,8 +3870,7 @@ class GatewayRunner:
         # message arriving during any of those yields would pass the
         # "already running" guard and spin up a duplicate agent for the
         # same session — corrupting the transcript.
-        self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
-        self._running_agents_ts[_quick_key] = time.time()
+        self._set_running_agent_entry(_quick_key, _AGENT_PENDING_SENTINEL)
 
         try:
             return await self._handle_message_with_agent(event, source, _quick_key)
@@ -3285,8 +3880,7 @@ class GatewayRunner:
             # (exception, command fallthrough, etc.) the sentinel must
             # not linger or the session would be permanently locked out.
             if self._running_agents.get(_quick_key) is _AGENT_PENDING_SENTINEL:
-                del self._running_agents[_quick_key]
-            self._running_agents_ts.pop(_quick_key, None)
+                self._clear_running_agent_entry(_quick_key)
 
     async def _prepare_inbound_message_text(
         self,
@@ -3554,6 +4148,25 @@ class GatewayRunner:
 
             session_entry.was_auto_reset = False
             session_entry.auto_reset_reason = None
+
+        if getattr(session_entry, 'was_interrupted', False):
+            interrupted_reason = getattr(session_entry, 'interrupted_reason', None) or 'restart'
+            if interrupted_reason == "restart":
+                context_note = (
+                    "[System note: The user's previous turn was interrupted by a gateway restart or shutdown. "
+                    "Resume the existing conversation context from the transcript and continue naturally. "
+                    "Acknowledge the interruption only if it is directly helpful.]"
+                )
+            else:
+                context_note = (
+                    f"[System note: The user's previous turn was interrupted ({interrupted_reason}). "
+                    "Resume the existing conversation context from the transcript and continue naturally. "
+                    "Acknowledge the interruption only if it is directly helpful.]"
+                )
+            context_prompt = context_note + "\n\n" + context_prompt
+            session_entry.was_interrupted = False
+            session_entry.interrupted_reason = None
+            self.session_store._save()
 
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
         # Discord channel_skill_bindings).  Supports a single name or ordered list.
@@ -3901,6 +4514,14 @@ class GatewayRunner:
         if message_text is None:
             return
 
+        direct_work_id = self._begin_direct_work_record(
+            session_id=session_entry.session_id,
+            session_key=session_key,
+            message_text=message_text,
+            platform=_platform_name,
+            event_message_id=event.message_id,
+        )
+
         try:
             # Emit agent:start hook
             hook_ctx = {
@@ -4183,12 +4804,24 @@ class GatewayRunner:
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
                         )
+                self._finish_direct_work_record(direct_work_id, session_key, failed=False)
                 return None
 
+            if response and response.startswith("MEDIA:"):
+                _media_adapter = self.adapters.get(source.platform)
+                if _media_adapter:
+                    await self._deliver_media_from_response(
+                        response, event, _media_adapter,
+                    )
+                self._finish_direct_work_record(direct_work_id, session_key, failed=False)
+                return None
+
+            self._finish_direct_work_record(direct_work_id, session_key, failed=False)
             return response
             
         except Exception as e:
-            # Stop typing indicator on error too
+            self._finish_direct_work_record(direct_work_id, session_key, failed=True)
+
             try:
                 _err_adapter = self.adapters.get(source.platform)
                 if _err_adapter and hasattr(_err_adapter, "stop_typing"):
@@ -4503,7 +5136,7 @@ class GatewayRunner:
         if agent is _AGENT_PENDING_SENTINEL:
             # Force-clean the sentinel so the session is unlocked.
             if session_key in self._running_agents:
-                del self._running_agents[session_key]
+                self._clear_running_agent_entry(session_key)
             logger.info("STOP (pending) for session %s — sentinel cleared", session_key[:20])
             return "⚡ Stopped. The agent hadn't started yet — you can continue this session."
         if agent:
@@ -4511,7 +5144,7 @@ class GatewayRunner:
             # Force-clean the session lock so a truly hung agent doesn't
             # keep it locked forever.
             if session_key in self._running_agents:
-                del self._running_agents[session_key]
+                self._clear_running_agent_entry(session_key)
             return "⚡ Stopped. You can continue this session."
         else:
             return "No active task to stop."
@@ -6428,7 +7061,7 @@ class GatewayRunner:
 
         # Clear any running agent for this session key
         if session_key in self._running_agents:
-            del self._running_agents[session_key]
+            self._clear_running_agent_entry(session_key)
 
         # Switch the session entry to point at the old session
         new_entry = self.session_store.switch_session(session_key, target_id)
@@ -7675,6 +8308,16 @@ class GatewayRunner:
             last_output_len = current_output_len
 
             if session.exited:
+                try:
+                    self._update_delegated_work_for_process(
+                        executor_session_id=session_id,
+                        exit_code=session.exit_code,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to update delegated work-state from process completion",
+                        exc_info=True,
+                    )
                 # --- Agent-triggered completion: inject synthetic message ---
                 # Skip if the agent already consumed the result via wait/poll/log
                 from tools.process_registry import process_registry as _pr_check
@@ -9040,7 +9683,11 @@ class GatewayRunner:
             while agent_holder[0] is None:
                 await asyncio.sleep(0.05)
             if session_key:
-                self._running_agents[session_key] = agent_holder[0]
+                self._set_running_agent_entry(
+                    session_key,
+                    agent_holder[0],
+                    update_timestamp=False,
+                )
                 if self._draining:
                     self._update_runtime_status("draining")
         
@@ -9519,8 +10166,8 @@ class GatewayRunner:
             # Clean up tracking
             tracking_task.cancel()
             if session_key and session_key in self._running_agents:
-                del self._running_agents[session_key]
-            if session_key:
+                self._clear_running_agent_entry(session_key)
+            elif session_key:
                 self._running_agents_ts.pop(session_key, None)
             if self._draining:
                 self._update_runtime_status("draining")
