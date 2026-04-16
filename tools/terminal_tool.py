@@ -36,11 +36,13 @@ import logging
 import os
 import platform
 import re
+import shlex
 import time
 import threading
 import atexit
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -1102,6 +1104,73 @@ def _command_requires_pipe_stdin(command: str) -> bool:
     )
 
 
+def _extract_tmux_session_name(command: str) -> Optional[str]:
+    try:
+        tokens = shlex.split(command)
+    except Exception:
+        return None
+    for idx, token in enumerate(tokens[:-1]):
+        if token == "-s" and idx + 1 < len(tokens):
+            value = str(tokens[idx + 1]).strip()
+            if value:
+                return value
+    return None
+
+
+def _looks_like_omx_delegation(command: str) -> bool:
+    normalized = " ".join((command or "").lower().split())
+    return "omx exec" in normalized or "omx team" in normalized
+
+
+def _maybe_mark_gateway_work_delegated(
+    *,
+    command: str,
+    session_key: str,
+    executor_session_id: Optional[str],
+    workdir: Optional[str],
+) -> bool:
+    if not session_key or not _looks_like_omx_delegation(command):
+        return False
+
+    from gateway.work_state import WorkStateStore
+
+    store = WorkStateStore()
+    candidates = [
+        record
+        for record in store.list_records()
+        if record.owner_session_id == session_key
+        and record.owner == "hermes"
+        and record.state in {"created", "running", "blocked", "stale"}
+    ]
+    if not candidates:
+        return False
+
+    direct_candidates = [record for record in candidates if record.mode == "direct"]
+    target = max(
+        direct_candidates or candidates,
+        key=lambda record: record.last_progress_at,
+    )
+    now = datetime.now().astimezone()
+    tmux_session = _extract_tmux_session_name(command)
+    repo_path = workdir or target.repo_path
+    worktree_path = workdir or target.worktree_path
+    delegated_executor_session_id = None if tmux_session else (executor_session_id or target.executor_session_id)
+    return store.update_record(
+        target.work_id,
+        target.owner_session_id,
+        executor="omx",
+        mode="delegated",
+        state="running",
+        last_progress_at=now,
+        executor_session_id=delegated_executor_session_id,
+        tmux_session=tmux_session or target.tmux_session,
+        repo_path=repo_path,
+        worktree_path=worktree_path,
+        next_action="Resume the delegated OMX work",
+        proof="terminal_background:omx_exec",
+    )
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -1379,6 +1448,14 @@ def terminal_tool(
                     "exit_code": 0,
                     "error": None,
                 }
+                delegated_marked = _maybe_mark_gateway_work_delegated(
+                    command=command,
+                    session_key=session_key,
+                    executor_session_id=proc_session.id,
+                    workdir=effective_cwd,
+                )
+                if delegated_marked:
+                    result_data["delegated_work_state"] = "marked"
                 if approval_note:
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:

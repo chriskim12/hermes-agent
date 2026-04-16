@@ -358,6 +358,43 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"status": "ignored", "event": event_type}
             )
 
+        delivery_id = request.headers.get(
+            "X-GitHub-Delivery",
+            request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+        )
+
+        if route_config.get("owner_ingress"):
+            if not self.gateway_runner or not hasattr(self.gateway_runner, "handle_owner_ingress_packet"):
+                return web.json_response(
+                    {"status": "reject", "verdict": "reject", "reason": "gateway_runner_unavailable"},
+                    status=503,
+                )
+            verdict = await self.gateway_runner.handle_owner_ingress_packet(
+                payload,
+                route_name=route_name,
+                delivery_id=delivery_id,
+            )
+            return web.json_response(
+                {k: v for k, v in verdict.items() if k != "http_status"},
+                status=int(verdict.get("http_status", 202)),
+            )
+
+        if route_config.get("delegated_ingress"):
+            if not self.gateway_runner or not hasattr(self.gateway_runner, "handle_delegated_ingress_packet"):
+                return web.json_response(
+                    {"status": "reject", "verdict": "reject", "reason": "gateway_runner_unavailable"},
+                    status=503,
+                )
+            verdict = await self.gateway_runner.handle_delegated_ingress_packet(
+                payload,
+                route_name=route_name,
+                delivery_id=delivery_id,
+            )
+            return web.json_response(
+                {k: v for k, v in verdict.items() if k != "http_status"},
+                status=int(verdict.get("http_status", 202)),
+            )
+
         # Format prompt from template
         prompt_template = route_config.get("prompt", "")
         prompt = self._render_prompt(
