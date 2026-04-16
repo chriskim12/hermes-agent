@@ -1946,6 +1946,46 @@ class GatewayRunner:
         )
         return work_id
 
+    def _begin_targeted_internal_work_record(
+        self,
+        *,
+        event: MessageEvent,
+        session_key: str,
+        message_text: str,
+    ) -> Optional[str]:
+        if not getattr(event, "internal", False):
+            return None
+        work_state_store = getattr(self, "work_state_store", None)
+        if work_state_store is None:
+            return None
+        raw_message = getattr(event, "raw_message", None)
+        if not isinstance(raw_message, dict):
+            return None
+        work_id = str(raw_message.get("work_id", "")).strip()
+        if not work_id:
+            return None
+        existing_records = work_state_store.find_matching_records(
+            work_id,
+            owner_session_id=session_key,
+            live_only=False,
+        )
+        existing = existing_records[0] if existing_records else None
+        if existing is None:
+            return None
+        if existing.mode != "direct" or existing.executor != "hermes":
+            return None
+        preview = (message_text or "").strip().splitlines()[0] if (message_text or "").strip() else "Continue the targeted internal work"
+        preview = preview[:160]
+        now = datetime.now().astimezone()
+        work_state_store.update_record(
+            work_id,
+            session_key,
+            state="running",
+            last_progress_at=now,
+            next_action=preview or existing.next_action,
+        )
+        return work_id
+
     def _finish_direct_work_record(
         self,
         work_id: Optional[str],
@@ -4514,13 +4554,19 @@ class GatewayRunner:
         if message_text is None:
             return
 
-        direct_work_id = self._begin_direct_work_record(
-            session_id=session_entry.session_id,
+        direct_work_id = self._begin_targeted_internal_work_record(
+            event=event,
             session_key=session_key,
             message_text=message_text,
-            platform=_platform_name,
-            event_message_id=event.message_id,
         )
+        if direct_work_id is None and not getattr(event, "internal", False):
+            direct_work_id = self._begin_direct_work_record(
+                session_id=session_entry.session_id,
+                session_key=session_key,
+                message_text=message_text,
+                platform=_platform_name,
+                event_message_id=event.message_id,
+            )
 
         try:
             # Emit agent:start hook
@@ -6972,6 +7018,7 @@ class GatewayRunner:
                     session_id=session_id,
                     source=source.platform.value if source.platform else "unknown",
                     user_id=source.user_id,
+                    source_metadata=source.to_dict(),
                 )
             except Exception:
                 pass  # Session might already exist, ignore errors
@@ -7124,6 +7171,7 @@ class GatewayRunner:
                 session_id=new_session_id,
                 source=source.platform.value if source.platform else "gateway",
                 model=(self.config.get("model", {}) or {}).get("default") if isinstance(self.config, dict) else None,
+                source_metadata=source.to_dict(),
                 parent_session_id=parent_session_id,
             )
         except Exception as e:
@@ -8820,10 +8868,16 @@ class GatewayRunner:
             or os.getenv("HERMES_TOOL_PROGRESS_MODE")
             or "all"
         )
+        iteration_report_every = resolve_display_setting(
+            user_config, platform_key, "iteration_report_every", 0
+        )
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
         tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        iteration_reports_enabled = (
+            source.platform != Platform.WEBHOOK and int(iteration_report_every or 0) > 0
+        )
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
@@ -8840,7 +8894,9 @@ class GatewayRunner:
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
-        
+        max_iterations_holder = [90]
+        last_iteration_report = [0]
+
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
             if not progress_queue:
@@ -9062,17 +9118,36 @@ class GatewayRunner:
                         _names.append(_t.get("name") or "")
                     else:
                         _names.append(str(_t))
-                asyncio.run_coroutine_threadsafe(
-                    _hooks_ref.emit("agent:step", {
-                        "platform": source.platform.value if source.platform else "",
-                        "user_id": source.user_id,
-                        "session_id": session_id,
-                        "iteration": iteration,
-                        "tool_names": _names,
-                        "tools": prev_tools,
-                    }),
-                    _loop_for_step,
-                )
+                if _hooks_ref.loaded_hooks:
+                    asyncio.run_coroutine_threadsafe(
+                        _hooks_ref.emit("agent:step", {
+                            "platform": source.platform.value if source.platform else "",
+                            "user_id": source.user_id,
+                            "session_id": session_id,
+                            "iteration": iteration,
+                            "tool_names": _names,
+                            "tools": prev_tools,
+                        }),
+                        _loop_for_step,
+                    )
+
+                _interval = int(iteration_report_every or 0)
+                if (
+                    iteration_reports_enabled
+                    and _interval > 0
+                    and iteration >= _interval
+                    and iteration % _interval == 0
+                    and iteration != last_iteration_report[0]
+                ):
+                    last_iteration_report[0] = iteration
+                    _recent = ", ".join(name for name in _names if name) or "(no recent tools)"
+                    _status_callback_sync(
+                        "iteration_report",
+                        (
+                            f"🔄 Iteration report: starting iteration {iteration}/{max_iterations_holder[0]}"
+                            f" — recent tools: {_recent}"
+                        ),
+                    )
             except Exception as _e:
                 logger.debug("agent:step hook error: %s", _e)
 
@@ -9111,6 +9186,7 @@ class GatewayRunner:
 
             # Read from env var or use default (same as CLI)
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            max_iterations_holder[0] = max_iterations
             
             # Map platform enum to the platform hint key the agent understands.
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
@@ -9298,7 +9374,7 @@ class GatewayRunner:
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
-            agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
+            agent.step_callback = _step_callback_sync if (_hooks_ref.loaded_hooks or iteration_reports_enabled) else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
