@@ -83,7 +83,7 @@ async def test_watch_notification_routes_to_process_owner_thread(monkeypatch, tm
 
 
 @pytest.mark.asyncio
-async def test_watch_notification_falls_back_to_current_event_when_owner_missing(monkeypatch, tmp_path):
+async def test_watch_notification_skips_when_owner_missing(monkeypatch, tmp_path):
     import tools.process_registry as pr_module
 
     monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(None))
@@ -101,11 +101,4 @@ async def test_watch_notification_falls_back_to_current_event_when_owner_missing
     telegram_adapter = runner.adapters[Platform.TELEGRAM]
 
     assert discord_adapter.handle_message.await_count == 0
-    assert telegram_adapter.handle_message.await_count == 1
-
-    event = telegram_adapter.handle_message.await_args.args[0]
-    assert event.source.platform == Platform.TELEGRAM
-    assert event.source.chat_id == "chat-current"
-    assert event.source.thread_id == "thread-current"
-    assert event.source.user_id == "user-current"
-    assert event.source.user_name == "current-user"
+    assert telegram_adapter.handle_message.await_count == 0

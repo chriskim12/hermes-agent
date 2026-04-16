@@ -399,6 +399,135 @@ async def test_handle_message_with_agent_tracks_direct_work_record_failure(tmp_p
     assert records[0].proof == "agent_failed"
 
 
+@pytest.mark.asyncio
+async def test_handle_message_with_agent_reuses_targeted_internal_direct_work_record(tmp_path):
+    runner, store, work_state_store = _make_message_runner(tmp_path)
+    source = _make_source()
+    session_entry = store.get_or_create_session(source)
+    now = datetime.now(timezone.utc)
+    work_state_store.upsert(
+        WorkRecord(
+            work_id="wk-direct-resume-1",
+            title="resume blocked direct work",
+            objective="resume the exact blocked direct work record rather than creating a duplicate",
+            owner="hermes",
+            executor="hermes",
+            mode="direct",
+            owner_session_id=session_entry.session_key,
+            state="blocked",
+            started_at=now,
+            last_progress_at=now,
+            next_action="Resume the interrupted owner turn",
+            proof="gateway_restart_checkpoint",
+        )
+    )
+
+    async def fake_run_agent(**_kwargs):
+        records = work_state_store.list_records()
+        assert len(records) == 1
+        assert records[0].work_id == "wk-direct-resume-1"
+        assert records[0].state == "running"
+        return {
+            "final_response": "resumed",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "api_calls": 1,
+        }
+
+    runner._run_agent = fake_run_agent
+
+    event = gateway_run.MessageEvent(
+        text="[System note: resume only this targeted work record]",
+        message_type=gateway_run.MessageType.TEXT,
+        source=source,
+        message_id="owner-ingress:direct-resume",
+        raw_message={"work_id": "wk-direct-resume-1", "owner": "hermes"},
+        internal=True,
+    )
+
+    result = await GatewayRunner._handle_message_with_agent(
+        runner,
+        event,
+        source,
+        session_entry.session_key,
+    )
+
+    assert result == "resumed"
+    records = work_state_store.list_records()
+    assert len(records) == 1
+    assert records[0].work_id == "wk-direct-resume-1"
+    assert records[0].state == "finished"
+    assert records[0].proof == "agent_completed"
+
+
+@pytest.mark.asyncio
+async def test_handle_message_with_agent_does_not_create_duplicate_direct_record_for_internal_delegated_followup(tmp_path):
+    runner, store, work_state_store = _make_message_runner(tmp_path)
+    source = _make_source()
+    session_entry = store.get_or_create_session(source)
+    now = datetime.now(timezone.utc)
+    work_state_store.upsert(
+        WorkRecord(
+            work_id="wk-delegated-blocked-1",
+            title="delegated blocked work",
+            objective="keep delegated ledger state stable while the owner handles the follow-up",
+            owner="hermes",
+            executor="omx",
+            mode="delegated",
+            owner_session_id=session_entry.session_key,
+            state="blocked",
+            started_at=now,
+            last_progress_at=now,
+            next_action="Inspect the blocked delegated run",
+            executor_session_id="proc-delegated-1",
+            proof="clawhip:session.blocked",
+        )
+    )
+
+    async def fake_run_agent(**_kwargs):
+        records = work_state_store.list_records()
+        assert len(records) == 1
+        assert records[0].work_id == "wk-delegated-blocked-1"
+        assert records[0].mode == "delegated"
+        assert records[0].state == "blocked"
+        return {
+            "final_response": "owner handled",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "api_calls": 1,
+        }
+
+    runner._run_agent = fake_run_agent
+
+    event = gateway_run.MessageEvent(
+        text="[System note: delegated owner follow-up]",
+        message_type=gateway_run.MessageType.TEXT,
+        source=source,
+        message_id="owner-ingress:delegated-followup",
+        raw_message={"work_id": "wk-delegated-blocked-1", "owner": "hermes"},
+        internal=True,
+    )
+
+    result = await GatewayRunner._handle_message_with_agent(
+        runner,
+        event,
+        source,
+        session_entry.session_key,
+    )
+
+    assert result == "owner handled"
+    records = work_state_store.list_records()
+    assert len(records) == 1
+    assert records[0].work_id == "wk-delegated-blocked-1"
+    assert records[0].mode == "delegated"
+    assert records[0].state == "blocked"
+    assert records[0].proof == "clawhip:session.blocked"
+
+
 def test_mark_work_record_delegated_handoff_writes_executor_correlation_fields(tmp_path):
     runner, store, work_state_store = _make_runner(tmp_path)
     source = _make_source()
