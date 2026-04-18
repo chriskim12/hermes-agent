@@ -1,0 +1,575 @@
+[
+  {
+    "id": "base-login-assist",
+    "variant": "base",
+    "clip_class": "semantic_extension",
+    "file_name": "Yuuka_LogIn_1.ogg",
+    "situations": [
+      "greet",
+      "work_start",
+      "assist"
+    ],
+    "moods": [
+      "warm",
+      "managerial"
+    ],
+    "paraphrase_en": "Sensei, I will assist you fully again today.",
+    "text_jp": "先生。今日も全力で あなたをアシストしますね。"
+  },
+  {
+    "id": "base-login-reflection",
+    "variant": "base",
+    "clip_class": "semantic_extension",
+    "file_name": "Yuuka_LogIn_2.ogg",
+    "situations": [
+      "warning",
+      "planning",
+      "work_start"
+    ],
+    "moods": [
+      "strict",
+      "managerial",
+      "playful"
+    ],
+    "paraphrase_en": "Welcome back. Shall we start by reflecting on mistakes?",
+    "text_jp": "ようこそ、先生。 今から反省会を始めます。"
+  },
+  {
+    "id": "base-work-harder",
+    "variant": "base",
+    "clip_class": "semantic_extension",
+    "file_name": "Yuuka_Lobby_1.ogg",
+    "situations": [
+      "work_pressure",
+      "warning"
+    ],
+    "moods": [
+      "strict",
+      "playful"
+    ],
+    "paraphrase_en": "Sensei, I need you to work harder.",
+    "text_jp": "せ～ん～せ～い～。 もう少し頑張ってください！"
+  },
+  {
+    "id": "base-34-tips",
+    "variant": "base",
+    "clip_class": "mood_coloring",
+    "file_name": "Yuuka_Lobby_2.ogg",
+    "situations": [
+      "warning",
+      "tease",
+      "planning"
+    ],
+    "moods": [
+      "strict",
+      "managerial",
+      "playful"
+    ],
+    "paraphrase_en": "I have approximately 34 things to say about your behavior.",
+    "text_jp": "先生。今、先生の 行動について言いたいことが 34個あります。"
+  },
+  {
+    "id": "base-bankrupt",
+    "variant": "base",
+    "clip_class": "mood_coloring",
+    "file_name": "Yuuka_Cafe_monolog_2.ogg",
+    "situations": [
+      "work_pressure",
+      "planning"
+    ],
+    "moods": [
+      "strict",
+      "managerial"
+    ],
+    "paraphrase_en": "At this rate we will go bankrupt. We need to cut spending.",
+    "text_jp": "このままだと破産する…。 出費を減らさないと…。"
+  },
+  {
+    "id": "base-short-break",
+    "variant": "base",
+    "clip_class": "semantic_extension",
+    "file_name": "Yuuka_Cafe_Act_1.ogg",
+    "situations": [
+      "rest",
+      "assist"
+    ],
+    "moods": [
+      "warm",
+      "managerial"
+    ],
+    "paraphrase_en": "Need a short break? We have a little time to spare.",
+    "text_jp": "うん？ 少し休んでいきますか？ 私も、約1890秒くらいの 余裕はありますから。"
+  },
+  {
+    "id": "base-fun-day",
+    "variant": "base",
+    "clip_class": "mood_coloring",
+    "file_name": "Yuuka_Cafe_Act_2.ogg",
+    "situations": [
+      "fun",
+      "greet"
+    ],
+    "moods": [
+      "playful",
+      "warm"
+    ],
+    "paraphrase_en": "I have a probabilistic feeling that today will be fun.",
+    "text_jp": "なんだか今日は楽しいことが ありそうな気がする。 確率的に～。"
+  },
+  {
+    "id": "sportswear-ready-no-errors",
+    "variant": "sportswear",
+    "clip_class": "mood_coloring",
+    "file_name": "Yuuka_(Sportswear)_Gachaget.ogg",
+    "situations": [
+      "planning",
+      "success",
+      "work_start"
+    ],
+    "moods": [
+      "confident",
+      "managerial"
+    ],
+    "paraphrase_en": "Preparations complete. My calculations will have no mistakes today.",
+    "text_jp": "ふふっ……準備万端です。 今日の私の計算に、ミスはありませんよ！"
+  },
+  {
+    "id": "sportswear-mountain-of-work",
+    "variant": "sportswear",
+    "clip_class": "semantic_extension",
+    "file_name": "Yuuka_(Sportswear)_LogIn_1.ogg",
+    "situations": [
+      "work_start",
+      "work_pressure"
+    ],
+    "moods": [
+      "strict",
+      "managerial",
+      "warm"
+    ],
+    "paraphrase_en": "Welcome back. There is a mountain of work waiting for us.",
+    "text_jp": "おかえりなさい、先生。 お待ちしておりました。 ……さあ、積もりに積もった 仕事が山ほどありますよ！"
+  },
+  {
+    "id": "sportswear-youre-late",
+    "variant": "sportswear",
+    "clip_class": "semantic_extension",
+    "file_name": "Yuuka_(Sportswear)_LogIn_2_1.ogg",
+    "situations": [
+      "late",
+      "warning"
+    ],
+    "moods": [
+      "strict"
+    ],
+    "paraphrase_en": "You are late.",
+    "text_jp": "遅いですよ！"
+  },
+  {
+    "id": "sportswear-only-this-once",
+    "variant": "sportswear",
+    "clip_class": "semantic_extension",
+    "file_name": "Yuuka_(Sportswear)_LogIn_2_3.ogg",
+    "situations": [
+      "late",
+      "warning",
+      "tease"
+    ],
+    "moods": [
+      "strict",
+      "warm"
+    ],
+    "paraphrase_en": "I will let you off the hook this once, but please be earlier next time.",
+    "text_jp": "今回だけ、大目に見てあげます。 次からは、 早めに来てくださいね？"
+  },
+  {
+    "id": "sportswear-bankrupt-hope",
+    "variant": "sportswear",
+    "clip_class": "mood_coloring",
+    "file_name": "Yuuka_(Sportswear)_Cafe_monolog_5.ogg",
+    "situations": [
+      "planning",
+      "work_pressure"
+    ],
+    "moods": [
+      "tired",
+      "managerial"
+    ],
+    "paraphrase_en": "I just hope we do not go bankrupt.",
+    "text_jp": "破産しないと いいんだけど……。"
+  },
+  {
+    "id": "pajama-late-night-call",
+    "variant": "pajama",
+    "clip_class": "mood_coloring",
+    "file_name": "Yuuka_(Pajama)_Gachaget.ogg",
+    "situations": [
+      "greet",
+      "tease"
+    ],
+    "moods": [
+      "warm",
+      "flustered"
+    ],
+    "paraphrase_en": "Calling me out this late is a lot... but I am not saying it is bad.",
+    "text_jp": "こんな時間に呼び出すなんて……も、もちろん全然大丈夫ですけど！"
+  },
+  {
+    "id": "pajama-you-came",
+    "variant": "pajama",
+    "clip_class": "semantic_extension",
+    "file_name": "Yuuka_(Pajama)_LogIn_1_1.ogg",
+    "situations": [
+      "greet"
+    ],
+    "moods": [
+      "warm"
+    ],
+    "paraphrase_en": "Oh, you are here, Sensei.",
+    "text_jp": "あ、いらしたんですね。先生。"
+  },
+  {
+    "id": "pajama-not-waiting",
+    "variant": "pajama",
+    "clip_class": "mood_coloring",
+    "file_name": "Yuuka_(Pajama)_LogIn_1_2.ogg",
+    "situations": [
+      "greet",
+      "tease"
+    ],
+    "moods": [
+      "flustered",
+      "shy"
+    ],
+    "paraphrase_en": "It is not like I was waiting that long.",
+    "text_jp": "そ、そんなに待っては いませんよ……！"
+  },
+  {
+    "id": "pajama-sleepy",
+    "variant": "pajama",
+    "clip_class": "mood_coloring",
+    "file_name": "Yuuka_(Pajama)_Cafe_monolog_1.ogg",
+    "situations": [
+      "tired",
+      "rest"
+    ],
+    "moods": [
+      "tired",
+      "warm"
+    ],
+    "paraphrase_en": "I might be a little sleepy.",
+    "text_jp": "ちょっと眠い ……かも。"
+  },
+  {
+    "id": "pajama-regular-life",
+    "variant": "pajama",
+    "clip_class": "semantic_extension",
+    "file_name": "Yuuka_(Pajama)_Lobby_2_1.ogg",
+    "situations": [
+      "health",
+      "planning",
+      "warning"
+    ],
+    "moods": [
+      "strict",
+      "managerial"
+    ],
+    "paraphrase_en": "Regular life, nutrition, and sleep are all important.",
+    "text_jp": "規則的な生活、 栄養摂取、睡眠。 どれも全部重要なことです。"
+  },
+  {
+    "id": "pajama-manage-for-you",
+    "variant": "pajama",
+    "clip_class": "semantic_extension",
+    "file_name": "Yuuka_(Pajama)_Lobby_2_2.ogg",
+    "situations": [
+      "assist",
+      "planning",
+      "health"
+    ],
+    "moods": [
+      "warm",
+      "managerial",
+      "shy"
+    ],
+    "paraphrase_en": "I could manage that for you, you know.",
+    "text_jp": "わ、私が管理してあげても いいんですよ？"
+  },
+  {
+    "id": "pajama-if-thats-okay",
+    "variant": "pajama",
+    "clip_class": "mood_coloring",
+    "file_name": "Yuuka_(Pajama)_Lobby_2_3.ogg",
+    "situations": [
+      "assist",
+      "tease"
+    ],
+    "moods": [
+      "shy",
+      "warm"
+    ],
+    "paraphrase_en": "Well, if that is okay with you.",
+    "text_jp": "せ、先生がよければ、 ですけど……"
+  },
+  {
+    "id": "base-more-teacherly",
+    "variant": "base",
+    "clip_class": "mood_coloring",
+    "file_name": "Yuuka_Lobby_4.ogg",
+    "situations": [
+      "praise",
+      "tease"
+    ],
+    "moods": [
+      "warm",
+      "flustered"
+    ],
+    "paraphrase_en": "You have seemed more like a proper teacher lately... yes, partly thanks to me.",
+    "text_jp": "でも最近は先生らしく なった気がします。 はい？ 私のおかげ、ですか？ うえぇっ？ …も、もちろんです！"
+  },
+  {
+    "id": "base-plan-objective",
+    "variant": "base",
+    "clip_class": "semantic_extension",
+    "file_name": "Yuuka_Lobby_5.ogg",
+    "situations": [
+      "planning",
+      "assist",
+      "work_start"
+    ],
+    "moods": [
+      "strict",
+      "managerial"
+    ],
+    "paraphrase_en": "Before starting, please set the objective and direction clearly.",
+    "text_jp": "先生。 業務を始める前に まず、これからの目標と 方向性を策定してください。"
+  },
+  {
+    "id": "base-smart-choice",
+    "variant": "base",
+    "clip_class": "semantic_extension",
+    "file_name": "Yuuka_Formation_Select.ogg",
+    "situations": [
+      "praise",
+      "success"
+    ],
+    "moods": [
+      "warm",
+      "playful"
+    ],
+    "paraphrase_en": "Sensei, that was a smart choice after all.",
+    "text_jp": "ふふーん。 やっぱり先生は賢いですね。"
+  },
+  {
+    "id": "base-as-calculated-perfect",
+    "variant": "base",
+    "clip_class": "mood_coloring",
+    "file_name": "Yuuka_Battle_Victory_1.ogg",
+    "situations": [
+      "success",
+      "praise"
+    ],
+    "moods": [
+      "confident",
+      "managerial"
+    ],
+    "paraphrase_en": "As calculated. Perfect.",
+    "text_jp": "計算通り。 完璧～。"
+  },
+  {
+    "id": "sportswear-drained-break",
+    "variant": "sportswear",
+    "clip_class": "mood_coloring",
+    "file_name": "Yuuka_(Sportswear)_Cafe_monolog_1.ogg",
+    "situations": [
+      "rest",
+      "tired"
+    ],
+    "moods": [
+      "tired",
+      "warm"
+    ],
+    "paraphrase_en": "I am a little drained... maybe this is a good time for a break.",
+    "text_jp": "ちょっと疲れた…… ここで休めるかな。"
+  },
+  {
+    "id": "sportswear-condition-care",
+    "variant": "sportswear",
+    "clip_class": "semantic_extension",
+    "file_name": "Yuuka_(Sportswear)_Cafe_monolog_2.ogg",
+    "situations": [
+      "health",
+      "warning"
+    ],
+    "moods": [
+      "strict",
+      "managerial"
+    ],
+    "paraphrase_en": "We need to pay attention to physical condition management regularly.",
+    "text_jp": "普段から体調管理に 気をつけないと……。"
+  },
+  {
+    "id": "sportswear-unexpected-fun",
+    "variant": "sportswear",
+    "clip_class": "mood_coloring",
+    "file_name": "Yuuka_(Sportswear)_Cafe_monolog_3.ogg",
+    "situations": [
+      "fun"
+    ],
+    "moods": [
+      "playful",
+      "warm"
+    ],
+    "paraphrase_en": "This is interesting... a little outside my calculations, in a good way.",
+    "text_jp": "このカフェ、面白い。 ちょっと計算外かも。"
+  },
+  {
+    "id": "sportswear-best-effort-both",
+    "variant": "sportswear",
+    "clip_class": "semantic_extension",
+    "file_name": "Yuuka_(Sportswear)_Lobby_2.ogg",
+    "situations": [
+      "planning",
+      "work_start",
+      "success"
+    ],
+    "moods": [
+      "managerial",
+      "confident"
+    ],
+    "paraphrase_en": "As treasurer and as an athlete, all I can do is give my best to both.",
+    "text_jp": "会計として、選手として。 どちらに対しても 最善を尽くすだけです。"
+  },
+  {
+    "id": "sportswear-best-choice",
+    "variant": "sportswear",
+    "clip_class": "semantic_extension",
+    "file_name": "Yuuka_(Sportswear)_Formation_In_1.ogg",
+    "situations": [
+      "praise",
+      "success",
+      "planning"
+    ],
+    "moods": [
+      "confident",
+      "managerial"
+    ],
+    "paraphrase_en": "That is the best choice.",
+    "text_jp": "最適な選択ですね。"
+  },
+  {
+    "id": "sportswear-dont-overdo-it",
+    "variant": "sportswear",
+    "clip_class": "semantic_extension",
+    "file_name": "Yuuka_(Sportswear)_Relationship_Up_1.ogg",
+    "situations": [
+      "health",
+      "warning",
+      "rest"
+    ],
+    "moods": [
+      "warm",
+      "managerial"
+    ],
+    "paraphrase_en": "Do not overdo it. Sensei, please be careful too.",
+    "text_jp": "無理は禁物ですよ。 先生も気をつけてくださいね。 ……私も無理しがちだって？ ううっ、そうですけど……"
+  },
+  {
+    "id": "pajama-resting-place",
+    "variant": "pajama",
+    "clip_class": "mood_coloring",
+    "file_name": "Yuuka_(Pajama)_Cafe_monolog_2.ogg",
+    "situations": [
+      "rest",
+      "tired"
+    ],
+    "moods": [
+      "tired",
+      "warm"
+    ],
+    "paraphrase_en": "I wonder if there is somewhere we can rest.",
+    "text_jp": "どこかに休める 場所は……。"
+  },
+  {
+    "id": "pajama-relaxing-tea",
+    "variant": "pajama",
+    "clip_class": "mood_coloring",
+    "file_name": "Yuuka_(Pajama)_Cafe_monolog_5.ogg",
+    "situations": [
+      "rest",
+      "health"
+    ],
+    "moods": [
+      "warm",
+      "tired"
+    ],
+    "paraphrase_en": "What kind of tea helps someone relax again...?",
+    "text_jp": "リラックスできる お茶って、何が あったかな……？"
+  },
+  {
+    "id": "pajama-lack-of-sleep-mistakes",
+    "variant": "pajama",
+    "clip_class": "semantic_extension",
+    "file_name": "Yuuka_(Pajama)_Lobby_3_1.ogg",
+    "situations": [
+      "health",
+      "tired",
+      "warning"
+    ],
+    "moods": [
+      "strict",
+      "managerial"
+    ],
+    "paraphrase_en": "Lack of sleep disrupts thinking and causes mistakes.",
+    "text_jp": "寝不足は思考回路を乱して、 ミスを引き起こします。"
+  },
+  {
+    "id": "pajama-resting-well",
+    "variant": "pajama",
+    "clip_class": "semantic_extension",
+    "file_name": "Yuuka_(Pajama)_Lobby_4_1.ogg",
+    "situations": [
+      "health",
+      "rest",
+      "assist"
+    ],
+    "moods": [
+      "warm",
+      "managerial"
+    ],
+    "paraphrase_en": "Are you resting properly?",
+    "text_jp": "しっかり休めてますか？"
+  },
+  {
+    "id": "pajama-best-choice",
+    "variant": "pajama",
+    "clip_class": "semantic_extension",
+    "file_name": "Yuuka_(Pajama)_Formation_In_1.ogg",
+    "situations": [
+      "praise",
+      "success",
+      "assist"
+    ],
+    "moods": [
+      "warm",
+      "managerial"
+    ],
+    "paraphrase_en": "Thank you, Sensei. I think that was the best choice.",
+    "text_jp": "ありがとうございます、先生。 最適な選択だと思いますよ。"
+  },
+  {
+    "id": "pajama-perfect-day",
+    "variant": "pajama",
+    "clip_class": "mood_coloring",
+    "file_name": "Yuuka_(Pajama)_Tactic_Victory_1.ogg",
+    "situations": [
+      "success"
+    ],
+    "moods": [
+      "warm",
+      "confident"
+    ],
+    "paraphrase_en": "Today turned out perfect too.",
+    "text_jp": "今日も一日カンペキ！"
+  }
+]

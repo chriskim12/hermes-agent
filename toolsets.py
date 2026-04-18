@@ -49,6 +49,8 @@ _HERMES_CORE_TOOLS = [
     # Media workflows
     "youtube_music_dig",
     "youtube_music_retry_pending",
+    # Yuuka voice reactions
+    "yuuka_voice_reply",
     # Planning & memory
     "todo", "memory",
     # Session history search
@@ -217,6 +219,12 @@ TOOLSETS = {
     "tts": {
         "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",
         "tools": ["text_to_speech"],
+        "includes": []
+    },
+
+    "yuuka_voice": {
+        "description": "Select and cache semantically aligned Hayase Yuuka voice clips for native media delivery",
+        "tools": ["yuuka_voice_reply"],
         "includes": []
     },
     
