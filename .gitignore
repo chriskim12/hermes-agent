@@ -49,6 +49,10 @@ cli-config.yaml
 skills/.hub/
 ignored/
 .worktrees/
+
+# Local OMX runtime state/logs
+.omx/
+
 environments/benchmarks/evals/
 
 # Web UI build output

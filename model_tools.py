@@ -159,6 +159,7 @@ def _discover_tools():
         # "tools.honcho_tools",  # Removed — Honcho is now a memory provider plugin
         "tools.homeassistant_tool",
         "tools.youtube_audio_tool",
+        "tools.yuuka_voice_tool",
     ]
     import importlib
     for mod_name in _modules:
