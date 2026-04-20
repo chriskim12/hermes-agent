@@ -195,6 +195,7 @@ class TestCreateSkill:
             result = _create_skill("my-skill", VALID_SKILL_CONTENT)
         assert result["success"] is True
         assert (tmp_path / "my-skill" / "SKILL.md").exists()
+        assert result["touched_paths"] == [str(tmp_path / "my-skill" / "SKILL.md")]
 
     def test_create_with_category(self, tmp_path):
         with _skill_dir(tmp_path):
@@ -279,6 +280,7 @@ class TestPatchSkill:
         assert result["success"] is True
         content = (tmp_path / "my-skill" / "SKILL.md").read_text()
         assert "Do the new thing." in content
+        assert result["touched_paths"] == [str(tmp_path / "my-skill" / "SKILL.md")]
 
     def test_patch_nonexistent_string(self, tmp_path):
         with _skill_dir(tmp_path):
@@ -359,6 +361,7 @@ class TestDeleteSkill:
             result = _delete_skill("my-skill")
         assert result["success"] is True
         assert not (tmp_path / "my-skill").exists()
+        assert result["touched_paths"] == [str(tmp_path / "my-skill")]
 
     def test_delete_nonexistent(self, tmp_path):
         with _skill_dir(tmp_path):
@@ -384,6 +387,7 @@ class TestWriteFile:
             result = _write_file("my-skill", "references/api.md", "# API\nEndpoint docs.")
         assert result["success"] is True
         assert (tmp_path / "my-skill" / "references" / "api.md").exists()
+        assert result["touched_paths"] == [str(tmp_path / "my-skill" / "references" / "api.md")]
 
     def test_write_to_nonexistent_skill(self, tmp_path):
         with _skill_dir(tmp_path):
@@ -424,6 +428,7 @@ class TestRemoveFile:
             result = _remove_file("my-skill", "references/api.md")
         assert result["success"] is True
         assert not (tmp_path / "my-skill" / "references" / "api.md").exists()
+        assert result["touched_paths"] == [str(tmp_path / "my-skill" / "references" / "api.md")]
 
     def test_remove_nonexistent_file(self, tmp_path):
         with _skill_dir(tmp_path):

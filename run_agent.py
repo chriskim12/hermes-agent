@@ -1129,6 +1129,20 @@ class AIAgent:
         except Exception:
             _agent_cfg = {}
 
+        skills_config = _agent_cfg.get("skills", {}) if isinstance(_agent_cfg.get("skills", {}), dict) else {}
+        auto_commit_cfg = skills_config.get("auto_commit", {}) if isinstance(skills_config.get("auto_commit", {}), dict) else {}
+        self._skill_autocommit_mode = str(auto_commit_cfg.get("mode", "off") or "off").strip().lower() or "off"
+        self._last_skill_autocommit_result = None
+        try:
+            from agent.skill_autocommit import SessionSkillAutoCommit
+            self._skill_autocommit = SessionSkillAutoCommit(
+                hermes_home=get_hermes_home(),
+                mode=self._skill_autocommit_mode,
+                session_id=self.session_id,
+            )
+        except Exception:
+            self._skill_autocommit = None
+
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
         self._memory_enabled = False
@@ -2995,6 +3009,26 @@ class AIAgent:
         NOT called per-turn — only at CLI exit, /reset, gateway
         session expiry, etc.
         """
+        tracker = getattr(self, "_skill_autocommit", None)
+        if tracker is not None:
+            try:
+                self._last_skill_autocommit_result = tracker.finalize()
+                _auto_commit_result = self._last_skill_autocommit_result or {}
+                if _auto_commit_result.get("status") == "committed":
+                    logger.info(
+                        "Session skill auto-commit created %s for session %s",
+                        _auto_commit_result.get("commit"),
+                        self.session_id or "",
+                    )
+                elif _auto_commit_result.get("status") == "skipped":
+                    logger.warning(
+                        "Session skill auto-commit skipped for session %s: %s",
+                        self.session_id or "",
+                        _auto_commit_result.get("reason"),
+                    )
+            except Exception as exc:
+                logger.debug("Session skill auto-commit finalize failed: %s", exc)
+
         if self._memory_manager:
             try:
                 self._memory_manager.on_session_end(messages or [])
@@ -6956,6 +6990,28 @@ class AIAgent:
                 enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
             )
 
+    def _note_skill_autocommit_attempt(self, function_name: str, function_args: dict) -> None:
+        if function_name != "skill_manage":
+            return
+        tracker = getattr(self, "_skill_autocommit", None)
+        if tracker is None:
+            return
+        try:
+            tracker.note_skill_manage_attempt(function_args)
+        except Exception as exc:
+            logger.debug("skill auto-commit pre-state capture failed: %s", exc)
+
+    def _record_skill_autocommit_candidate(self, function_name: str, function_result: str) -> None:
+        if function_name != "skill_manage":
+            return
+        tracker = getattr(self, "_skill_autocommit", None)
+        if tracker is None:
+            return
+        try:
+            tracker.record_tool_result(function_result)
+        except Exception as exc:
+            logger.debug("skill auto-commit candidate capture failed: %s", exc)
+
     def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute multiple tool calls concurrently using a thread pool.
 
@@ -6993,6 +7049,8 @@ class AIAgent:
                 function_args = {}
             if not isinstance(function_args, dict):
                 function_args = {}
+
+            self._note_skill_autocommit_attempt(function_name, function_args)
 
             # Checkpoint for file-mutating tools
             if function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
@@ -7138,6 +7196,8 @@ class AIAgent:
                 except Exception as cb_err:
                     logging.debug(f"Tool complete callback error: {cb_err}")
 
+            self._record_skill_autocommit_candidate(name, function_result)
+
             function_result = maybe_persist_tool_result(
                 content=function_result,
                 tool_name=name,
@@ -7197,6 +7257,8 @@ class AIAgent:
                 function_args = {}
             if not isinstance(function_args, dict):
                 function_args = {}
+
+            self._note_skill_autocommit_attempt(function_name, function_args)
 
             if not self.quiet_mode:
                 args_str = json.dumps(function_args, ensure_ascii=False)
@@ -7459,6 +7521,8 @@ class AIAgent:
                     self.tool_complete_callback(tool_call.id, function_name, function_args, function_result)
                 except Exception as cb_err:
                     logging.debug(f"Tool complete callback error: {cb_err}")
+
+            self._record_skill_autocommit_candidate(function_name, function_result)
 
             function_result = maybe_persist_tool_result(
                 content=function_result,

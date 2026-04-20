@@ -336,6 +336,7 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         "message": f"Skill '{name}' created.",
         "path": str(skill_dir.relative_to(SKILLS_DIR)),
         "skill_md": str(skill_md),
+        "touched_paths": [str(skill_md)],
     }
     if category:
         result["category"] = category
@@ -376,6 +377,7 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
         "success": True,
         "message": f"Skill '{name}' updated.",
         "path": str(existing["path"]),
+        "touched_paths": [str(skill_md)],
     }
 
 
@@ -464,6 +466,7 @@ def _patch_skill(
     return {
         "success": True,
         "message": f"Patched {'SKILL.md' if not file_path else file_path} in skill '{name}' ({match_count} replacement{'s' if match_count > 1 else ''}).",
+        "touched_paths": [str(target)],
     }
 
 
@@ -484,6 +487,7 @@ def _delete_skill(name: str) -> Dict[str, Any]:
     return {
         "success": True,
         "message": f"Skill '{name}' deleted.",
+        "touched_paths": [str(skill_dir)],
     }
 
 
@@ -536,6 +540,7 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
         "success": True,
         "message": f"File '{file_path}' written to skill '{name}'.",
         "path": str(target),
+        "touched_paths": [str(target)],
     }
 
 
@@ -578,6 +583,7 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     return {
         "success": True,
         "message": f"File '{file_path}' removed from skill '{name}'.",
+        "touched_paths": [str(target)],
     }
 
 
