@@ -16,10 +16,11 @@ repos:
     apply_window: manual-review
     bootstrap_required: true
     notes:
-      - initial baseline catch-up must be reviewed once before broad auto-apply
-      - 2026-04-20: baseline was fast-forwarded to v0.14.0 and the tree is now clean/tracking origin/main
-      - keep bootstrap_required until `npm test` passes on this ARM64 host; current blocker is `src/cli/__tests__/explore.test.ts` hydration coverage expecting an x64 native asset fixture
-      - after bootstrap clears, fast-forward-only apply is the intended lane
+      - initial baseline catch-up was reviewed before broad auto-apply
+      - 2026-04-20: baseline fast-forward completed to v0.14.0 and the tree is clean/tracking origin/main
+      - 2026-04-20: ARM64 hydration-fixture blocker was fixed on branch `ch-122-arm64-smoke-blocker`; `npm test` passes there on this host
+      - keep bootstrap_required until that fix is landed/reconciled onto the mainline update lane
+      - fast-forward-only apply remains the intended steady-state lane after bootstrap clears
   - name: clawhip
     path: /home/ubuntu/repos/clawhip
     mode: report_only
