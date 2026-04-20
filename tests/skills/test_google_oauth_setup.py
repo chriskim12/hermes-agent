@@ -33,6 +33,7 @@ class FakeCredentials:
                 "https://www.googleapis.com/auth/gmail.modify",
                 "https://www.googleapis.com/auth/calendar",
                 "https://www.googleapis.com/auth/drive.readonly",
+                "https://www.googleapis.com/auth/drive.file",
                 "https://www.googleapis.com/auth/contacts.readonly",
                 "https://www.googleapis.com/auth/spreadsheets",
                 "https://www.googleapis.com/auth/documents.readonly",
@@ -133,6 +134,12 @@ def setup_module(monkeypatch, tmp_path):
 
 
 class TestGetAuthUrl:
+    def test_requests_drive_upload_scope(self, setup_module):
+        setup_module.get_auth_url()
+
+        flow = FakeFlow.created[-1]
+        assert "https://www.googleapis.com/auth/drive.file" in flow.scopes
+
     def test_persists_state_and_code_verifier_for_later_exchange(self, setup_module, capsys):
         setup_module.get_auth_url()
 
@@ -225,6 +232,7 @@ class TestExchangeAuthCode:
             "client_secret": "client-secret",
             "scopes": [
                 "https://www.googleapis.com/auth/drive.readonly",
+                "https://www.googleapis.com/auth/drive.file",
                 "https://www.googleapis.com/auth/spreadsheets",
             ],
         }
