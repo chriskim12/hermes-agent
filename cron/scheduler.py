@@ -50,9 +50,19 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
-# response with this marker to suppress delivery.  Output is still saved
-# locally for audit.
+# response with this marker to suppress delivery. Output is still saved
+# locally for audit. Keep legacy NO_REPLY support for migrated jobs that
+# haven't been rewritten yet.
 SILENT_MARKER = "[SILENT]"
+LEGACY_SILENT_MARKERS = (SILENT_MARKER, "NO_REPLY")
+
+
+def _is_silent_response(content: str) -> bool:
+    """Return True when a cron response should suppress delivery."""
+    normalized = (content or "").strip().upper()
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in LEGACY_SILENT_MARKERS)
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 _hermes_home = get_hermes_home()
@@ -955,8 +965,12 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # output is already saved above).  Failed jobs always deliver.
                 deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
                 should_deliver = bool(deliver_content)
-                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
-                    logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+                if should_deliver and success and _is_silent_response(deliver_content):
+                    logger.info(
+                        "Job '%s': agent returned silent marker (%s) — skipping delivery",
+                        job["id"],
+                        deliver_content.strip(),
+                    )
                     should_deliver = False
 
                 delivery_error = None

@@ -7,6 +7,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -22,6 +23,17 @@ _SUPPORTED_HOSTS = {
     "music.youtube.com",
     "youtu.be",
 }
+_AGENT_BROWSER_COOKIE_DOMAINS = (
+    ".youtube.com",
+    "youtube.com",
+    ".google.com",
+    "google.com",
+    "accounts.google.com",
+)
+_YOUTUBE_AUTH_CHALLENGE_MARKERS = (
+    "sign in to confirm you're not a bot",
+    "sign in to confirm you’re not a bot",
+)
 
 
 def _tool_dirs() -> dict[str, Path]:
@@ -47,6 +59,270 @@ def _mutagen_available() -> bool:
         return True
     except ImportError:
         return False
+
+
+def _youtube_cookie_file() -> Path | None:
+    candidate = get_hermes_home() / "secrets" / "youtube-cookies.txt"
+    try:
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            return candidate
+    except OSError:
+        return None
+    return None
+
+
+def _agent_browser_profile_path() -> Path:
+    return get_hermes_home() / "integrations" / "youtube-agent-browser" / "profile"
+
+
+def _agent_browser_command() -> str | None:
+    command = shutil.which("agent-browser")
+    if command:
+        return command
+    local_bin = get_hermes_home() / "hermes-agent" / "node_modules" / ".bin" / "agent-browser"
+    if local_bin.is_file():
+        return str(local_bin)
+    return None
+
+
+def _is_google_or_youtube_cookie_domain(domain: str) -> bool:
+    normalized = (domain or "").strip().lower().lstrip(".")
+    if not normalized:
+        return False
+
+    for candidate in _AGENT_BROWSER_COOKIE_DOMAINS:
+        base = candidate.lower().lstrip(".")
+        if normalized == base or normalized.endswith(f".{base}"):
+            return True
+    return False
+
+
+def _netscape_bool(value: bool) -> str:
+    return "TRUE" if value else "FALSE"
+
+
+def _cookie_to_netscape_line(cookie: dict[str, Any]) -> str | None:
+    domain = str(cookie.get("domain") or "").strip()
+    name = str(cookie.get("name") or "").strip()
+    value = str(cookie.get("value") or "")
+    if not domain or not name or not _is_google_or_youtube_cookie_domain(domain):
+        return None
+
+    path = str(cookie.get("path") or "/")
+    secure = bool(cookie.get("secure", False))
+    expires_raw = cookie.get("expires", 0)
+    try:
+        expires = int(expires_raw)
+    except (TypeError, ValueError):
+        expires = 0
+    include_subdomains = domain.startswith(".")
+    return "\t".join(
+        [
+            domain,
+            _netscape_bool(include_subdomains),
+            path,
+            _netscape_bool(secure),
+            str(max(expires, 0)),
+            name,
+            value,
+        ]
+    )
+
+
+def _refresh_youtube_cookies_from_agent_browser() -> dict[str, Any]:
+    agent_browser = _agent_browser_command()
+    profile_path = _agent_browser_profile_path()
+    if not agent_browser:
+        return {
+            "success": False,
+            "error": "missing_agent_browser",
+            "detail": "agent-browser is not installed.",
+            "profile_path": str(profile_path),
+            "source": "agent_browser",
+        }
+
+    profile_path.mkdir(parents=True, exist_ok=True)
+    open_result = subprocess.run(
+        [agent_browser, "--profile", str(profile_path), "open", "https://www.youtube.com", "--json"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if open_result.returncode != 0:
+        return {
+            "success": False,
+            "error": "agent_browser_open_failed",
+            "detail": (open_result.stderr or open_result.stdout or "agent-browser open failed").strip(),
+            "profile_path": str(profile_path),
+            "source": "agent_browser",
+        }
+
+    cookie_result = subprocess.run(
+        [agent_browser, "--profile", str(profile_path), "cookies", "--json"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if cookie_result.returncode != 0:
+        return {
+            "success": False,
+            "error": "agent_browser_cookie_read_failed",
+            "detail": (cookie_result.stderr or cookie_result.stdout or "agent-browser cookies failed").strip(),
+            "profile_path": str(profile_path),
+            "source": "agent_browser",
+        }
+
+    try:
+        payload = json.loads(cookie_result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        return {
+            "success": False,
+            "error": "agent_browser_cookie_parse_failed",
+            "detail": str(exc),
+            "profile_path": str(profile_path),
+            "source": "agent_browser",
+        }
+
+    cookies = payload.get("data", {}).get("cookies", []) if isinstance(payload, dict) else []
+    lines = []
+    for cookie in cookies:
+        if not isinstance(cookie, dict):
+            continue
+        line = _cookie_to_netscape_line(cookie)
+        if line:
+            lines.append(line)
+
+    if not lines:
+        return {
+            "success": False,
+            "error": "no_youtube_cookies_found",
+            "detail": "No Google/YouTube cookies were available in the agent-browser profile.",
+            "profile_path": str(profile_path),
+            "source": "agent_browser",
+        }
+
+    cookie_path = get_hermes_home() / "secrets" / "youtube-cookies.txt"
+    cookie_path.parent.mkdir(parents=True, exist_ok=True)
+    cookie_path.write_text(
+        "# Netscape HTTP Cookie File\n" + "\n".join(sorted(lines)) + "\n",
+        encoding="utf-8",
+    )
+    cookie_path.chmod(0o600)
+    return {
+        "success": True,
+        "cookie_count": len(lines),
+        "cookie_path": str(cookie_path),
+        "profile_path": str(profile_path),
+        "source": "agent_browser",
+    }
+
+
+def _is_youtube_auth_challenge(detail: str) -> bool:
+    lowered = (detail or "").strip().lower()
+    return any(marker in lowered for marker in _YOUTUBE_AUTH_CHALLENGE_MARKERS)
+
+
+def _yt_dlp_base_command() -> list[str]:
+    command = ["yt-dlp"]
+    cookie_file = _youtube_cookie_file()
+    if cookie_file is not None:
+        command.extend(["--cookies", str(cookie_file)])
+    if shutil.which("node") is not None:
+        command.extend(["--js-runtimes", "node"])
+    return command
+
+
+def _google_drive_folder_config_path() -> Path:
+    return get_hermes_home() / "integrations" / "youtube-audio-google-drive-folder.txt"
+
+
+def _google_drive_folder_id() -> str | None:
+    candidate = _google_drive_folder_config_path()
+    try:
+        folder_id = candidate.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return folder_id or None
+
+
+def _google_workspace_bridge_path() -> Path | None:
+    candidate = get_hermes_home() / "skills" / "productivity" / "google-workspace" / "scripts" / "gws_bridge.py"
+    return candidate if candidate.is_file() else None
+
+
+def _upload_file_to_google_drive(path: Path) -> dict[str, Any] | None:
+    folder_id = _google_drive_folder_id()
+    if not folder_id:
+        return None
+
+    bridge_path = _google_workspace_bridge_path()
+    if bridge_path is None:
+        return {
+            "success": False,
+            "folder_id": folder_id,
+            "error": "missing_google_workspace_bridge",
+            "detail": "Google Workspace bridge script is not installed.",
+        }
+
+    token_path = get_hermes_home() / "google_token.json"
+    if not token_path.is_file():
+        return {
+            "success": False,
+            "folder_id": folder_id,
+            "error": "missing_google_auth",
+            "detail": f"No Google token found at {token_path}.",
+        }
+
+    upload_result = subprocess.run(
+        [
+            sys.executable,
+            str(bridge_path),
+            "drive",
+            "+upload",
+            str(path),
+            "--parent",
+            folder_id,
+            "--format",
+            "json",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if upload_result.returncode != 0:
+        return {
+            "success": False,
+            "folder_id": folder_id,
+            "error": "drive_upload_failed",
+            "detail": (upload_result.stderr or upload_result.stdout or "gws drive upload failed").strip(),
+        }
+
+    raw_output = (upload_result.stdout or "").strip()
+    payload: dict[str, Any] = {}
+    if raw_output:
+        try:
+            parsed = json.loads(raw_output)
+            if isinstance(parsed, dict):
+                payload = parsed
+        except json.JSONDecodeError:
+            payload = {}
+
+    result: dict[str, Any] = {
+        "success": True,
+        "folder_id": folder_id,
+    }
+    file_id = payload.get("id") or payload.get("fileId") or payload.get("file_id")
+    name = payload.get("name") or payload.get("filename")
+    web_view_link = payload.get("webViewLink") or payload.get("web_view_link") or payload.get("webLink")
+    if file_id:
+        result["file_id"] = file_id
+    if name:
+        result["name"] = name
+    if web_view_link:
+        result["web_view_link"] = web_view_link
+    if payload:
+        result["raw"] = payload
+    return result
 
 
 def check_youtube_audio_requirements() -> bool:
@@ -172,7 +448,7 @@ def _extract_media_info(path: Path) -> dict[str, Any]:
 
 def _fetch_youtube_metadata(url: str, video_id: str) -> dict[str, Any]:
     result = subprocess.run(
-        ["yt-dlp", "--dump-single-json", "--no-playlist", url],
+        _yt_dlp_base_command() + ["--dump-single-json", "--no-playlist", url],
         capture_output=True,
         text=True,
         timeout=120,
@@ -271,27 +547,49 @@ def youtube_to_mp3(url: str, preferred_bitrate: str = "320k", task_id: str | Non
     metadata_year = _year_from_upload_date(youtube_metadata.get("upload_date"))
 
     try:
+        auth_refresh: dict[str, Any] | None = None
+        download_command = _yt_dlp_base_command() + [
+            "--no-playlist",
+            "-f",
+            "bestaudio/best",
+            "-o",
+            str(incoming_path),
+            url,
+        ]
         download_result = subprocess.run(
-            [
-                "yt-dlp",
-                "--no-playlist",
-                "-f",
-                "bestaudio/best",
-                "-o",
-                str(incoming_path),
-                url,
-            ],
+            download_command,
             capture_output=True,
             text=True,
             timeout=300,
         )
         if download_result.returncode != 0:
-            return _error_payload(
-                "download_failed",
-                (download_result.stderr or download_result.stdout or "yt-dlp failed").strip(),
-                source_url=url,
-                video_id=video_id,
-            )
+            download_error = (download_result.stderr or download_result.stdout or "yt-dlp failed").strip()
+            if _is_youtube_auth_challenge(download_error):
+                auth_refresh = _refresh_youtube_cookies_from_agent_browser()
+                if auth_refresh.get("success"):
+                    download_result = subprocess.run(
+                        _yt_dlp_base_command()
+                        + [
+                            "--no-playlist",
+                            "-f",
+                            "bestaudio/best",
+                            "-o",
+                            str(incoming_path),
+                            url,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=300,
+                    )
+                    download_error = (download_result.stderr or download_result.stdout or "yt-dlp failed").strip()
+            if download_result.returncode != 0:
+                return _error_payload(
+                    "download_failed",
+                    download_error,
+                    source_url=url,
+                    video_id=video_id,
+                    auth_refresh=auth_refresh,
+                )
 
         conversion_result = subprocess.run(
             [
@@ -359,18 +657,28 @@ def youtube_to_mp3(url: str, preferred_bitrate: str = "320k", task_id: str | Non
             },
         )
 
-        return json.dumps(
-            {
-                "success": True,
-                "file_path": str(processed_path),
-                "title": title,
-                "artist": artist,
-                "artist_inferred": artist_inferred,
-                "source_url": url,
-                "video_id": video_id,
-                "warnings": warnings,
-            }
-        )
+        drive_upload = _upload_file_to_google_drive(processed_path)
+        if drive_upload and not drive_upload.get("success"):
+            warnings.append(
+                f"google drive upload failed: {drive_upload.get('detail') or drive_upload.get('error') or 'unknown error'}"
+            )
+
+        payload = {
+            "success": True,
+            "file_path": str(processed_path),
+            "title": title,
+            "artist": artist,
+            "artist_inferred": artist_inferred,
+            "source_url": url,
+            "video_id": video_id,
+            "warnings": warnings,
+        }
+        if auth_refresh is not None:
+            payload["auth_refresh"] = auth_refresh
+        if drive_upload is not None:
+            payload["drive_upload"] = drive_upload
+
+        return json.dumps(payload)
     except subprocess.TimeoutExpired as exc:
         if incoming_path.exists():
             shutil.move(str(incoming_path), failed_path)

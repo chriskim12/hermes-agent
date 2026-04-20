@@ -78,3 +78,30 @@ async def test_send_retries_without_reference_when_reply_target_is_system_messag
     assert channel.send.await_count == 2
     assert send_calls[0]["reference"] is ref_msg
     assert send_calls[1]["reference"] is None
+
+
+@pytest.mark.asyncio
+async def test_send_voice_mp3_uses_regular_file_attachment(tmp_path):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    audio_path = tmp_path / "track.mp3"
+    audio_path.write_bytes(b"fake-mp3")
+
+    sent_msg = SimpleNamespace(id=4321)
+    channel = SimpleNamespace(id=777, send=AsyncMock(return_value=sent_msg))
+    http = SimpleNamespace(request=AsyncMock(return_value={"id": "999"}))
+
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+        http=http,
+    )
+
+    result = await adapter.send_voice("555", str(audio_path), caption="here")
+
+    assert result.success is True
+    assert result.message_id == "4321"
+    assert http.request.await_count == 0
+    channel.send.assert_awaited_once()
+    send_kwargs = channel.send.await_args.kwargs
+    assert send_kwargs["content"] == "here"
+    assert send_kwargs["file"].filename == "track.mp3"

@@ -938,9 +938,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=f"Audio file not found: {audio_path}")
 
             filename = os.path.basename(audio_path)
+            ext = os.path.splitext(filename)[1].lower()
 
             with open(audio_path, "rb") as f:
                 file_data = f.read()
+
+            if ext not in {".ogg", ".opus"}:
+                file = discord.File(io.BytesIO(file_data), filename=filename)
+                msg = await channel.send(content=caption if caption else None, file=file)
+                return SendResult(success=True, message_id=str(msg.id))
 
             # Try sending as a native voice message via raw API (flags=8192).
             try:
@@ -984,7 +990,7 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as voice_err:
                 logger.debug("Voice message flag failed, falling back to file: %s", voice_err)
                 file = discord.File(io.BytesIO(file_data), filename=filename)
-                msg = await channel.send(file=file)
+                msg = await channel.send(content=caption if caption else None, file=file)
                 return SendResult(success=True, message_id=str(msg.id))
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send audio, falling back to base adapter: %s", self.name, e, exc_info=True)

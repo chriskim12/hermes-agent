@@ -110,6 +110,28 @@ class TestIsTimeoutError:
         assert not _StubAdapter._is_timeout_error("ConnectionError: host unreachable")
 
 
+class TestCleanupSentLocalMedia:
+    def test_deletes_youtube_audio_cache_file_under_hermes_home(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("gateway.platforms.base.get_hermes_home", lambda: tmp_path)
+        media_path = tmp_path / "media_cache" / "youtube-audio" / "processed" / "track.mp3"
+        media_path.parent.mkdir(parents=True, exist_ok=True)
+        media_path.write_bytes(b"mp3")
+
+        _StubAdapter._cleanup_sent_local_media(str(media_path))
+
+        assert not media_path.exists()
+
+    def test_keeps_unrelated_files(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("gateway.platforms.base.get_hermes_home", lambda: tmp_path)
+        media_path = tmp_path / "other" / "track.mp3"
+        media_path.parent.mkdir(parents=True, exist_ok=True)
+        media_path.write_bytes(b"mp3")
+
+        _StubAdapter._cleanup_sent_local_media(str(media_path))
+
+        assert media_path.exists()
+
+
 # ---------------------------------------------------------------------------
 # _send_with_retry — success on first attempt
 # ---------------------------------------------------------------------------
