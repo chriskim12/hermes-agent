@@ -30,6 +30,7 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
     "show_reasoning": False,
     "tool_preview_length": 0,
+    "iteration_report_every": 0,
     "streaming": None,  # None = follow top-level streaming config
 }
 
@@ -45,6 +46,7 @@ _TIER_HIGH = {
     "tool_progress": "all",
     "show_reasoning": False,
     "tool_preview_length": 40,
+    "iteration_report_every": 0,
     "streaming": None,  # follow global
 }
 
@@ -52,6 +54,7 @@ _TIER_MEDIUM = {
     "tool_progress": "new",
     "show_reasoning": False,
     "tool_preview_length": 40,
+    "iteration_report_every": 0,
     "streaming": None,
 }
 
@@ -59,6 +62,7 @@ _TIER_LOW = {
     "tool_progress": "off",
     "show_reasoning": False,
     "tool_preview_length": 40,
+    "iteration_report_every": 0,
     "streaming": False,
 }
 
@@ -66,6 +70,7 @@ _TIER_MINIMAL = {
     "tool_progress": "off",
     "show_reasoning": False,
     "tool_preview_length": 0,
+    "iteration_report_every": 0,
     "streaming": False,
 }
 
@@ -164,18 +169,19 @@ def resolve_display_setting(
 
 
 def get_platform_defaults(platform_key: str) -> dict[str, Any]:
-    """Return the built-in default display settings for a platform.
+    """Return a copy of the built-in default display settings for a platform.
 
-    Falls back to ``_GLOBAL_DEFAULTS`` for unknown platforms.
+    Unknown platforms fall back to the global defaults.
     """
-    return dict(_PLATFORM_DEFAULTS.get(platform_key, _GLOBAL_DEFAULTS))
+    defaults = dict(_GLOBAL_DEFAULTS)
+    plat_defaults = _PLATFORM_DEFAULTS.get(platform_key)
+    if plat_defaults:
+        defaults.update(plat_defaults)
+    return defaults
 
 
 def get_effective_display(user_config: dict, platform_key: str) -> dict[str, Any]:
-    """Return the fully-resolved display settings for a platform.
-
-    Useful for status commands that want to show all effective settings.
-    """
+    """Return the fully resolved display settings for a platform."""
     return {
         key: resolve_display_setting(user_config, platform_key, key)
         for key in OVERRIDEABLE_KEYS
@@ -198,7 +204,7 @@ def _normalise(setting: str, value: Any) -> Any:
         if isinstance(value, str):
             return value.lower() in ("true", "1", "yes", "on")
         return bool(value)
-    if setting == "tool_preview_length":
+    if setting in ("tool_preview_length", "iteration_report_every"):
         try:
             return int(value)
         except (TypeError, ValueError):

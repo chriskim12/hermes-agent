@@ -32,6 +32,33 @@ def test_load_gateway_config_bridges_stt_enabled_from_config_yaml(tmp_path, monk
     assert config.stt_enabled is False
 
 
+def test_load_gateway_config_bridges_discord_guild_skill_bindings_from_config_yaml(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "discord": {
+                    "guild_skill_bindings": [
+                        {"id": "1486771653466656901", "skills": ["yuuka-discord-voice-autoattach"]}
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    config = load_gateway_config()
+
+    assert Platform.DISCORD in config.platforms
+    assert config.platforms[Platform.DISCORD].extra["guild_skill_bindings"] == [
+        {"id": "1486771653466656901", "skills": ["yuuka-discord-voice-autoattach"]}
+    ]
+
+
 @pytest.mark.asyncio
 async def test_enrich_message_with_transcription_skips_when_stt_disabled():
     from gateway.run import GatewayRunner

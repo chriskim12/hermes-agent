@@ -46,6 +46,10 @@ _HERMES_CORE_TOOLS = [
     "browser_vision", "browser_console",
     # Text-to-speech
     "text_to_speech",
+    # Audio extraction
+    "youtube_to_mp3",
+    # Yuuka voice reactions
+    "yuuka_voice_reply",
     # Planning & memory
     "todo", "memory",
     # Session history search
@@ -153,6 +157,18 @@ TOOLSETS = {
     "tts": {
         "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, or OpenAI",
         "tools": ["text_to_speech"],
+        "includes": []
+    },
+
+    "youtube_audio": {
+        "description": "Download audio from supported YouTube URLs and convert it to MP3",
+        "tools": ["youtube_to_mp3"],
+        "includes": []
+    },
+
+    "yuuka_voice": {
+        "description": "Select and cache semantically aligned Hayase Yuuka voice clips for native media delivery",
+        "tools": ["yuuka_voice_reply"],
         "includes": []
     },
     

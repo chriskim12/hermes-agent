@@ -71,6 +71,22 @@ class FakeAgent:
         }
 
 
+class InitCaptureAgent:
+    last_init_kwargs = None
+
+    def __init__(self, **kwargs):
+        type(self).last_init_kwargs = kwargs
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class LongPreviewAgent:
     """Agent that emits a tool call with a very long preview string."""
     LONG_CMD = "cd /home/teknium/.hermes/hermes-agent/.worktrees/hermes-d8860339 && source .venv/bin/activate && python -m pytest tests/gateway/test_run_progress_topics.py -n0 -q"
@@ -362,6 +378,22 @@ class CommentaryAgent:
         }
 
 
+class IterationReportingAgent:
+    def __init__(self, **kwargs):
+        self.step_callback = kwargs.get("step_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        for iteration in range(1, 12):
+            if self.step_callback:
+                self.step_callback(iteration, [{"name": "read_file", "result": '{"content": "ok"}'}])
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 11,
+        }
+
+
 class PreviewedResponseAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -372,6 +404,25 @@ class PreviewedResponseAgent:
             self.interim_assistant_callback("You're welcome.", already_streamed=False)
         return {
             "final_response": "You're welcome.",
+            "response_previewed": True,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class StreamingRefineAgent:
+    def __init__(self, **kwargs):
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.stream_delta_callback:
+            self.stream_delta_callback("Continuing to refine:")
+        time.sleep(0.1)
+        if self.stream_delta_callback:
+            self.stream_delta_callback(" Final answer.")
+        return {
+            "final_response": "Continuing to refine: Final answer.",
             "response_previewed": True,
             "messages": [],
             "api_calls": 1,
@@ -425,7 +476,17 @@ async def _run_with_agent(
     session_id,
     pending_text=None,
     config_data=None,
+    platform=Platform.TELEGRAM,
+    chat_id="-1001",
+    chat_type="group",
+    thread_id="17585",
+    max_iterations_env="90",
 ):
+    if max_iterations_env is None:
+        monkeypatch.delenv("HERMES_MAX_ITERATIONS", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_MAX_ITERATIONS", max_iterations_env)
+
     if config_data:
         import yaml
 
@@ -439,7 +500,7 @@ async def _run_with_agent(
     fake_run_agent.AIAgent = agent_cls
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
-    adapter = ProgressCaptureAdapter()
+    adapter = ProgressCaptureAdapter(platform=platform)
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     if config_data and "streaming" in config_data:
@@ -447,12 +508,14 @@ async def _run_with_agent(
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
     source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="-1001",
-        chat_type="group",
-        thread_id="17585",
+        platform=platform,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        thread_id=thread_id,
     )
-    session_key = "agent:main:telegram:group:-1001:17585"
+    session_key = f"agent:main:{platform.value}:{chat_type}:{chat_id}"
+    if thread_id:
+        session_key = f"{session_key}:{thread_id}"
     if pending_text is not None:
         adapter._pending_messages[session_key] = MessageEvent(
             text=pending_text,
@@ -470,6 +533,24 @@ async def _run_with_agent(
         session_key=session_key,
     )
     return adapter, result
+
+
+@pytest.mark.asyncio
+async def test_run_agent_uses_default_max_iterations_when_env_unset(monkeypatch, tmp_path):
+    InitCaptureAgent.last_init_kwargs = None
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        InitCaptureAgent,
+        session_id="sess-default-max-iterations",
+        max_iterations_env=None,
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == []
+    assert InitCaptureAgent.last_init_kwargs is not None
+    assert InitCaptureAgent.last_init_kwargs["max_iterations"] == 90
 
 
 @pytest.mark.asyncio
@@ -567,6 +648,22 @@ async def test_run_agent_interim_commentary_works_with_tool_progress_off(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_run_agent_surfaces_iteration_reports_every_ten_steps(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        IterationReportingAgent,
+        session_id="sess-iteration-report",
+        config_data={"display": {"iteration_report_every": 10}},
+    )
+
+    assert result.get("already_sent") is not True
+    reports = [call["content"] for call in adapter.sent if "10/90" in call["content"]]
+    assert reports, adapter.sent
+    assert any("iteration" in report.lower() for report in reports)
+
+
+@pytest.mark.asyncio
 async def test_run_agent_previewed_final_marks_already_sent(monkeypatch, tmp_path):
     adapter, result = await _run_with_agent(
         monkeypatch,
@@ -578,6 +675,30 @@ async def test_run_agent_previewed_final_marks_already_sent(monkeypatch, tmp_pat
 
     assert result.get("already_sent") is True
     assert [call["content"] for call in adapter.sent] == ["You're welcome."]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_matrix_streaming_omits_cursor(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StreamingRefineAgent,
+        session_id="sess-matrix-streaming",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        platform=Platform.MATRIX,
+        chat_id="!room:matrix.example.org",
+        chat_type="group",
+        thread_id="$thread",
+    )
+
+    assert result.get("already_sent") is True
+    all_text = [call["content"] for call in adapter.sent] + [call["content"] for call in adapter.edits]
+    assert all_text, "expected streamed Matrix content to be sent or edited"
+    assert all("▉" not in text for text in all_text)
+    assert any("Continuing to refine:" in text for text in all_text)
 
 
 @pytest.mark.asyncio

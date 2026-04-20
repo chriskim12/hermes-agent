@@ -12,7 +12,6 @@ import hashlib
 import logging
 import os
 import json
-import re
 import threading
 import uuid
 from pathlib import Path
@@ -81,6 +80,7 @@ class SessionSource:
     user_name: Optional[str] = None
     thread_id: Optional[str] = None  # For forum topics, Discord threads, etc.
     chat_topic: Optional[str] = None  # Channel topic/description (Discord, Slack)
+    jump_url: Optional[str] = None  # Deep link back to the originating Discord message/thread when available
     user_id_alt: Optional[str] = None  # Signal UUID (alternative to phone number)
     chat_id_alt: Optional[str] = None  # Signal group internal ID
     
@@ -115,6 +115,7 @@ class SessionSource:
             "user_name": self.user_name,
             "thread_id": self.thread_id,
             "chat_topic": self.chat_topic,
+            "jump_url": self.jump_url,
         }
         if self.user_id_alt:
             d["user_id_alt"] = self.user_id_alt
@@ -133,6 +134,7 @@ class SessionSource:
             user_name=data.get("user_name"),
             thread_id=data.get("thread_id"),
             chat_topic=data.get("chat_topic"),
+            jump_url=data.get("jump_url"),
             user_id_alt=data.get("user_id_alt"),
             chat_id_alt=data.get("chat_id_alt"),
         )
@@ -373,6 +375,15 @@ class SessionEntry:
     # this session (create a new session_id) so the user starts fresh.
     # Set by /stop to break stuck-resume loops (#7536).
     suspended: bool = False
+
+    # Persisted crash/restart recovery marker. Unlike ``suspended``, interrupted
+    # sessions keep the same session_id/transcript and resume on the next turn.
+    interrupted: bool = False
+    interrupted_reason: Optional[str] = None
+
+    # One-shot in-memory signal consumed by the message handler to inject a
+    # resume note into the next prompt. Not persisted.
+    was_interrupted: bool = False
     
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -393,6 +404,8 @@ class SessionEntry:
             "cost_status": self.cost_status,
             "memory_flushed": self.memory_flushed,
             "suspended": self.suspended,
+            "interrupted": self.interrupted,
+            "interrupted_reason": self.interrupted_reason,
         }
         if self.origin:
             result["origin"] = self.origin.to_dict()
@@ -430,6 +443,8 @@ class SessionEntry:
             cost_status=data.get("cost_status", "unknown"),
             memory_flushed=data.get("memory_flushed", False),
             suspended=data.get("suspended", False),
+            interrupted=data.get("interrupted", False),
+            interrupted_reason=data.get("interrupted_reason"),
         )
 
 
@@ -712,6 +727,12 @@ class SessionStore:
                 else:
                     reset_reason = self._should_reset(entry, source)
                 if not reset_reason:
+                    if entry.interrupted:
+                        entry.updated_at = now
+                        entry.interrupted = False
+                        entry.was_interrupted = True
+                        self._save()
+                        return entry
                     entry.updated_at = now
                     self._save()
                     return entry
@@ -750,6 +771,7 @@ class SessionStore:
                 "session_id": session_id,
                 "source": source.platform.value,
                 "user_id": source.user_id,
+                "source_metadata": source.to_dict(),
             }
 
         # SQLite operations outside the lock
@@ -782,6 +804,45 @@ class SessionStore:
                 if last_prompt_tokens is not None:
                     entry.last_prompt_tokens = last_prompt_tokens
                 self._save()
+
+    def get_session_entry(self, session_key: str) -> Optional[SessionEntry]:
+        """Return a copy of the persisted session entry for *session_key*."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if not entry:
+                return None
+            return SessionEntry.from_dict(entry.to_dict())
+
+    def mark_interrupted_sessions(
+        self,
+        session_keys: list[str],
+        reason: str = "restart",
+    ) -> int:
+        """Mark exact sessions as interrupted so the next turn resumes them.
+
+        Used for gateway restart/crash recovery. Interrupted sessions preserve
+        their session_id and transcript; the next access clears the persisted
+        flag and exposes a one-shot ``was_interrupted`` marker to the caller.
+        """
+        count = 0
+        keys = {key for key in session_keys if key}
+        if not keys:
+            return 0
+
+        with self._lock:
+            self._ensure_loaded_locked()
+            for key in keys:
+                entry = self._entries.get(key)
+                if not entry:
+                    continue
+                entry.interrupted = True
+                entry.interrupted_reason = reason
+                entry.was_interrupted = False
+                count += 1
+            if count:
+                self._save()
+        return count
 
     def suspend_session(self, session_key: str) -> bool:
         """Mark a session as suspended so it auto-resets on next access.
@@ -856,6 +917,7 @@ class SessionStore:
                 "session_id": session_id,
                 "source": old_entry.platform.value if old_entry.platform else "unknown",
                 "user_id": old_entry.origin.user_id if old_entry.origin else None,
+                "source_metadata": old_entry.origin.to_dict() if old_entry.origin else None,
             }
 
         if self._db and db_end_session_id:
@@ -878,7 +940,8 @@ class SessionStore:
         Used by ``/resume`` to restore a previously-named session.
         Ends the current session in SQLite (like reset), but instead of
         generating a fresh session ID, re-uses ``target_session_id`` so the
-        old transcript is loaded on the next message.
+        old transcript is loaded on the next message. If the target session was
+        previously ended, re-open it so gateway resume semantics match the CLI.
         """
         db_end_session_id = None
         new_entry = None
@@ -917,6 +980,12 @@ class SessionStore:
                 self._db.end_session(db_end_session_id, "session_switch")
             except Exception as e:
                 logger.debug("Session DB end_session failed: %s", e)
+
+        if self._db:
+            try:
+                self._db.reopen_session(target_session_id)
+            except Exception as e:
+                logger.debug("Session DB reopen_session failed: %s", e)
 
         return new_entry
 

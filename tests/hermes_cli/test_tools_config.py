@@ -30,6 +30,22 @@ def test_get_platform_tools_preserves_explicit_empty_selection():
     assert enabled == set()
 
 
+def test_get_platform_tools_keeps_yuuka_voice_from_default_discord_toolset():
+    """Platform defaults like hermes-discord must still expose Yuuka voice.
+
+    Regression test for guild-wide auto-loaded skills that rely on
+    `yuuka_voice_reply`: when discord is still on the default composite
+    toolset (`hermes-discord`), `_get_platform_tools()` reverse-mapped only
+    configurable toolsets and silently dropped the non-configurable
+    `yuuka_voice` toolset.
+    """
+    config = {"platform_toolsets": {"discord": ["hermes-discord"]}}
+
+    enabled = _get_platform_tools(config, "discord")
+
+    assert "yuuka_voice" in enabled
+
+
 def test_platform_toolset_summary_uses_explicit_platform_list():
     config = {}
 
@@ -119,8 +135,7 @@ def test_toolset_has_keys_for_vision_accepts_codex_auth(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("AUXILIARY_VISION_PROVIDER", raising=False)
-    monkeypatch.delenv("CONTEXT_VISION_PROVIDER", raising=False)
+
     monkeypatch.setattr(
         "agent.auxiliary_client.resolve_vision_provider_client",
         lambda: ("openai-codex", object(), "gpt-4.1"),

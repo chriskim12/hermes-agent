@@ -146,6 +146,40 @@ class TestTruncateAroundMatches:
         result = _truncate_around_matches(text, "KEYWORD")
         assert "KEYWORD" in result
 
+    def test_multiword_phrase_match_beats_individual_term(self):
+        """Full phrase deep in text should be found even when a single term
+        appears much earlier in boilerplate."""
+        boilerplate = "The project setup is complex. " * 500  # ~15K, has 'project' early
+        filler = "x" * (MAX_SESSION_CHARS + 20000)
+        target = "We reviewed the keystone project roadmap in detail."
+        text = boilerplate + filler + target + filler
+        result = _truncate_around_matches(text, "keystone project")
+        assert "keystone project" in result.lower()
+
+    def test_multiword_proximity_cooccurrence(self):
+        """When exact phrase is absent, terms co-occurring within proximity
+        should be preferred over a lone early term."""
+        early = "project " + "a" * (MAX_SESSION_CHARS + 20000)
+        # Place 'keystone' and 'project' near each other (but not as exact phrase)
+        cooccur = "this keystone initiative for the project was pivotal"
+        tail = "b" * (MAX_SESSION_CHARS + 20000)
+        text = early + cooccur + tail
+        result = _truncate_around_matches(text, "keystone project")
+        assert "keystone" in result.lower()
+        assert "project" in result.lower()
+
+    def test_multiword_window_maximises_coverage(self):
+        """Sliding window should capture as many match clusters as possible."""
+        # Place two phrase matches: one at ~50K, one at ~60K, both should fit
+        pre = "z" * 50000
+        match1 = " alpha beta "
+        gap = "z" * 10000
+        match2 = " alpha beta "
+        post = "z" * (MAX_SESSION_CHARS + 40000)
+        text = pre + match1 + gap + match2 + post
+        result = _truncate_around_matches(text, "alpha beta")
+        assert result.lower().count("alpha beta") == 2
+
 
 # =========================================================================
 # session_search (dispatcher)
@@ -284,3 +318,67 @@ class TestSessionSearch:
         assert result["count"] == 0
         assert result["results"] == []
         assert result["sessions_searched"] == 0
+
+    def test_recent_sessions_include_origin_jump_url_when_available(self):
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import _list_recent_sessions
+
+        mock_db = MagicMock()
+        mock_db.list_sessions_rich.return_value = [
+            {
+                "id": "discord-session-1",
+                "title": "watchdog target",
+                "source": "discord",
+                "started_at": 1709500000,
+                "last_active": 1709500300,
+                "message_count": 4,
+                "preview": "unfinished work",
+                "source_metadata": json.dumps({
+                    "chat_name": "Guild / #general / thread",
+                    "chat_type": "thread",
+                    "thread_id": "456",
+                    "jump_url": "https://discord.com/channels/1/456/123",
+                }),
+            }
+        ]
+
+        result = json.loads(_list_recent_sessions(mock_db, limit=1, current_session_id="current"))
+
+        assert result["success"] is True
+        assert result["results"][0]["origin"]["jump_url"] == "https://discord.com/channels/1/456/123"
+
+    def test_keyword_search_includes_origin_jump_url_when_available(self):
+        from unittest.mock import AsyncMock, MagicMock, patch as _patch
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {
+                "session_id": "discord-session-1",
+                "content": "resume this thread",
+                "source": "discord",
+                "session_started": 1709500000,
+                "model": "gpt-5.4-mini",
+            }
+        ]
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "resume this thread"},
+            {"role": "assistant", "content": "I'll continue."},
+        ]
+        mock_db.get_session.return_value = {
+            "parent_session_id": None,
+            "source_metadata": json.dumps({
+                "chat_name": "Guild / #general / thread",
+                "chat_type": "thread",
+                "thread_id": "456",
+                "jump_url": "https://discord.com/channels/1/456/123",
+            }),
+        }
+
+        with _patch("tools.session_search_tool.async_call_llm",
+                     new_callable=AsyncMock,
+                     side_effect=RuntimeError("no provider")):
+            result = json.loads(session_search(query="resume", db=mock_db, limit=1))
+
+        assert result["success"] is True
+        assert result["results"][0]["origin"]["jump_url"] == "https://discord.com/channels/1/456/123"

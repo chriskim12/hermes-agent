@@ -241,7 +241,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
 from gateway.session import SessionSource, build_session_key
-from hermes_constants import get_hermes_dir
+from hermes_constants import get_hermes_dir, get_hermes_home
 
 
 GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE = (
@@ -1231,6 +1231,23 @@ class BasePlatformAdapter(ABC):
         return media, cleaned
 
     @staticmethod
+    def _cleanup_sent_local_media(media_path: str) -> None:
+        """Delete transient youtube-audio cache files after successful delivery."""
+        if not media_path:
+            return
+        try:
+            resolved = Path(media_path).expanduser().resolve(strict=False)
+            cache_root = (get_hermes_home() / "media_cache" / "youtube-audio").resolve(strict=False)
+            resolved.relative_to(cache_root)
+        except Exception:
+            return
+        try:
+            if resolved.is_file():
+                resolved.unlink()
+        except OSError:
+            pass
+
+    @staticmethod
     def extract_local_files(content: str) -> Tuple[List[str], str]:
         """
         Detect bare local file paths in response text for native media delivery.
@@ -1764,6 +1781,8 @@ class BasePlatformAdapter(ABC):
 
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
+                        else:
+                            self._cleanup_sent_local_media(media_path)
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
@@ -1896,6 +1915,7 @@ class BasePlatformAdapter(ABC):
         user_name: Optional[str] = None,
         thread_id: Optional[str] = None,
         chat_topic: Optional[str] = None,
+        jump_url: Optional[str] = None,
         user_id_alt: Optional[str] = None,
         chat_id_alt: Optional[str] = None,
     ) -> SessionSource:
@@ -1912,6 +1932,7 @@ class BasePlatformAdapter(ABC):
             user_name=user_name,
             thread_id=str(thread_id) if thread_id else None,
             chat_topic=chat_topic.strip() if chat_topic else None,
+            jump_url=jump_url.strip() if isinstance(jump_url, str) and jump_url.strip() else None,
             user_id_alt=user_id_alt,
             chat_id_alt=chat_id_alt,
         )

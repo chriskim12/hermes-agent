@@ -10,7 +10,6 @@ Uses discord.py library for:
 """
 
 import asyncio
-import json
 import logging
 import os
 import struct
@@ -19,7 +18,6 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
-from pathlib import Path
 from typing import Callable, Dict, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -442,6 +440,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._voice_text_channels: Dict[int, int] = {}  # guild_id -> text_channel_id
+        self._voice_sources: Dict[int, Dict[str, Any]] = {}  # guild_id -> linked text channel source metadata
         self._voice_timeout_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> timeout task
         # Phase 2: voice listening
         self._voice_receivers: Dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
@@ -939,9 +938,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=f"Audio file not found: {audio_path}")
 
             filename = os.path.basename(audio_path)
+            ext = os.path.splitext(filename)[1].lower()
 
             with open(audio_path, "rb") as f:
                 file_data = f.read()
+
+            if ext not in {".ogg", ".opus"}:
+                file = discord.File(io.BytesIO(file_data), filename=filename)
+                msg = await channel.send(content=caption if caption else None, file=file)
+                return SendResult(success=True, message_id=str(msg.id))
 
             # Try sending as a native voice message via raw API (flags=8192).
             try:
@@ -985,7 +990,7 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as voice_err:
                 logger.debug("Voice message flag failed, falling back to file: %s", voice_err)
                 file = discord.File(io.BytesIO(file_data), filename=filename)
-                msg = await channel.send(file=file)
+                msg = await channel.send(content=caption if caption else None, file=file)
                 return SendResult(success=True, message_id=str(msg.id))
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send audio, falling back to base adapter: %s", self.name, e, exc_info=True)
@@ -1045,6 +1050,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if task:
             task.cancel()
         self._voice_text_channels.pop(guild_id, None)
+        self._voice_sources.pop(guild_id, None)
 
     # Maximum seconds to wait for voice playback before giving up
     PLAYBACK_TIMEOUT = 120
@@ -1809,6 +1815,7 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            jump_url=getattr(getattr(interaction, "channel", None), "jump_url", None),
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
@@ -1885,10 +1892,12 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            jump_url=getattr(getattr(interaction, "channel", None), "jump_url", None),
         )
 
         _parent_id = str(getattr(getattr(interaction, "channel", None), "parent_id", "") or "")
-        _skills = self._resolve_channel_skills(thread_id, _parent_id or None)
+        _guild_id = str(getattr(getattr(getattr(interaction, "channel", None), "guild", None), "id", "") or "")
+        _skills = self._resolve_channel_skills(thread_id, _parent_id or None, _guild_id or None)
         event = MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
@@ -1898,18 +1907,26 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         await self.handle_message(event)
 
-    def _resolve_channel_skills(self, channel_id: str, parent_id: str | None = None) -> list[str] | None:
-        """Look up auto-skill bindings for a Discord channel/forum thread.
+    def _resolve_channel_skills(
+        self,
+        channel_id: str,
+        parent_id: str | None = None,
+        guild_id: str | None = None,
+    ) -> list[str] | None:
+        """Look up auto-skill bindings for a Discord channel/forum thread/guild.
 
         Config format (in platform extra):
             channel_skill_bindings:
               - id: "123456"
                 skills: ["skill-a", "skill-b"]
-        Also checks parent_id so forum threads inherit the forum's bindings.
+            guild_skill_bindings:
+              - id: "987654"
+                skills: ["guild-skill"]
+
+        Channel/thread bindings win over guild-wide bindings. Also checks
+        parent_id so forum threads inherit the forum's bindings.
         """
         bindings = self.config.extra.get("channel_skill_bindings", [])
-        if not bindings:
-            return None
         ids_to_check = {channel_id}
         if parent_id:
             ids_to_check.add(parent_id)
@@ -1921,6 +1938,17 @@ class DiscordAdapter(BasePlatformAdapter):
                     return [skills]
                 if isinstance(skills, list) and skills:
                     return list(dict.fromkeys(skills))  # dedup, preserve order
+
+        guild_bindings = self.config.extra.get("guild_skill_bindings", [])
+        if guild_id:
+            for entry in guild_bindings:
+                entry_id = str(entry.get("id", ""))
+                if entry_id == guild_id:
+                    skills = entry.get("skills") or entry.get("skill")
+                    if isinstance(skills, str):
+                        return [skills]
+                    if isinstance(skills, list) and skills:
+                        return list(dict.fromkeys(skills))
         return None
 
     def _thread_parent_channel(self, channel: Any) -> Any:
@@ -2244,6 +2272,7 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_id = str(message.channel.id)
             parent_channel_id = self._get_parent_channel_id(message.channel)
 
+        is_voice_linked_channel = False
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
@@ -2270,7 +2299,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel_ids.add(parent_channel_id)
 
             require_mention = os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in ("false", "0", "no")
-            is_free_channel = bool(channel_ids & free_channels)
+            # Voice-linked text channels act as free-response while voice is active.
+            # Only the exact bound channel gets the exemption, not sibling threads.
+            voice_linked_ids = {str(ch_id) for ch_id in self._voice_text_channels.values()}
+            current_channel_id = str(message.channel.id)
+            is_voice_linked_channel = current_channel_id in voice_linked_ids
+            is_free_channel = bool(channel_ids & free_channels) or is_voice_linked_channel
 
             # Skip the mention check if the message is in a thread where
             # the bot has previously participated (auto-created or replied in).
@@ -2294,7 +2328,7 @@ class DiscordAdapter(BasePlatformAdapter):
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
             skip_thread = bool(channel_ids & no_thread_channels)
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in ("true", "1", "yes")
-            if auto_thread and not skip_thread:
+            if auto_thread and not skip_thread and not is_voice_linked_channel:
                 thread = await self._auto_create_thread(message)
                 if thread:
                     is_thread = True
@@ -2327,6 +2361,9 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # When auto-threading kicked in, route responses to the new thread
         effective_channel = auto_threaded_channel or message.channel
+        jump_url = getattr(effective_channel, "jump_url", None) if is_thread else None
+        if not jump_url:
+            jump_url = getattr(message, "jump_url", None)
 
         # Determine chat type
         if isinstance(message.channel, discord.DMChannel):
@@ -2355,6 +2392,7 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=message.author.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            jump_url=jump_url,
         )
 
         # Build media URLs -- download image attachments to local cache so the
@@ -2467,7 +2505,8 @@ class DiscordAdapter(BasePlatformAdapter):
         _chan = message.channel
         _parent_id = str(getattr(_chan, "parent_id", "") or "")
         _chan_id = str(getattr(_chan, "id", ""))
-        _skills = self._resolve_channel_skills(_chan_id, _parent_id or None)
+        _guild_id = str(getattr(getattr(_chan, "guild", None), "id", "") or "")
+        _skills = self._resolve_channel_skills(_chan_id, _parent_id or None, _guild_id or None)
         event = MessageEvent(
             text=event_text,
             message_type=msg_type,

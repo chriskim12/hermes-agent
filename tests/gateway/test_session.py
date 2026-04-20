@@ -54,6 +54,24 @@ class TestSessionSourceRoundtrip:
         assert restored.chat_topic == "Planning and coordination for Project X"
         assert restored.chat_name == "Server / #project-planning"
 
+    def test_full_roundtrip_with_jump_url(self):
+        """jump_url should survive to_dict/from_dict roundtrip."""
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="789",
+            chat_name="Server / #project-planning / thread",
+            chat_type="thread",
+            user_id="42",
+            user_name="bob",
+            thread_id="789",
+            jump_url="https://discord.com/channels/1/789/999",
+        )
+        d = source.to_dict()
+        assert d["jump_url"] == "https://discord.com/channels/1/789/999"
+
+        restored = SessionSource.from_dict(d)
+        assert restored.jump_url == "https://discord.com/channels/1/789/999"
+
     def test_minimal_roundtrip(self):
         source = SessionSource(platform=Platform.LOCAL, chat_id="cli")
         d = source.to_dict()
@@ -552,6 +570,45 @@ class TestLoadTranscriptPreferLongerSource:
         assert result[0]["content"] == "db-q"
 
 
+class TestSessionStoreSwitchSession:
+    """Regression coverage for gateway /resume session switching semantics."""
+
+    def test_switch_session_reopens_target_session_in_db(self, tmp_path):
+        from hermes_state import SessionDB
+
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        store._db = db
+        store._loaded = True
+
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="chat-1",
+            chat_type="dm",
+            user_id="user-1",
+            user_name="tester",
+        )
+        current_entry = store.get_or_create_session(source)
+        current_session_id = current_entry.session_id
+
+        target_session_id = "old_session_abc"
+        db.create_session(target_session_id, source="feishu", user_id="user-1")
+        db.end_session(target_session_id, end_reason="user_exit")
+        assert db.get_session(target_session_id)["ended_at"] is not None
+
+        switched = store.switch_session(current_entry.session_key, target_session_id)
+
+        assert switched is not None
+        assert switched.session_id == target_session_id
+        assert db.get_session(current_session_id)["end_reason"] == "session_switch"
+        resumed = db.get_session(target_session_id)
+        assert resumed["ended_at"] is None
+        assert resumed["end_reason"] is None
+        db.close()
+
+
 class TestWhatsAppDMSessionKeyConsistency:
     """Regression: all session-key construction must go through build_session_key
     so DMs are isolated by chat_id across platforms."""
@@ -837,6 +894,28 @@ class TestHasAnySessions:
         store._db.session_count.return_value = 1
 
         assert store.has_any_sessions() is False
+
+    def test_new_gateway_sessions_persist_source_metadata_to_sqlite(self, store_with_mock_db):
+        """Gateway session creation should persist full origin metadata for later recall tools."""
+        store = store_with_mock_db
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="789",
+            chat_name="Guild / #general / thread",
+            chat_type="thread",
+            user_id="42",
+            user_name="bob",
+            thread_id="789",
+            jump_url="https://discord.com/channels/1/789/999",
+        )
+
+        store.get_or_create_session(source)
+
+        assert store._db.create_session.called
+        kwargs = store._db.create_session.call_args.kwargs
+        assert kwargs["source"] == "discord"
+        assert kwargs["user_id"] == "42"
+        assert kwargs["source_metadata"] == source.to_dict()
 
     def test_fallback_without_database(self, tmp_path):
         """Should fall back to len(_entries) when DB is not available."""

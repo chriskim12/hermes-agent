@@ -39,6 +39,7 @@ import subprocess
 import threading
 import time
 import uuid
+from datetime import datetime
 
 _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _sanitize_subprocess_env
@@ -617,6 +618,40 @@ class ProcessRegistry:
 
     # ----- Query Methods -----
 
+    def _maybe_update_delegated_work_on_exit(self, session: Optional[ProcessSession]) -> None:
+        """Best-effort delegated work-state closeout when an exited process is observed.
+
+        This complements the gateway watcher path so that explicit process
+        observation via poll/wait/log can still propagate the same executor
+        session exit into the persisted delegated work ledger.
+        """
+        if session is None or not session.exited or not session.id:
+            return
+        try:
+            from gateway.work_state import WorkStateStore
+
+            store = WorkStateStore()
+            resolution = store.resolve_delegated_signal_candidate(
+                executor_session_id=session.id,
+                live_only=True,
+            )
+            if resolution.get("status") != "single_match":
+                return
+            record = resolution.get("record")
+            if record is None:
+                return
+            succeeded = session.exit_code == 0
+            store.update_record(
+                record.work_id,
+                record.owner_session_id,
+                state="finished" if succeeded else "failed",
+                last_progress_at=datetime.now().astimezone(),
+                next_action="Inspect the completed OMX run" if succeeded else "Inspect the failed OMX run",
+                proof=f"background_process_exit:{session.exit_code}",
+            )
+        except Exception:
+            logger.debug("Failed to propagate delegated work-state from process observation", exc_info=True)
+
     def is_completion_consumed(self, session_id: str) -> bool:
         """Check if a completion notification was already consumed via wait/poll/log."""
         return session_id in self._completion_consumed
@@ -647,6 +682,7 @@ class ProcessRegistry:
             "output_preview": output_preview,
         }
         if session.exited:
+            self._maybe_update_delegated_work_on_exit(session)
             result["exit_code"] = session.exit_code
             self._completion_consumed.add(session_id)
         if session.detached:
@@ -682,6 +718,7 @@ class ProcessRegistry:
             "showing": f"{len(selected)} lines",
         }
         if session.exited:
+            self._maybe_update_delegated_work_on_exit(session)
             self._completion_consumed.add(session_id)
         return result
 
@@ -726,6 +763,7 @@ class ProcessRegistry:
         while time.monotonic() < deadline:
             session = self._refresh_detached_session(session)
             if session.exited:
+                self._maybe_update_delegated_work_on_exit(session)
                 self._completion_consumed.add(session_id)
                 result = {
                     "status": "exited",

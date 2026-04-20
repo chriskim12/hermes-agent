@@ -56,6 +56,7 @@ CONFIGURABLE_TOOLSETS = [
     ("image_gen",       "🎨 Image Generation",          "image_generate"),
     ("moa",             "🧠 Mixture of Agents",         "mixture_of_agents"),
     ("tts",             "🔊 Text-to-Speech",            "text_to_speech"),
+    ("yuuka_voice",     "🎙️ Yuuka Voice Reply",        "yuuka_voice_reply"),
     ("skills",          "📚 Skills",                    "list, view, manage"),
     ("todo",            "📋 Task Planning",             "todo"),
     ("memory",          "💾 Memory",                    "persistent memory across sessions"),

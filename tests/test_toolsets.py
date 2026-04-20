@@ -141,3 +141,7 @@ class TestToolsetConsistency:
         # All platform toolsets should be identical
         for ts in tool_sets[1:]:
             assert ts == tool_sets[0]
+
+    def test_youtube_audio_toolset_resolves(self):
+        assert resolve_toolset("youtube_audio") == ["youtube_to_mp3"]
+        assert "youtube_to_mp3" in TOOLSETS["hermes-cli"]["tools"]

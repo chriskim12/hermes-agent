@@ -36,11 +36,13 @@ import logging
 import os
 import platform
 import re
+import shlex
 import time
 import threading
 import atexit
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -56,9 +58,6 @@ from tools.interrupt import is_interrupted, _interrupt_event  # noqa: F401 — r
 # display_hermes_home imported lazily at call site (stale-module safety during hermes update)
 
 
-def ensure_minisweagent_on_path(_repo_root: Path | None = None) -> None:
-    """Backward-compatible no-op after minisweagent_path.py removal."""
-    return
 
 
 # =============================================================================
@@ -140,7 +139,6 @@ def set_approval_callback(cb):
 
 # Dangerous command detection + approval now consolidated in tools/approval.py
 from tools.approval import (
-    check_dangerous_command as _check_dangerous_command_impl,
     check_all_command_guards as _check_all_guards_impl,
 )
 
@@ -531,7 +529,6 @@ Working directory: Use 'workdir' for per-command cwd.
 PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
 
 Do NOT use vim/nano/interactive tools without pty=true — they hang without a pseudo-terminal. Pipe git output to cat if it might page.
-Important: cloud sandboxes may be cleaned up, idled out, or recreated between turns. Persistent filesystem means files can resume later; it does NOT guarantee a continuously running machine or surviving background processes. Use terminal sandboxes for task work, not durable hosting.
 """
 
 # Global state for environment lifecycle management
@@ -938,29 +935,6 @@ def is_persistent_env(task_id: str) -> bool:
     return bool(getattr(env, "_persistent", False))
 
 
-def get_active_environments_info() -> Dict[str, Any]:
-    """Get information about currently active environments."""
-    info = {
-        "count": len(_active_environments),
-        "task_ids": list(_active_environments.keys()),
-        "workdirs": {},
-    }
-    
-    # Calculate total disk usage (per-task to avoid double-counting)
-    total_size = 0
-    for task_id in _active_environments:
-        scratch_dir = _get_scratch_dir()
-        pattern = f"hermes-*{task_id[:8]}*"
-        import glob
-        for path in glob.glob(str(scratch_dir / pattern)):
-            try:
-                size = sum(f.stat().st_size for f in Path(path).rglob('*') if f.is_file())
-                total_size += size
-            except OSError as e:
-                logger.debug("Could not stat path %s: %s", path, e)
-    
-    info["total_disk_usage_mb"] = round(total_size / (1024 * 1024), 2)
-    return info
 
 
 def cleanup_all_environments():
@@ -1127,6 +1101,73 @@ def _command_requires_pipe_stdin(command: str) -> bool:
     return (
         normalized.startswith("gh auth login")
         and "--with-token" in normalized
+    )
+
+
+def _extract_tmux_session_name(command: str) -> Optional[str]:
+    try:
+        tokens = shlex.split(command)
+    except Exception:
+        return None
+    for idx, token in enumerate(tokens[:-1]):
+        if token == "-s" and idx + 1 < len(tokens):
+            value = str(tokens[idx + 1]).strip()
+            if value:
+                return value
+    return None
+
+
+def _looks_like_omx_delegation(command: str) -> bool:
+    normalized = " ".join((command or "").lower().split())
+    return "omx exec" in normalized or "omx team" in normalized
+
+
+def _maybe_mark_gateway_work_delegated(
+    *,
+    command: str,
+    session_key: str,
+    executor_session_id: Optional[str],
+    workdir: Optional[str],
+) -> bool:
+    if not session_key or not _looks_like_omx_delegation(command):
+        return False
+
+    from gateway.work_state import WorkStateStore
+
+    store = WorkStateStore()
+    candidates = [
+        record
+        for record in store.list_records()
+        if record.owner_session_id == session_key
+        and record.owner == "hermes"
+        and record.state in {"created", "running", "blocked", "stale"}
+    ]
+    if not candidates:
+        return False
+
+    direct_candidates = [record for record in candidates if record.mode == "direct"]
+    target = max(
+        direct_candidates or candidates,
+        key=lambda record: record.last_progress_at,
+    )
+    now = datetime.now().astimezone()
+    tmux_session = _extract_tmux_session_name(command)
+    repo_path = workdir or target.repo_path
+    worktree_path = workdir or target.worktree_path
+    delegated_executor_session_id = None if tmux_session else (executor_session_id or target.executor_session_id)
+    return store.update_record(
+        target.work_id,
+        target.owner_session_id,
+        executor="omx",
+        mode="delegated",
+        state="running",
+        last_progress_at=now,
+        executor_session_id=delegated_executor_session_id,
+        tmux_session=tmux_session or target.tmux_session,
+        repo_path=repo_path,
+        worktree_path=worktree_path,
+        next_action="Resume the delegated OMX work",
+        proof="terminal_background:omx_exec",
     )
 
 
@@ -1407,6 +1448,14 @@ def terminal_tool(
                     "exit_code": 0,
                     "error": None,
                 }
+                delegated_marked = _maybe_mark_gateway_work_delegated(
+                    command=command,
+                    session_key=session_key,
+                    executor_session_id=proc_session.id,
+                    workdir=effective_cwd,
+                )
+                if delegated_marked:
+                    result_data["delegated_work_state"] = "marked"
                 if approval_note:
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:

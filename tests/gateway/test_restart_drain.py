@@ -13,7 +13,8 @@ from tests.gateway.restart_test_helpers import make_restart_runner, make_restart
 
 
 @pytest.mark.asyncio
-async def test_restart_command_while_busy_requests_drain_without_interrupt():
+async def test_restart_command_while_busy_requests_drain_without_interrupt(monkeypatch):
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
     runner, _adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
     event = MessageEvent(
