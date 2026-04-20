@@ -31,7 +31,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     user_id TEXT,
     model TEXT,
     model_config TEXT,
+    source_metadata TEXT,
     system_prompt TEXT,
     parent_session_id TEXT,
     started_at REAL NOT NULL,
@@ -329,6 +330,12 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                try:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN source_metadata TEXT")
+                except sqlite3.OperationalError:
+                    pass
+                cursor.execute("UPDATE schema_version SET version = 7")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -358,6 +365,7 @@ class SessionDB:
         source: str,
         model: str = None,
         model_config: Dict[str, Any] = None,
+        source_metadata: Dict[str, Any] = None,
         system_prompt: str = None,
         user_id: str = None,
         parent_session_id: str = None,
@@ -366,14 +374,15 @@ class SessionDB:
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, parent_session_id, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   source_metadata, system_prompt, parent_session_id, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     source,
                     user_id,
                     model,
                     json.dumps(model_config) if model_config else None,
+                    json.dumps(source_metadata) if source_metadata else None,
                     system_prompt,
                     parent_session_id,
                     time.time(),

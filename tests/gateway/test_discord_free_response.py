@@ -107,6 +107,7 @@ def make_message(*, channel, content: str, mentions=None):
         created_at=datetime.now(timezone.utc),
         channel=channel,
         author=author,
+        jump_url="https://discord.com/channels/1/456/123",
     )
 
 
@@ -176,6 +177,21 @@ async def test_discord_forum_threads_are_handled_as_threads(adapter, monkeypatch
     assert event.source.thread_id == "456"
     assert event.source.chat_type == "thread"
     assert event.source.chat_name == "Hermes Server / support-forum / Can Hermes reply here?"
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_messages_capture_jump_url(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    thread = FakeThread(channel_id=456, name="Ghost reader skill")
+    message = make_message(channel=thread, content="hello from thread")
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.jump_url == "https://discord.com/channels/1/456/123"
 
 
 @pytest.mark.asyncio

@@ -87,6 +87,31 @@ def _format_conversation(messages: List[Dict[str, Any]]) -> str:
     return "\n\n".join(parts)
 
 
+def _extract_origin(session_meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Parse stored session source metadata into compact tool output."""
+    raw = session_meta.get("source_metadata")
+    if not raw:
+        return None
+
+    try:
+        meta = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        logging.debug("Failed to parse session source metadata", exc_info=True)
+        return None
+
+    if not isinstance(meta, dict):
+        return None
+
+    origin = {
+        "platform": meta.get("platform"),
+        "chat_name": meta.get("chat_name"),
+        "chat_type": meta.get("chat_type"),
+        "thread_id": meta.get("thread_id"),
+        "jump_url": meta.get("jump_url"),
+    }
+    return {k: v for k, v in origin.items() if v not in (None, "")}
+
+
 def _truncate_around_matches(
     full_text: str, query: str, max_chars: int = MAX_SESSION_CHARS
 ) -> str:
@@ -279,6 +304,9 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
                 "message_count": s.get("message_count", 0),
                 "preview": s.get("preview", ""),
             })
+            origin = _extract_origin(s)
+            if origin:
+                results[-1]["origin"] = origin
             if len(results) >= limit:
                 break
 
@@ -442,7 +470,7 @@ def session_search(
             }, ensure_ascii=False)
 
         summaries = []
-        for (session_id, match_info, conversation_text, _), result in zip(tasks, results):
+        for (session_id, match_info, conversation_text, session_meta), result in zip(tasks, results):
             if isinstance(result, Exception):
                 logging.warning(
                     "Failed to summarize session %s: %s",
@@ -456,6 +484,9 @@ def session_search(
                 "source": match_info.get("source", "unknown"),
                 "model": match_info.get("model"),
             }
+            origin = _extract_origin(session_meta) or _extract_origin(match_info)
+            if origin:
+                entry["origin"] = origin
 
             if result:
                 entry["summary"] = result

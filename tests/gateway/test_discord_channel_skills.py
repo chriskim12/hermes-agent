@@ -1,4 +1,4 @@
-"""Tests for Discord channel_skill_bindings auto-skill resolution."""
+"""Tests for Discord channel/guild auto-skill resolution."""
 from unittest.mock import MagicMock
 import pytest
 
@@ -35,6 +35,27 @@ class TestResolveChannelSkills:
         }
         # channel_id doesn't match, but parent_id does (forum thread)
         assert adapter._resolve_channel_skills("999", parent_id="200") == ["forum-skill"]
+
+    def test_match_by_guild_id(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {
+            "guild_skill_bindings": [
+                {"id": "300", "skills": ["guild-skill"]},
+            ]
+        }
+        assert adapter._resolve_channel_skills("999", guild_id="300") == ["guild-skill"]
+
+    def test_channel_binding_beats_guild_binding(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {
+            "channel_skill_bindings": [
+                {"id": "100", "skills": ["channel-skill"]},
+            ],
+            "guild_skill_bindings": [
+                {"id": "300", "skills": ["guild-skill"]},
+            ],
+        }
+        assert adapter._resolve_channel_skills("100", guild_id="300") == ["channel-skill"]
 
     def test_no_match_returns_none(self):
         adapter = _make_adapter()

@@ -1809,6 +1809,7 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            jump_url=getattr(getattr(interaction, "channel", None), "jump_url", None),
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
@@ -1885,10 +1886,12 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            jump_url=getattr(getattr(interaction, "channel", None), "jump_url", None),
         )
 
         _parent_id = str(getattr(getattr(interaction, "channel", None), "parent_id", "") or "")
-        _skills = self._resolve_channel_skills(thread_id, _parent_id or None)
+        _guild_id = str(getattr(getattr(getattr(interaction, "channel", None), "guild", None), "id", "") or "")
+        _skills = self._resolve_channel_skills(thread_id, _parent_id or None, _guild_id or None)
         event = MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
@@ -1898,18 +1901,26 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         await self.handle_message(event)
 
-    def _resolve_channel_skills(self, channel_id: str, parent_id: str | None = None) -> list[str] | None:
-        """Look up auto-skill bindings for a Discord channel/forum thread.
+    def _resolve_channel_skills(
+        self,
+        channel_id: str,
+        parent_id: str | None = None,
+        guild_id: str | None = None,
+    ) -> list[str] | None:
+        """Look up auto-skill bindings for a Discord channel/forum thread/guild.
 
         Config format (in platform extra):
             channel_skill_bindings:
               - id: "123456"
                 skills: ["skill-a", "skill-b"]
-        Also checks parent_id so forum threads inherit the forum's bindings.
+            guild_skill_bindings:
+              - id: "987654"
+                skills: ["guild-skill"]
+
+        Channel/thread bindings win over guild-wide bindings. Also checks
+        parent_id so forum threads inherit the forum's bindings.
         """
         bindings = self.config.extra.get("channel_skill_bindings", [])
-        if not bindings:
-            return None
         ids_to_check = {channel_id}
         if parent_id:
             ids_to_check.add(parent_id)
@@ -1921,6 +1932,17 @@ class DiscordAdapter(BasePlatformAdapter):
                     return [skills]
                 if isinstance(skills, list) and skills:
                     return list(dict.fromkeys(skills))  # dedup, preserve order
+
+        guild_bindings = self.config.extra.get("guild_skill_bindings", [])
+        if guild_id:
+            for entry in guild_bindings:
+                entry_id = str(entry.get("id", ""))
+                if entry_id == guild_id:
+                    skills = entry.get("skills") or entry.get("skill")
+                    if isinstance(skills, str):
+                        return [skills]
+                    if isinstance(skills, list) and skills:
+                        return list(dict.fromkeys(skills))
         return None
 
     def _thread_parent_channel(self, channel: Any) -> Any:
@@ -2333,6 +2355,9 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # When auto-threading kicked in, route responses to the new thread
         effective_channel = auto_threaded_channel or message.channel
+        jump_url = getattr(effective_channel, "jump_url", None) if is_thread else None
+        if not jump_url:
+            jump_url = getattr(message, "jump_url", None)
 
         # Determine chat type
         if isinstance(message.channel, discord.DMChannel):
@@ -2361,6 +2386,7 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=message.author.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            jump_url=jump_url,
         )
 
         # Build media URLs -- download image attachments to local cache so the
@@ -2473,7 +2499,8 @@ class DiscordAdapter(BasePlatformAdapter):
         _chan = message.channel
         _parent_id = str(getattr(_chan, "parent_id", "") or "")
         _chan_id = str(getattr(_chan, "id", ""))
-        _skills = self._resolve_channel_skills(_chan_id, _parent_id or None)
+        _guild_id = str(getattr(getattr(_chan, "guild", None), "id", "") or "")
+        _skills = self._resolve_channel_skills(_chan_id, _parent_id or None, _guild_id or None)
         event = MessageEvent(
             text=event_text,
             message_type=msg_type,

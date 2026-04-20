@@ -550,6 +550,8 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
                 if plat == Platform.DISCORD and "channel_skill_bindings" in platform_cfg:
                     bridged["channel_skill_bindings"] = platform_cfg["channel_skill_bindings"]
+                if plat == Platform.DISCORD and "guild_skill_bindings" in platform_cfg:
+                    bridged["guild_skill_bindings"] = platform_cfg["guild_skill_bindings"]
                 if not bridged:
                     continue
                 plat_data = platforms_data.setdefault(plat.value, {})
