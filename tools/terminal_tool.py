@@ -141,6 +141,11 @@ def set_approval_callback(cb):
 from tools.approval import (
     check_all_command_guards as _check_all_guards_impl,
 )
+from tools.worktree_policy import (
+    build_dedicated_worktree_error,
+    command_is_repo_mutating,
+    requires_dedicated_worktree_for_path,
+)
 
 
 def _check_all_guards(command: str, env_type: str) -> dict:
@@ -1400,6 +1405,19 @@ def terminal_tool(
                     "error": workdir_error,
                     "status": "blocked"
                 }, ensure_ascii=False)
+
+        effective_workdir = workdir or cwd
+        if command_is_repo_mutating(command) and requires_dedicated_worktree_for_path(
+            effective_workdir,
+            cwd_hint=effective_workdir,
+            host_cwd_hint=config.get("host_cwd"),
+        ):
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": build_dedicated_worktree_error(effective_workdir),
+                "status": "blocked",
+            }, ensure_ascii=False)
 
         # Prepare command for execution
         pty_disabled_reason = None
