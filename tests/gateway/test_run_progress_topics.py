@@ -71,6 +71,22 @@ class FakeAgent:
         }
 
 
+class InitCaptureAgent:
+    last_init_kwargs = None
+
+    def __init__(self, **kwargs):
+        type(self).last_init_kwargs = kwargs
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class LongPreviewAgent:
     """Agent that emits a tool call with a very long preview string."""
     LONG_CMD = "cd /home/teknium/.hermes/hermes-agent/.worktrees/hermes-d8860339 && source .venv/bin/activate && python -m pytest tests/gateway/test_run_progress_topics.py -n0 -q"
@@ -362,6 +378,22 @@ class CommentaryAgent:
         }
 
 
+class IterationReportingAgent:
+    def __init__(self, **kwargs):
+        self.step_callback = kwargs.get("step_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        for iteration in range(1, 12):
+            if self.step_callback:
+                self.step_callback(iteration, [{"name": "read_file", "result": '{"content": "ok"}'}])
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 11,
+        }
+
+
 class PreviewedResponseAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -448,7 +480,13 @@ async def _run_with_agent(
     chat_id="-1001",
     chat_type="group",
     thread_id="17585",
+    max_iterations_env="90",
 ):
+    if max_iterations_env is None:
+        monkeypatch.delenv("HERMES_MAX_ITERATIONS", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_MAX_ITERATIONS", max_iterations_env)
+
     if config_data:
         import yaml
 
@@ -495,6 +533,24 @@ async def _run_with_agent(
         session_key=session_key,
     )
     return adapter, result
+
+
+@pytest.mark.asyncio
+async def test_run_agent_uses_default_max_iterations_when_env_unset(monkeypatch, tmp_path):
+    InitCaptureAgent.last_init_kwargs = None
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        InitCaptureAgent,
+        session_id="sess-default-max-iterations",
+        max_iterations_env=None,
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == []
+    assert InitCaptureAgent.last_init_kwargs is not None
+    assert InitCaptureAgent.last_init_kwargs["max_iterations"] == 90
 
 
 @pytest.mark.asyncio
@@ -589,6 +645,22 @@ async def test_run_agent_interim_commentary_works_with_tool_progress_off(monkeyp
 
     assert result.get("already_sent") is not True
     assert any(call["content"] == "I'll inspect the repo first." for call in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_surfaces_iteration_reports_every_ten_steps(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        IterationReportingAgent,
+        session_id="sess-iteration-report",
+        config_data={"display": {"iteration_report_every": 10}},
+    )
+
+    assert result.get("already_sent") is not True
+    reports = [call["content"] for call in adapter.sent if "10/90" in call["content"]]
+    assert reports, adapter.sent
+    assert any("iteration" in report.lower() for report in reports)
 
 
 @pytest.mark.asyncio

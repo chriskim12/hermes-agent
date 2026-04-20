@@ -163,6 +163,13 @@ class TestYAMLNormalisation:
         config = {"display": {"platforms": {"slack": {"tool_preview_length": "80"}}}}
         assert resolve_display_setting(config, "slack", "tool_preview_length") == 80
 
+    def test_iteration_report_every_string(self):
+        """String numbers are normalised to int for iteration reporting."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"platforms": {"discord": {"iteration_report_every": "10"}}}}
+        assert resolve_display_setting(config, "discord", "iteration_report_every") == 10
+
     def test_platform_override_false_tool_progress(self):
         """Per-platform bare off → normalised."""
         from gateway.display_config import resolve_display_setting
@@ -218,6 +225,13 @@ class TestPlatformDefaults:
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "telegram", "streaming") is None
+
+    def test_iteration_report_defaults_to_zero(self):
+        """Iteration reports are off by default across platforms."""
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "telegram", "iteration_report_every") == 0
+        assert resolve_display_setting({}, "email", "iteration_report_every") == 0
 
 
 # ---------------------------------------------------------------------------

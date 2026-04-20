@@ -69,6 +69,33 @@ class TestApiServerPlatformConfig:
 
 class TestApiServerAdapterToolset:
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
+    def test_create_agent_uses_default_max_iterations_when_env_unset(self):
+        """API server should fall back to the shared default when env is absent."""
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = APIServerAdapter(PlatformConfig())
+
+        with patch.dict(os.environ, {}, clear=False), \
+             patch("gateway.run._resolve_runtime_agent_kwargs") as mock_kwargs, \
+             patch("gateway.run._resolve_gateway_model") as mock_model, \
+             patch("gateway.run._load_gateway_config") as mock_config, \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+
+            os.environ.pop("HERMES_MAX_ITERATIONS", None)
+            mock_kwargs.return_value = {"api_key": "***", "base_url": None,
+                                        "provider": None, "api_mode": None,
+                                        "command": None, "args": []}
+            mock_model.return_value = "test/model"
+            mock_config.return_value = {}
+            mock_agent_cls.return_value = MagicMock()
+
+            adapter._create_agent()
+
+            mock_agent_cls.assert_called_once()
+            assert mock_agent_cls.call_args.kwargs.get("max_iterations") == 90
+
+    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
     def test_create_agent_reads_config_toolsets(self):
         """API server resolves toolsets from config like all other platforms."""
         from gateway.platforms.api_server import APIServerAdapter
