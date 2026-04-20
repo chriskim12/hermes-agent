@@ -61,6 +61,9 @@ class TestEnsureHermesHome:
 
 
 class TestLoadConfigDefaults:
+    def test_default_config_uses_90_max_turns(self):
+        assert DEFAULT_CONFIG["agent"]["max_turns"] == 90
+
     def test_returns_defaults_when_no_file(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             config = load_config()
@@ -459,7 +462,7 @@ class TestCustomProviderCompatibility:
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
-        assert raw["_config_version"] == 17
+        assert raw["_config_version"] == 18
         assert raw["providers"]["openai-direct"] == {
             "api": "https://api.openai.com/v1",
             "api_key": "test-key",
@@ -606,6 +609,28 @@ class TestInterimAssistantMessageConfig:
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
-        assert raw["_config_version"] == 17
+        assert raw["_config_version"] == 18
         assert raw["display"]["tool_progress"] == "off"
         assert raw["display"]["interim_assistant_messages"] is True
+        assert raw["display"]["iteration_report_every"] == 0
+
+
+class TestIterationReportConfig:
+    """Test the gateway iteration-report config default and migration."""
+
+    def test_default_config_disables_iteration_reports(self):
+        assert DEFAULT_CONFIG["display"]["iteration_report_every"] == 0
+
+    def test_migrate_to_v17_adds_iteration_report_every(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump({"_config_version": 16, "display": {"tool_progress": "off"}}),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert raw["_config_version"] == 18
+        assert raw["display"]["iteration_report_every"] == 0
