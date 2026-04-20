@@ -1895,8 +1895,9 @@ class DiscordAdapter(BasePlatformAdapter):
             jump_url=getattr(getattr(interaction, "channel", None), "jump_url", None),
         )
 
-        _parent_id = str(getattr(getattr(interaction, "channel", None), "parent_id", "") or "")
-        _guild_id = str(getattr(getattr(getattr(interaction, "channel", None), "guild", None), "id", "") or "")
+        _channel = getattr(interaction, "channel", None)
+        _parent_id = str(getattr(_channel, "parent_id", "") or "")
+        _guild_id = self._get_effective_guild_id(_channel, getattr(interaction, "guild", None))
         _skills = self._resolve_channel_skills(thread_id, _parent_id or None, _guild_id or None)
         event = MessageEvent(
             text=text,
@@ -2212,6 +2213,23 @@ class DiscordAdapter(BasePlatformAdapter):
             return str(parent_id)
         return None
 
+    def _get_effective_guild_id(self, channel: Any, fallback_guild: Any = None) -> Optional[str]:
+        """Return a guild ID even when a thread payload omits ``channel.guild``.
+
+        Discord thread objects can arrive with ``thread.guild`` unset while the
+        parent channel still has the guild populated. Guild-bound auto-skills
+        should still resolve in that case.
+        """
+        guild = (
+            getattr(channel, "guild", None)
+            or getattr(getattr(channel, "parent", None), "guild", None)
+            or fallback_guild
+        )
+        guild_id = getattr(guild, "id", None)
+        if guild_id is None:
+            return None
+        return str(guild_id)
+
     def _is_forum_parent(self, channel: Any) -> bool:
         """Best-effort check for whether a Discord channel is a forum channel."""
         if channel is None:
@@ -2505,7 +2523,7 @@ class DiscordAdapter(BasePlatformAdapter):
         _chan = message.channel
         _parent_id = str(getattr(_chan, "parent_id", "") or "")
         _chan_id = str(getattr(_chan, "id", ""))
-        _guild_id = str(getattr(getattr(_chan, "guild", None), "id", "") or "")
+        _guild_id = self._get_effective_guild_id(_chan, getattr(message, "guild", None))
         _skills = self._resolve_channel_skills(_chan_id, _parent_id or None, _guild_id or None)
         event = MessageEvent(
             text=event_text,

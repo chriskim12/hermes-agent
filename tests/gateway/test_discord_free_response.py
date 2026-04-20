@@ -348,6 +348,32 @@ async def test_discord_unknown_thread_still_requires_mention(adapter, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_discord_thread_uses_parent_guild_for_auto_skill_resolution(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+    guild = SimpleNamespace(id=1486771653466656901, name="chrisland")
+    parent = SimpleNamespace(id=222, name="일반", guild=guild, topic=None)
+    thread = FakeThread(channel_id=456, name="voice auto attach", parent=parent)
+    thread.guild = None  # regression: thread payload may omit guild while parent still has it
+
+    adapter.config.extra = {
+        "guild_skill_bindings": [
+            {"id": str(guild.id), "skills": ["yuuka-discord-voice-autoattach"]},
+        ]
+    }
+
+    message = make_message(channel=thread, content="hello from thread")
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.auto_skill == ["yuuka-discord-voice-autoattach"]
+
+
+@pytest.mark.asyncio
 async def test_discord_auto_thread_tracks_participation(adapter, monkeypatch):
     """Auto-created threads should be tracked for future mention-free replies."""
     monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
