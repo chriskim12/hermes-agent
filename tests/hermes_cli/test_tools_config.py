@@ -30,6 +30,22 @@ def test_get_platform_tools_preserves_explicit_empty_selection():
     assert enabled == set()
 
 
+def test_get_platform_tools_keeps_yuuka_voice_from_default_discord_toolset():
+    """Platform defaults like hermes-discord must still expose Yuuka voice.
+
+    Regression test for guild-wide auto-loaded skills that rely on
+    `yuuka_voice_reply`: when discord is still on the default composite
+    toolset (`hermes-discord`), `_get_platform_tools()` reverse-mapped only
+    configurable toolsets and silently dropped the non-configurable
+    `yuuka_voice` toolset.
+    """
+    config = {"platform_toolsets": {"discord": ["hermes-discord"]}}
+
+    enabled = _get_platform_tools(config, "discord")
+
+    assert "yuuka_voice" in enabled
+
+
 def test_platform_toolset_summary_uses_explicit_platform_list():
     config = {}
 
