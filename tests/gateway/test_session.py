@@ -54,6 +54,24 @@ class TestSessionSourceRoundtrip:
         assert restored.chat_topic == "Planning and coordination for Project X"
         assert restored.chat_name == "Server / #project-planning"
 
+    def test_full_roundtrip_with_jump_url(self):
+        """jump_url should survive to_dict/from_dict roundtrip."""
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="789",
+            chat_name="Server / #project-planning / thread",
+            chat_type="thread",
+            user_id="42",
+            user_name="bob",
+            thread_id="789",
+            jump_url="https://discord.com/channels/1/789/999",
+        )
+        d = source.to_dict()
+        assert d["jump_url"] == "https://discord.com/channels/1/789/999"
+
+        restored = SessionSource.from_dict(d)
+        assert restored.jump_url == "https://discord.com/channels/1/789/999"
+
     def test_minimal_roundtrip(self):
         source = SessionSource(platform=Platform.LOCAL, chat_id="cli")
         d = source.to_dict()
@@ -876,6 +894,28 @@ class TestHasAnySessions:
         store._db.session_count.return_value = 1
 
         assert store.has_any_sessions() is False
+
+    def test_new_gateway_sessions_persist_source_metadata_to_sqlite(self, store_with_mock_db):
+        """Gateway session creation should persist full origin metadata for later recall tools."""
+        store = store_with_mock_db
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="789",
+            chat_name="Guild / #general / thread",
+            chat_type="thread",
+            user_id="42",
+            user_name="bob",
+            thread_id="789",
+            jump_url="https://discord.com/channels/1/789/999",
+        )
+
+        store.get_or_create_session(source)
+
+        assert store._db.create_session.called
+        kwargs = store._db.create_session.call_args.kwargs
+        assert kwargs["source"] == "discord"
+        assert kwargs["user_id"] == "42"
+        assert kwargs["source_metadata"] == source.to_dict()
 
     def test_fallback_without_database(self, tmp_path):
         """Should fall back to len(_entries) when DB is not available."""

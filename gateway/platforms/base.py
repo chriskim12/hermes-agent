@@ -1896,6 +1896,7 @@ class BasePlatformAdapter(ABC):
         user_name: Optional[str] = None,
         thread_id: Optional[str] = None,
         chat_topic: Optional[str] = None,
+        jump_url: Optional[str] = None,
         user_id_alt: Optional[str] = None,
         chat_id_alt: Optional[str] = None,
     ) -> SessionSource:
@@ -1912,6 +1913,7 @@ class BasePlatformAdapter(ABC):
             user_name=user_name,
             thread_id=str(thread_id) if thread_id else None,
             chat_topic=chat_topic.strip() if chat_topic else None,
+            jump_url=jump_url.strip() if isinstance(jump_url, str) and jump_url.strip() else None,
             user_id_alt=user_id_alt,
             chat_id_alt=chat_id_alt,
         )

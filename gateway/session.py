@@ -80,6 +80,7 @@ class SessionSource:
     user_name: Optional[str] = None
     thread_id: Optional[str] = None  # For forum topics, Discord threads, etc.
     chat_topic: Optional[str] = None  # Channel topic/description (Discord, Slack)
+    jump_url: Optional[str] = None  # Deep link back to the originating Discord message/thread when available
     user_id_alt: Optional[str] = None  # Signal UUID (alternative to phone number)
     chat_id_alt: Optional[str] = None  # Signal group internal ID
     
@@ -114,6 +115,7 @@ class SessionSource:
             "user_name": self.user_name,
             "thread_id": self.thread_id,
             "chat_topic": self.chat_topic,
+            "jump_url": self.jump_url,
         }
         if self.user_id_alt:
             d["user_id_alt"] = self.user_id_alt
@@ -132,6 +134,7 @@ class SessionSource:
             user_name=data.get("user_name"),
             thread_id=data.get("thread_id"),
             chat_topic=data.get("chat_topic"),
+            jump_url=data.get("jump_url"),
             user_id_alt=data.get("user_id_alt"),
             chat_id_alt=data.get("chat_id_alt"),
         )
@@ -768,6 +771,7 @@ class SessionStore:
                 "session_id": session_id,
                 "source": source.platform.value,
                 "user_id": source.user_id,
+                "source_metadata": source.to_dict(),
             }
 
         # SQLite operations outside the lock
@@ -913,6 +917,7 @@ class SessionStore:
                 "session_id": session_id,
                 "source": old_entry.platform.value if old_entry.platform else "unknown",
                 "user_id": old_entry.origin.user_id if old_entry.origin else None,
+                "source_metadata": old_entry.origin.to_dict() if old_entry.origin else None,
             }
 
         if self._db and db_end_session_id:

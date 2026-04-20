@@ -318,3 +318,67 @@ class TestSessionSearch:
         assert result["count"] == 0
         assert result["results"] == []
         assert result["sessions_searched"] == 0
+
+    def test_recent_sessions_include_origin_jump_url_when_available(self):
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import _list_recent_sessions
+
+        mock_db = MagicMock()
+        mock_db.list_sessions_rich.return_value = [
+            {
+                "id": "discord-session-1",
+                "title": "watchdog target",
+                "source": "discord",
+                "started_at": 1709500000,
+                "last_active": 1709500300,
+                "message_count": 4,
+                "preview": "unfinished work",
+                "source_metadata": json.dumps({
+                    "chat_name": "Guild / #general / thread",
+                    "chat_type": "thread",
+                    "thread_id": "456",
+                    "jump_url": "https://discord.com/channels/1/456/123",
+                }),
+            }
+        ]
+
+        result = json.loads(_list_recent_sessions(mock_db, limit=1, current_session_id="current"))
+
+        assert result["success"] is True
+        assert result["results"][0]["origin"]["jump_url"] == "https://discord.com/channels/1/456/123"
+
+    def test_keyword_search_includes_origin_jump_url_when_available(self):
+        from unittest.mock import AsyncMock, MagicMock, patch as _patch
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {
+                "session_id": "discord-session-1",
+                "content": "resume this thread",
+                "source": "discord",
+                "session_started": 1709500000,
+                "model": "gpt-5.4-mini",
+            }
+        ]
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "resume this thread"},
+            {"role": "assistant", "content": "I'll continue."},
+        ]
+        mock_db.get_session.return_value = {
+            "parent_session_id": None,
+            "source_metadata": json.dumps({
+                "chat_name": "Guild / #general / thread",
+                "chat_type": "thread",
+                "thread_id": "456",
+                "jump_url": "https://discord.com/channels/1/456/123",
+            }),
+        }
+
+        with _patch("tools.session_search_tool.async_call_llm",
+                     new_callable=AsyncMock,
+                     side_effect=RuntimeError("no provider")):
+            result = json.loads(session_search(query="resume", db=mock_db, limit=1))
+
+        assert result["success"] is True
+        assert result["results"][0]["origin"]["jump_url"] == "https://discord.com/channels/1/456/123"
