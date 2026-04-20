@@ -1,0 +1,41 @@
+schema_version: 1
+metadata:
+  owner: Chris / Hermes
+  silent_marker: "[SILENT]"
+  state_path: /home/ubuntu/.hermes/state/status-gate/repo-upstream-watch.json
+  entrypoints:
+    check: python /home/ubuntu/.hermes/hermes-agent/scripts/repo_update_gate.py check --inventory /home/ubuntu/.hermes/hermes-agent/ops/repo-upstream-watch.yaml --cron
+    apply_plan: python /home/ubuntu/.hermes/hermes-agent/scripts/repo_update_gate.py apply-plan --inventory /home/ubuntu/.hermes/hermes-agent/ops/repo-upstream-watch.yaml
+repos:
+  - name: oh-my-codex
+    path: /home/ubuntu/repos/oh-my-codex
+    mode: safe_auto_apply
+    base_remote: origin
+    base_branch: main
+    smoke_test: npm test
+    apply_window: manual-review
+    bootstrap_required: true
+    notes:
+      - initial baseline catch-up must be reviewed once before broad auto-apply
+      - after bootstrap clears, fast-forward-only apply is the intended lane
+  - name: clawhip
+    path: /home/ubuntu/repos/clawhip
+    mode: report_only
+    base_remote: origin
+    base_branch: main
+    smoke_test: cargo test
+    apply_window: manual-review
+    notes:
+      - direct apply stays blocked while the working tree is dirty
+  - name: hermes-agent
+    path: /home/ubuntu/.hermes/hermes-agent
+    mode: staged_sync
+    base_remote: upstream
+    base_branch: main
+    smoke_test: source venv/bin/activate && python -m pytest tests/ -q
+    apply_window: manual-review
+    staging_branch: sync/upstream-main
+    staging_worktree_path: /home/ubuntu/.hermes/hermes-agent/.worktrees/sync-upstream-main
+    notes:
+      - never direct-apply onto active local branches
+      - stage upstream integration in a dedicated worktree first
