@@ -10,15 +10,16 @@ repos:
   - name: oh-my-codex
     path: /home/ubuntu/repos/oh-my-codex
     mode: safe_auto_apply
-    base_remote: origin
+    base_remote: upstream
     base_branch: main
     smoke_test: npm test
     apply_window: manual-review
     bootstrap_required: true
     notes:
       - initial baseline catch-up was reviewed before broad auto-apply
-      - 2026-04-20: baseline fast-forward completed to v0.14.0 and the tree is clean/tracking origin/main
+      - 2026-04-20: baseline fast-forward completed to v0.14.0 and the tree is clean/tracking upstream/main
       - 2026-04-20: ARM64 hydration-fixture blocker was fixed on branch `ch-122-arm64-smoke-blocker`; `npm test` passes there on this host
+      - 2026-04-20: remote alias was normalized from `origin` to `upstream` on this checkout to reduce lane-name ambiguity
       - keep bootstrap_required until that fix is landed/reconciled onto the mainline update lane
       - fast-forward-only apply remains the intended steady-state lane after bootstrap clears
   - name: clawhip
