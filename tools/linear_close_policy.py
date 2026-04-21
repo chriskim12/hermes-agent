@@ -85,7 +85,7 @@ def _dailychingu_task_done_close_blockers(repo_path: str | Path) -> list[str]:
     else:
         branch_result = _run_git(current_checkout_root, "branch", "--show-current")
         current_branch = branch_result.stdout.strip() if branch_result.returncode == 0 else ""
-        if current_branch and current_branch not in _DAILYCHINGU_ALLOWED_DONE_BRANCHES:
+        if current_branch not in _DAILYCHINGU_ALLOWED_DONE_BRANCHES:
             blockers.append("task_branch_not_integrated")
 
     status = _run_git(base_repo_root, "status", "--short")

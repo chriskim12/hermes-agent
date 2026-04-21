@@ -151,6 +151,18 @@ def test_dailychingu_done_blocks_when_root_still_on_task_branch(tmp_path):
 
 
 
+def test_dailychingu_done_blocks_when_root_is_detached_head(tmp_path):
+    from tools.linear_close_policy import linear_done_close_blockers
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+    subprocess.run(["git", "checkout", "--detach", "HEAD"], cwd=repo, capture_output=True, check=True)
+
+    blockers = linear_done_close_blockers(str(repo))
+
+    assert "task_branch_not_integrated" in blockers
+
+
+
 def test_terminal_tool_allows_dailychingu_done_on_clean_develop_with_other_review_lane(tmp_path):
     from tools.terminal_tool import terminal_tool
 
@@ -172,3 +184,26 @@ def test_terminal_tool_allows_dailychingu_done_on_clean_develop_with_other_revie
     assert result["exit_code"] == 0
     assert result["output"] == "ok"
     mock_env.execute.assert_called_once()
+
+
+
+def test_terminal_tool_blocks_dailychingu_done_on_detached_head_root(tmp_path):
+    from tools.terminal_tool import terminal_tool
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+    subprocess.run(["git", "checkout", "--detach", "HEAD"], cwd=repo, capture_output=True, check=True)
+    mock_env = MagicMock()
+    mock_env.execute.return_value = {"output": "should not run", "returncode": 0}
+    command = _linear_done_command()
+
+    with patch("tools.terminal_tool._get_env_config", return_value={"env_type": "local", "env_name": "default", "cwd": str(repo), "timeout": 180}), \
+         patch("tools.terminal_tool._start_cleanup_thread"), \
+         patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
+         patch("tools.terminal_tool._last_activity", {"default": 0}), \
+         patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
+        result = json.loads(terminal_tool(command=command, workdir=str(repo)))
+
+    assert result["exit_code"] == -1
+    assert result["status"] == "blocked"
+    assert "task_branch_not_integrated" in result["error"]
+    mock_env.execute.assert_not_called()
