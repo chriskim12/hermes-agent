@@ -8,6 +8,7 @@ broad chat/session heuristics.
 from __future__ import annotations
 
 import json
+import re
 import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -49,6 +50,36 @@ CLOSE_DISPOSITIONS = frozenset({
     "update",
     "close",
 })
+
+OMX_LANES = frozenset({"omx_exec", "plan", "ralplan", "ralph", "team"})
+PLANNING_GATES = frozenset({"open", "closed"})
+NEXT_EXECUTION_BRANCHES = frozenset({"none", "pending", "ralph", "team"})
+CLOSE_AUTHORITIES = frozenset({"hermes", "human", "omx"})
+OMX_GLOBAL_BOOLEAN_FLAGS = frozenset({
+    "--madmax",
+    "--high",
+    "--xhigh",
+    "--spark",
+    "--madmax-spark",
+    "--notify-temp",
+    "--tmux",
+    "--discord",
+    "--slack",
+    "--telegram",
+    "--force",
+    "--dry-run",
+    "--keep-config",
+    "--purge",
+    "--verbose",
+})
+OMX_GLOBAL_FLAGS_WITH_VALUES = frozenset({"--custom", "--scope", "--skill-target"})
+OMX_LANE_SUBCOMMANDS = {
+    "exec": "omx_exec",
+    "plan": "plan",
+    "ralplan": "ralplan",
+    "ralph": "ralph",
+    "team": "team",
+}
 
 
 def _utcnow() -> datetime:
@@ -129,6 +160,201 @@ def record_has_closed_usable_outcome(record: Any) -> bool:
     )
 
 
+def _normalize_lane_value(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    text = text.replace("-", "_").replace(" ", "_")
+    aliases = {
+        "exec": "omx_exec",
+        "omxexec": "omx_exec",
+        "omx_exec": "omx_exec",
+        "plan": "plan",
+        "ralplan": "ralplan",
+        "ralph": "ralph",
+        "team": "team",
+    }
+    normalized = aliases.get(text)
+    if normalized in OMX_LANES:
+        return normalized
+    return None
+
+
+def _normalize_planning_gate(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    text = text.replace("-", "_").replace(" ", "_")
+    return text if text in PLANNING_GATES else None
+
+
+def _normalize_next_execution_branch(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    text = text.replace("-", "_").replace(" ", "_")
+    if text in {"none_yet", "not_set"}:
+        text = "none"
+    return text if text in NEXT_EXECUTION_BRANCHES else None
+
+
+def _normalize_close_authority(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    text = text.replace("-", "_").replace(" ", "_")
+    return text if text in CLOSE_AUTHORITIES else None
+
+
+def infer_omx_lane_from_command(command: str) -> Optional[str]:
+    normalized = str(command or "").lower()
+    if not normalized.strip():
+        return None
+    if "$ralplan" in normalized:
+        return "ralplan"
+    if "$ralph" in normalized:
+        return "ralph"
+    if "$team" in normalized:
+        return "team"
+
+    shellish = re.sub(r"[\n\r\t\"'`|&;()\[\]{}<>]", " ", normalized)
+    tokens = [token for token in shellish.split() if token]
+    if not tokens:
+        return None
+
+    for idx, token in enumerate(tokens):
+        if token != "omx":
+            continue
+        cursor = idx + 1
+        while cursor < len(tokens):
+            current = tokens[cursor]
+            lane = OMX_LANE_SUBCOMMANDS.get(current)
+            if lane:
+                return lane
+            if current in OMX_GLOBAL_BOOLEAN_FLAGS:
+                cursor += 1
+                continue
+            if current in OMX_GLOBAL_FLAGS_WITH_VALUES:
+                cursor += 2
+                continue
+            if any(current.startswith(f"{flag}=") for flag in OMX_GLOBAL_FLAGS_WITH_VALUES):
+                cursor += 1
+                continue
+            if current == "-w":
+                if cursor + 1 < len(tokens) and not tokens[cursor + 1].startswith("-"):
+                    cursor += 2
+                else:
+                    cursor += 1
+                continue
+            if current.startswith("-w="):
+                cursor += 1
+                continue
+            if current.startswith("-"):
+                cursor += 1
+                continue
+            break
+    return None
+
+
+def resolve_omx_lane_truth(
+    *,
+    current_lane: Optional[str] = None,
+    planning_gate: Optional[str] = None,
+    next_execution_branch: Optional[str] = None,
+    close_authority: Optional[str] = None,
+) -> Dict[str, Optional[str]]:
+    lane = _normalize_lane_value(current_lane)
+    gate = _normalize_planning_gate(planning_gate)
+    branch = _normalize_next_execution_branch(next_execution_branch)
+    authority = _normalize_close_authority(close_authority)
+
+    if current_lane and lane is None:
+        raise ValueError("invalid_current_lane")
+    if planning_gate and gate is None:
+        raise ValueError("invalid_planning_gate")
+    if next_execution_branch and branch is None:
+        raise ValueError("invalid_next_execution_branch")
+    if close_authority and authority is None:
+        raise ValueError("invalid_close_authority")
+
+    if lane is None:
+        if gate or branch or authority:
+            raise ValueError("lane_fields_require_current_lane")
+        return {
+            "current_lane": None,
+            "planning_gate": None,
+            "next_execution_branch": None,
+            "close_authority": None,
+        }
+
+    authority = authority or "hermes"
+
+    if lane == "omx_exec":
+        expected_gate = "closed"
+        expected_branch = "none"
+    elif lane == "plan":
+        expected_gate = "open"
+        expected_branch = "none"
+    elif lane == "ralplan":
+        expected_gate = gate or "open"
+        if expected_gate == "open":
+            expected_branch = "none"
+        else:
+            expected_branch = branch or "pending"
+            if expected_branch not in {"pending", "ralph", "team"}:
+                raise ValueError("invalid_ralplan_branch")
+    elif lane == "ralph":
+        expected_gate = "closed"
+        expected_branch = "ralph"
+    else:
+        expected_gate = "closed"
+        expected_branch = "team"
+
+    if gate and gate != expected_gate:
+        raise ValueError("invalid_planning_gate_for_lane")
+    if branch and branch != expected_branch:
+        raise ValueError("invalid_next_execution_branch_for_lane")
+
+    return {
+        "current_lane": lane,
+        "planning_gate": expected_gate,
+        "next_execution_branch": expected_branch,
+        "close_authority": authority,
+    }
+
+
+def _apply_omx_lane_truth(record: "WorkRecord") -> None:
+    if not (
+        record.owner == "hermes"
+        and record.executor == "omx"
+        and record.mode == "delegated"
+    ):
+        return
+    if not any(
+        getattr(record, field, None)
+        for field in ("current_lane", "planning_gate", "next_execution_branch", "close_authority")
+    ):
+        return
+    lane_truth = resolve_omx_lane_truth(
+        current_lane=getattr(record, "current_lane", None),
+        planning_gate=getattr(record, "planning_gate", None),
+        next_execution_branch=getattr(record, "next_execution_branch", None),
+        close_authority=getattr(record, "close_authority", None),
+    )
+    record.current_lane = lane_truth["current_lane"]
+    record.planning_gate = lane_truth["planning_gate"]
+    record.next_execution_branch = lane_truth["next_execution_branch"]
+    record.close_authority = lane_truth["close_authority"]
+
+
 @dataclass
 class WorkRecord:
     work_id: str
@@ -150,6 +376,10 @@ class WorkRecord:
     proof: Optional[str] = None
     usable_outcome: Optional[str] = None
     close_disposition: Optional[str] = None
+    current_lane: Optional[str] = None
+    planning_gate: Optional[str] = None
+    next_execution_branch: Optional[str] = None
+    close_authority: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -179,6 +409,10 @@ class WorkRecord:
             proof=data.get("proof"),
             usable_outcome=data.get("usable_outcome"),
             close_disposition=data.get("close_disposition"),
+            current_lane=data.get("current_lane"),
+            planning_gate=data.get("planning_gate"),
+            next_execution_branch=data.get("next_execution_branch"),
+            close_authority=data.get("close_authority"),
         )
 
 
@@ -235,6 +469,7 @@ class WorkStateStore:
     def upsert(self, record: WorkRecord) -> None:
         with self._lock:
             self._ensure_loaded()
+            _apply_omx_lane_truth(record)
             for idx, existing in enumerate(self._records):
                 if (
                     existing.work_id == record.work_id
@@ -259,6 +494,7 @@ class WorkStateStore:
                     for key, value in updates.items():
                         if hasattr(record, key):
                             setattr(record, key, value)
+                    _apply_omx_lane_truth(record)
                     self._save_locked()
                     return True
         return False

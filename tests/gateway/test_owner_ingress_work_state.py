@@ -12,7 +12,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, SessionStore
-from gateway.work_state import WorkRecord, WorkStateStore
+from gateway.work_state import WorkRecord, WorkStateStore, infer_omx_lane_from_command
 
 
 class _CaptureAdapter:
@@ -85,6 +85,12 @@ def _make_runner(tmp_path):
     runner.work_state_store = work_state_store
     runner.adapters = {Platform.TELEGRAM: _CaptureAdapter()}
     return runner, store, work_state_store
+
+
+def test_infer_omx_lane_from_flag_prefixed_commands():
+    assert infer_omx_lane_from_command("omx --madmax --high exec -C /repo/demo --json") == "omx_exec"
+    assert infer_omx_lane_from_command("omx --madmax --high ralplan -C /repo/demo --json") == "ralplan"
+    assert infer_omx_lane_from_command("tmux new-session -d -s omx-team 'bash -lc \"cd /repo/demo && omx --madmax --high team -C /repo/demo --json\"'") == "team"
 
 
 @pytest.mark.asyncio
@@ -569,6 +575,44 @@ def test_mark_work_record_delegated_handoff_writes_executor_correlation_fields(t
     assert record.worktree_path == "/repo/demo"
     assert record.next_action == "Resume the OMX-owned delegated run"
     assert record.proof == "delegated_handoff:test"
+
+
+def test_mark_work_record_delegated_handoff_writes_planning_closed_pending_branch_fields(tmp_path):
+    runner, store, work_state_store = _make_runner(tmp_path)
+    source = _make_source()
+    session_entry = store.get_or_create_session(source)
+
+    work_id = GatewayRunner._begin_direct_work_record(
+        runner,
+        session_id=session_entry.session_id,
+        session_key=session_entry.session_key,
+        message_text="delegate this task to OMX planning",
+        platform="telegram",
+        event_message_id="msg-ralplan",
+    )
+
+    updated = GatewayRunner._mark_work_record_delegated(
+        runner,
+        work_id,
+        session_entry.session_key,
+        executor_session_id="omx-session-plan-123",
+        tmux_session="omx-plan-test",
+        repo_path="/repo/demo",
+        worktree_path="/repo/demo",
+        next_action="Wait for approved branch selection",
+        proof="delegated_handoff:ralplan",
+        current_lane="ralplan",
+        planning_gate="closed",
+        next_execution_branch="pending",
+        close_authority="hermes",
+    )
+
+    assert updated is True
+    record = work_state_store.list_records()[0]
+    assert record.current_lane == "ralplan"
+    assert record.planning_gate == "closed"
+    assert record.next_execution_branch == "pending"
+    assert record.close_authority == "hermes"
 
 
 @pytest.mark.asyncio
@@ -1259,6 +1303,128 @@ async def test_handle_delegated_ingress_packet_rejects_ambiguous_match(tmp_path)
     assert capture_adapter.events == []
 
 
+@pytest.mark.asyncio
+async def test_handle_delegated_ingress_packet_materializes_planning_closed_pending_branch(tmp_path):
+    runner, store, work_state_store = _make_runner(tmp_path)
+    source = _make_source()
+    session_entry = store.get_or_create_session(source)
+    now = datetime.now(timezone.utc)
+    work_state_store.upsert(
+        WorkRecord(
+            work_id="wk-delegated-plan-close-1",
+            title="delegated planning close",
+            objective="materialize planning-closed as a real lane transition",
+            owner="hermes",
+            executor="omx",
+            mode="delegated",
+            owner_session_id=session_entry.session_key,
+            state="running",
+            started_at=now,
+            last_progress_at=now,
+            next_action="Wait for planning review",
+            executor_session_id="omx-plan-close-1",
+            tmux_session="omx-plan-close",
+            repo_path="/repo/demo",
+            worktree_path="/repo/demo",
+            proof="delegated_handoff:test",
+            current_lane="ralplan",
+            planning_gate="open",
+            next_execution_branch="none",
+            close_authority="hermes",
+        )
+    )
+
+    result = await GatewayRunner.handle_delegated_ingress_packet(
+        runner,
+        {
+            "owner": "hermes",
+            "state": "blocked",
+            "normalized_event": "blocked",
+            "executor": "omx",
+            "executor_session_id": "omx-plan-close-1",
+            "tmux_session": "omx-plan-close",
+            "repo_path": "/repo/demo",
+            "worktree_path": "/repo/demo",
+            "current_lane": "ralplan",
+            "planning_gate": "closed",
+            "next_execution_branch": "pending",
+            "close_authority": "hermes",
+            "next_action": "Select ralph or team after approval",
+            "proof": "clawhip:planning-approved",
+        },
+        route_name="delegated-ingress",
+        delivery_id="delegated-plan-close-001",
+    )
+
+    assert result["status"] == "accepted"
+    record = work_state_store.resolve_delegated_signal_candidate(
+        work_id="wk-delegated-plan-close-1",
+        live_only=False,
+    )["record"]
+    assert record.current_lane == "ralplan"
+    assert record.planning_gate == "closed"
+    assert record.next_execution_branch == "pending"
+    assert record.close_authority == "hermes"
+
+
+@pytest.mark.asyncio
+async def test_handle_delegated_ingress_packet_rejects_invalid_lane_transition(tmp_path):
+    runner, store, work_state_store = _make_runner(tmp_path)
+    source = _make_source()
+    session_entry = store.get_or_create_session(source)
+    now = datetime.now(timezone.utc)
+    work_state_store.upsert(
+        WorkRecord(
+            work_id="wk-delegated-invalid-transition-1",
+            title="delegated invalid transition",
+            objective="reject lane truth that collapses back to generic delegated state",
+            owner="hermes",
+            executor="omx",
+            mode="delegated",
+            owner_session_id=session_entry.session_key,
+            state="running",
+            started_at=now,
+            last_progress_at=now,
+            next_action="Wait for OMX signal",
+            executor_session_id="omx-invalid-1",
+            tmux_session="omx-invalid",
+            repo_path="/repo/demo",
+            worktree_path="/repo/demo",
+            proof="delegated_handoff:test",
+            current_lane="ralplan",
+            planning_gate="open",
+            next_execution_branch="none",
+            close_authority="hermes",
+        )
+    )
+
+    result = await GatewayRunner.handle_delegated_ingress_packet(
+        runner,
+        {
+            "owner": "hermes",
+            "state": "blocked",
+            "normalized_event": "blocked",
+            "executor": "omx",
+            "executor_session_id": "omx-invalid-1",
+            "tmux_session": "omx-invalid",
+            "repo_path": "/repo/demo",
+            "worktree_path": "/repo/demo",
+            "current_lane": "plan",
+            "planning_gate": "closed",
+            "next_execution_branch": "pending",
+            "close_authority": "hermes",
+            "next_action": "This should be rejected",
+            "proof": "clawhip:invalid-transition",
+        },
+        route_name="delegated-ingress",
+        delivery_id="delegated-invalid-001",
+    )
+
+    assert result["status"] == "reject"
+    assert result["reason"] == "invalid_delegated_lane_transition"
+    assert result["http_status"] == 400
+
+
 def test_resolve_delegated_signal_candidate_refreshes_external_store_updates(tmp_path):
     path = tmp_path / "work_state.json"
     reader = WorkStateStore(path)
@@ -1381,6 +1547,54 @@ def test_update_delegated_work_for_process_marks_failed_on_nonzero_exit(tmp_path
     assert record.close_disposition == "close"
     assert record.proof == "background_process_exit:23"
     assert record.next_action == "Inspect runtime contamination before any retry or handoff"
+
+
+def test_update_delegated_work_for_process_preserves_lane_truth_on_non_success(tmp_path):
+    runner, store, work_state_store = _make_runner(tmp_path)
+    source = _make_source()
+    session_entry = store.get_or_create_session(source)
+    now = datetime.now(timezone.utc)
+    work_state_store.upsert(
+        WorkRecord(
+            work_id="wk-delegated-team-fail-1",
+            title="delegated team fail",
+            objective="terminal non-success should not erase lane truth",
+            owner="hermes",
+            executor="omx",
+            mode="delegated",
+            owner_session_id=session_entry.session_key,
+            state="running",
+            started_at=now,
+            last_progress_at=now,
+            next_action="Wait for team branch completion",
+            executor_session_id="proc-team-fail-1",
+            tmux_session="omx-team-fail",
+            repo_path="/repo/demo",
+            worktree_path="/repo/demo",
+            proof="delegated_handoff:test",
+            current_lane="team",
+            planning_gate="closed",
+            next_execution_branch="team",
+            close_authority="hermes",
+        )
+    )
+
+    updated = GatewayRunner._update_delegated_work_for_process(
+        runner,
+        executor_session_id="proc-team-fail-1",
+        exit_code=17,
+    )
+
+    assert updated is True
+    record = work_state_store.resolve_delegated_signal_candidate(
+        work_id="wk-delegated-team-fail-1",
+        live_only=False,
+    )["record"]
+    assert record.state == "failed"
+    assert record.current_lane == "team"
+    assert record.planning_gate == "closed"
+    assert record.next_execution_branch == "team"
+    assert record.close_authority == "hermes"
 
 
 def test_finish_direct_work_record_does_not_overwrite_delegated_record_state_or_proof(tmp_path):

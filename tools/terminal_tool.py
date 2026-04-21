@@ -1124,9 +1124,19 @@ def _extract_tmux_session_name(command: str) -> Optional[str]:
     return None
 
 
+def _apply_default_omx_launch_flags(command: str) -> str:
+    text = str(command or "")
+    if not text.strip() or "omx " not in text:
+        return text
+
+    pattern = re.compile(r"\bomx\s+(?![^\n]*\b--madmax\b)(?![^\n]*\b--high\b)(exec|plan|ralplan|ralph|team)\b")
+    return pattern.sub(r"omx --madmax --high \1", text)
+
+
 def _looks_like_omx_delegation(command: str) -> bool:
-    normalized = " ".join((command or "").lower().split())
-    return "omx exec" in normalized or "omx team" in normalized
+    from gateway.work_state import infer_omx_lane_from_command
+
+    return infer_omx_lane_from_command(command) is not None
 
 
 def _maybe_mark_gateway_work_delegated(
@@ -1139,7 +1149,16 @@ def _maybe_mark_gateway_work_delegated(
     if not session_key or not _looks_like_omx_delegation(command):
         return False
 
-    from gateway.work_state import WorkStateStore
+    from gateway.work_state import WorkStateStore, infer_omx_lane_from_command, resolve_omx_lane_truth
+
+    current_lane = infer_omx_lane_from_command(command)
+    if current_lane is None:
+        return False
+
+    try:
+        lane_truth = resolve_omx_lane_truth(current_lane=current_lane)
+    except ValueError:
+        return False
 
     store = WorkStateStore()
     candidates = [
@@ -1174,9 +1193,13 @@ def _maybe_mark_gateway_work_delegated(
         repo_path=repo_path,
         worktree_path=worktree_path,
         next_action="Resume the delegated OMX work",
-        proof="terminal_background:omx_exec",
+        proof=f"terminal_background:{current_lane}",
         usable_outcome=None,
         close_disposition=None,
+        current_lane=lane_truth["current_lane"],
+        planning_gate=lane_truth["planning_gate"],
+        next_execution_branch=lane_truth["next_execution_branch"],
+        close_authority=lane_truth["close_authority"],
     )
 
 
@@ -1233,6 +1256,8 @@ def terminal_tool(
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
                 "status": "error",
             }, ensure_ascii=False)
+
+        command = _apply_default_omx_launch_flags(command)
 
         # Get configuration
         config = _get_env_config()

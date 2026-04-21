@@ -1563,6 +1563,10 @@ class GatewayRunner:
         state = str(payload.get("state", "")).strip() or str(payload.get("normalized_event", "")).strip().replace("-", "_")
         next_action = str(payload.get("next_action", "")).strip()
         proof = str(payload.get("proof", "")).strip()
+        current_lane = str(payload.get("current_lane", "")).strip() or None
+        planning_gate = str(payload.get("planning_gate", "")).strip() or None
+        next_execution_branch = str(payload.get("next_execution_branch", "")).strip() or None
+        close_authority = str(payload.get("close_authority", "")).strip() or None
 
         from gateway.work_state import (
             WAKE_STATES,
@@ -1570,21 +1574,15 @@ class GatewayRunner:
             map_usable_outcome_to_owner_state,
             normalize_close_disposition,
             normalize_usable_outcome,
+            resolve_omx_lane_truth,
         )
 
         usable_outcome = normalize_usable_outcome(payload.get("usable_outcome"))
         close_disposition = normalize_close_disposition(payload.get("close_disposition"))
         expected_state = map_usable_outcome_to_owner_state(usable_outcome or "") if usable_outcome else None
+        legacy_lane_only = usable_outcome is None and close_disposition is None
 
-        if (
-            owner != "hermes"
-            or executor != "omx"
-            or not next_action
-            or not proof
-            or not usable_outcome
-            or not close_disposition
-            or expected_state is None
-        ):
+        if owner != "hermes" or executor != "omx" or not next_action or not proof:
             return {
                 "status": "reject",
                 "verdict": "reject",
@@ -1593,23 +1591,41 @@ class GatewayRunner:
                 "http_status": 400,
             }
 
-        state = state or expected_state
-        if state != expected_state or state not in WAKE_STATES:
-            return {
-                "status": "reject",
-                "verdict": "reject",
-                "reason": "invalid_delegated_ingress_state",
-                "resolution": "invalid",
-                "http_status": 400,
-            }
-        if close_disposition == "update" and usable_outcome != "retry_needed":
-            return {
-                "status": "reject",
-                "verdict": "reject",
-                "reason": "invalid_delegated_ingress_packet",
-                "resolution": "invalid",
-                "http_status": 400,
-            }
+        if legacy_lane_only:
+            if state not in WAKE_STATES:
+                return {
+                    "status": "reject",
+                    "verdict": "reject",
+                    "reason": "invalid_delegated_ingress_state",
+                    "resolution": "invalid",
+                    "http_status": 400,
+                }
+        else:
+            if not usable_outcome or not close_disposition or expected_state is None:
+                return {
+                    "status": "reject",
+                    "verdict": "reject",
+                    "reason": "invalid_delegated_ingress_packet",
+                    "resolution": "invalid",
+                    "http_status": 400,
+                }
+            state = state or expected_state
+            if state != expected_state or state not in WAKE_STATES:
+                return {
+                    "status": "reject",
+                    "verdict": "reject",
+                    "reason": "invalid_delegated_ingress_state",
+                    "resolution": "invalid",
+                    "http_status": 400,
+                }
+            if close_disposition == "update" and usable_outcome != "retry_needed":
+                return {
+                    "status": "reject",
+                    "verdict": "reject",
+                    "reason": "invalid_delegated_ingress_packet",
+                    "resolution": "invalid",
+                    "http_status": 400,
+                }
 
         work_state_store = getattr(self, "work_state_store", None)
         if work_state_store is None:
@@ -1658,6 +1674,22 @@ class GatewayRunner:
                 "http_status": 404,
             }
 
+        try:
+            lane_truth = resolve_omx_lane_truth(
+                current_lane=current_lane or getattr(record, "current_lane", None),
+                planning_gate=planning_gate or getattr(record, "planning_gate", None),
+                next_execution_branch=next_execution_branch or getattr(record, "next_execution_branch", None),
+                close_authority=close_authority or getattr(record, "close_authority", None),
+            )
+        except ValueError:
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": "invalid_delegated_lane_transition",
+                "resolution": "invalid",
+                "http_status": 400,
+            }
+
         now = datetime.now().astimezone()
         bounded_next = bound_next_action(
             next_action,
@@ -1665,8 +1697,11 @@ class GatewayRunner:
         )
         dispatch_result = None
         dispatch_reason = None
+        wants_retry_update = close_disposition == "update" or (
+            legacy_lane_only and state == "retry_needed"
+        )
 
-        if close_disposition == "update":
+        if wants_retry_update:
             prior_retry_dispatched = (
                 getattr(record, "usable_outcome", None) == "retry_needed"
                 and getattr(record, "close_disposition", None) == "update"
@@ -1704,6 +1739,10 @@ class GatewayRunner:
                         tmux_session=tmux_session or record.tmux_session,
                         repo_path=repo_path or record.repo_path,
                         worktree_path=worktree_path or record.worktree_path,
+                        current_lane=lane_truth["current_lane"],
+                        planning_gate=lane_truth["planning_gate"],
+                        next_execution_branch=lane_truth["next_execution_branch"],
+                        close_authority=lane_truth["close_authority"],
                     )
                     return {
                         "status": "accepted",
@@ -1719,7 +1758,8 @@ class GatewayRunner:
                         "http_status": 202,
                     }
                 dispatch_reason = dispatch_result.get("reason")
-                close_disposition = "close"
+                if not legacy_lane_only:
+                    close_disposition = "close"
 
         work_state_store.update_record(
             record.work_id,
@@ -1734,6 +1774,10 @@ class GatewayRunner:
             tmux_session=tmux_session or record.tmux_session,
             repo_path=repo_path or record.repo_path,
             worktree_path=worktree_path or record.worktree_path,
+            current_lane=lane_truth["current_lane"],
+            planning_gate=lane_truth["planning_gate"],
+            next_execution_branch=lane_truth["next_execution_branch"],
+            close_authority=lane_truth["close_authority"],
         )
 
         owner_result = await self.handle_owner_ingress_packet(
@@ -1751,7 +1795,7 @@ class GatewayRunner:
         owner_result["work_id"] = record.work_id
         owner_result["usable_outcome"] = usable_outcome
         owner_result["close_disposition"] = close_disposition
-        if usable_outcome == "retry_needed":
+        if usable_outcome == "retry_needed" or (legacy_lane_only and state == "retry_needed"):
             owner_result["reaction"] = "owner_fallback"
             if dispatch_reason:
                 owner_result["dispatch_reason"] = dispatch_reason
@@ -1863,11 +1907,35 @@ class GatewayRunner:
         worktree_path: Optional[str] = None,
         next_action: str = "Resume the delegated OMX work",
         proof: str = "delegated_handoff",
+        current_lane: Optional[str] = None,
+        planning_gate: Optional[str] = None,
+        next_execution_branch: Optional[str] = None,
+        close_authority: Optional[str] = None,
     ) -> bool:
         if not work_id:
             return False
         work_state_store = getattr(self, "work_state_store", None)
         if work_state_store is None:
+            return False
+        existing_records = work_state_store.find_matching_records(
+            work_id,
+            owner_session_id=session_key,
+            live_only=False,
+        )
+        existing = existing_records[0] if existing_records else None
+
+        from gateway.work_state import resolve_omx_lane_truth
+
+        try:
+            lane_truth = resolve_omx_lane_truth(
+                current_lane=current_lane or getattr(existing, "current_lane", None),
+                planning_gate=planning_gate or getattr(existing, "planning_gate", None),
+                next_execution_branch=(
+                    next_execution_branch or getattr(existing, "next_execution_branch", None)
+                ),
+                close_authority=close_authority or getattr(existing, "close_authority", None),
+            )
+        except ValueError:
             return False
         now = datetime.now().astimezone()
         return work_state_store.update_record(
@@ -1885,6 +1953,10 @@ class GatewayRunner:
             proof=proof,
             usable_outcome=None,
             close_disposition=None,
+            current_lane=lane_truth["current_lane"],
+            planning_gate=lane_truth["planning_gate"],
+            next_execution_branch=lane_truth["next_execution_branch"],
+            close_authority=lane_truth["close_authority"],
         )
 
     def _update_delegated_work_for_process(
