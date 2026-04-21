@@ -35,6 +35,14 @@ _DISCORD_THREAD_RESUME_ALIASES = {
     "resume",
 }
 
+_DISCORD_THREAD_FOLLOWUP_ALIASES = {
+    "그다음 뭐지?",
+    "다음 뭐지?",
+    "다음 카드",
+    "다음 단계",
+    "follow-up",
+}
+
 
 def _merge_runtime_notes(*notes: str) -> str:
     merged: list[str] = []
@@ -140,6 +148,18 @@ def resolve_natural_skill_invocation(
             "/discord-thread-state-recovery",
             normalized,
             _discord_thread_state_recovery_runtime_note("resume"),
+        )
+
+    if (
+        platform_name == "discord"
+        and chat_kind == "thread"
+        and thread_id
+        and normalized_lower in {alias.casefold() for alias in _DISCORD_THREAD_FOLLOWUP_ALIASES}
+    ):
+        return (
+            "/discord-thread-state-recovery",
+            normalized,
+            _discord_thread_state_recovery_runtime_note("follow-up"),
         )
 
     return None
