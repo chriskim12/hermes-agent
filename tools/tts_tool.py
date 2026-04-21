@@ -2,12 +2,13 @@
 """
 Text-to-Speech Tool Module
 
-Supports six TTS providers:
+Supports seven TTS providers:
 - Edge TTS (default, free, no API key): Microsoft Edge neural voices
 - ElevenLabs (premium): High-quality voices, needs ELEVENLABS_API_KEY
 - OpenAI TTS: Good quality, needs OPENAI_API_KEY
 - MiniMax TTS: High-quality with voice cloning, needs MINIMAX_API_KEY
 - Mistral (Voxtral TTS): Multilingual, native Opus, needs MISTRAL_API_KEY
+- Fish Audio TTS: Voice-model based TTS, needs FISH_AUDIO_API_KEY
 - NeuTTS (local, free, no API key): On-device TTS via neutts_cli, needs neutts installed
 
 Output formats:
@@ -91,6 +92,8 @@ DEFAULT_MINIMAX_VOICE_ID = "English_Graceful_Lady"
 DEFAULT_MINIMAX_BASE_URL = "https://api.minimax.io/v1/t2a_v2"
 DEFAULT_MISTRAL_TTS_MODEL = "voxtral-mini-tts-2603"
 DEFAULT_MISTRAL_TTS_VOICE_ID = "c69964a6-ab8b-4f8a-9465-ec0925096ec8"  # Paul - Neutral
+DEFAULT_FISH_TTS_MODEL = "s2-pro"
+DEFAULT_FISH_TTS_BASE_URL = "https://api.fish.audio/v1/tts"
 
 def _get_default_output_dir() -> str:
     from hermes_constants import get_hermes_dir
@@ -98,6 +101,9 @@ def _get_default_output_dir() -> str:
 
 DEFAULT_OUTPUT_DIR = _get_default_output_dir()
 MAX_TEXT_LENGTH = 4000
+SUPPORTED_TTS_PROVIDERS = {
+    "edge", "elevenlabs", "openai", "minimax", "mistral", "fish", "neutts"
+}
 
 
 # ===========================================================================
@@ -434,6 +440,88 @@ def _generate_mistral_tts(text: str, output_path: str, tts_config: Dict[str, Any
 
 
 # ===========================================================================
+# Provider: Fish Audio TTS
+# ===========================================================================
+def _generate_fish_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate audio using Fish Audio's REST TTS API."""
+    import urllib.error
+    import urllib.request
+
+    api_key = os.getenv("FISH_AUDIO_API_KEY", "")
+    if not api_key:
+        raise ValueError("FISH_AUDIO_API_KEY not set. Get one at https://fish.audio/")
+
+    fish_config = tts_config.get("fish", {})
+    model = str(fish_config.get("model") or DEFAULT_FISH_TTS_MODEL).strip()
+    voice_id = str(fish_config.get("voice_id") or "").strip()
+    if not voice_id:
+        raise ValueError("Fish Audio voice_id not set under tts.fish.voice_id")
+
+    base_url = str(fish_config.get("base_url") or DEFAULT_FISH_TTS_BASE_URL).strip()
+    speed = float(fish_config.get("speed", tts_config.get("speed", 1.0)))
+    normalize_loudness = bool(fish_config.get("normalize_loudness", True))
+
+    if output_path.endswith(".wav"):
+        audio_format = "wav"
+    else:
+        audio_format = "mp3"
+
+    payload = {
+        "text": text,
+        "reference_id": voice_id,
+        "format": audio_format,
+        "sample_rate": int(fish_config.get("sample_rate", 44100)),
+        "latency": fish_config.get("latency", "normal"),
+        "normalize": bool(fish_config.get("normalize", True)),
+        "prosody": {
+            "speed": speed,
+            "volume": float(fish_config.get("volume", 0)),
+            "normalize_loudness": normalize_loudness,
+        },
+    }
+    if audio_format == "mp3":
+        payload["mp3_bitrate"] = int(fish_config.get("mp3_bitrate", 128))
+
+    request = urllib.request.Request(
+        base_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "model": model,
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            audio_bytes = response.read()
+    except urllib.error.HTTPError as e:
+        detail = e.reason
+        try:
+            body = e.read().decode("utf-8", errors="ignore").strip()
+            if body:
+                try:
+                    parsed = json.loads(body)
+                    detail = parsed.get("message") or parsed.get("detail") or body
+                except json.JSONDecodeError:
+                    detail = body
+        except Exception:
+            pass
+        raise RuntimeError(f"Fish Audio TTS API error ({e.code}): {detail}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Fish Audio TTS request failed: {e.reason}") from e
+
+    if not audio_bytes:
+        raise RuntimeError("Fish Audio TTS returned empty audio data")
+
+    with open(output_path, "wb") as f:
+        f.write(audio_bytes)
+
+    return output_path
+
+
+# ===========================================================================
 # NeuTTS (local, on-device TTS via neutts_cli)
 # ===========================================================================
 
@@ -543,6 +631,8 @@ def text_to_speech_tool(
 
     tts_config = _load_tts_config()
     provider = _get_provider(tts_config)
+    if provider not in SUPPORTED_TTS_PROVIDERS:
+        return tool_error(f"Unsupported TTS provider: {provider}", success=False)
 
     # Detect platform from gateway env var to choose the best output format.
     # Telegram voice bubbles require Opus (.ogg); OpenAI and ElevenLabs can
@@ -609,6 +699,10 @@ def text_to_speech_tool(
                 }, ensure_ascii=False)
             logger.info("Generating speech with Mistral Voxtral TTS...")
             _generate_mistral_tts(text, file_str, tts_config)
+
+        elif provider == "fish":
+            logger.info("Generating speech with Fish Audio TTS...")
+            _generate_fish_tts(text, file_str, tts_config)
 
         elif provider == "neutts":
             if not _check_neutts_available():
@@ -738,6 +832,8 @@ def check_tts_requirements() -> bool:
             return True
     except ImportError:
         pass
+    if os.getenv("FISH_AUDIO_API_KEY"):
+        return True
     if _check_neutts_available():
         return True
     return False

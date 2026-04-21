@@ -255,6 +255,10 @@ def check_config(groq_key, eleven_key):
                 warn("TTS config says elevenlabs but ELEVENLABS_API_KEY is missing")
             if tts_provider == "mistral" and not os.getenv("MISTRAL_API_KEY"):
                 warn("TTS config says mistral but MISTRAL_API_KEY is missing")
+            if tts_provider == "fish" and not os.getenv("FISH_AUDIO_API_KEY"):
+                warn("TTS config says fish but FISH_AUDIO_API_KEY is missing")
+            if tts_provider == "fish" and not cfg.get("tts", {}).get("fish", {}).get("voice_id"):
+                warn("TTS config says fish but tts.fish.voice_id is missing")
         except Exception as e:
             warn("config.yaml", f"parse error: {e}")
     else:

@@ -433,6 +433,10 @@ def _print_setup_summary(config: dict, hermes_home):
         tool_status.append(("Text-to-Speech (MiniMax)", True, None))
     elif tts_provider == "mistral" and get_env_value("MISTRAL_API_KEY"):
         tool_status.append(("Text-to-Speech (Mistral Voxtral)", True, None))
+    elif tts_provider == "fish" and get_env_value("FISH_AUDIO_API_KEY") and config.get("tts", {}).get("fish", {}).get("voice_id"):
+        tool_status.append(("Text-to-Speech (Fish Audio)", True, None))
+    elif tts_provider == "fish":
+        tool_status.append(("Text-to-Speech (Fish Audio — missing API key or voice ID)", False, "run 'hermes setup tts'"))
     elif tts_provider == "neutts":
         try:
             import importlib.util
@@ -922,6 +926,7 @@ def _setup_tts_provider(config: dict):
         "openai": "OpenAI TTS",
         "minimax": "MiniMax TTS",
         "mistral": "Mistral Voxtral TTS",
+        "fish": "Fish Audio TTS",
         "neutts": "NeuTTS",
     }
     current_label = provider_labels.get(current_provider, current_provider)
@@ -943,10 +948,11 @@ def _setup_tts_provider(config: dict):
             "OpenAI TTS (good quality, needs API key)",
             "MiniMax TTS (high quality with voice cloning, needs API key)",
             "Mistral Voxtral TTS (multilingual, native Opus, needs API key)",
+            "Fish Audio TTS (voice-model based, needs API key + voice ID)",
             "NeuTTS (local on-device, free, ~300MB model download)",
         ]
     )
-    providers.extend(["edge", "elevenlabs", "openai", "minimax", "mistral", "neutts"])
+    providers.extend(["edge", "elevenlabs", "openai", "minimax", "mistral", "fish", "neutts"])
     choices.append(f"Keep current ({current_label})")
     keep_current_idx = len(choices) - 1
     idx = prompt_choice("Select TTS provider:", choices, keep_current_idx)
@@ -1036,12 +1042,43 @@ def _setup_tts_provider(config: dict):
                 print_warning("No API key provided. Falling back to Edge TTS.")
                 selected = "edge"
 
+    elif selected == "fish":
+        existing = get_env_value("FISH_AUDIO_API_KEY")
+        if not existing:
+            print()
+            api_key = prompt("Fish Audio API key for TTS", password=True)
+            if api_key:
+                save_env_value("FISH_AUDIO_API_KEY", api_key)
+                print_success("Fish Audio API key saved")
+            else:
+                print_warning("No API key provided. Falling back to Edge TTS.")
+                selected = "edge"
+
     # Save the selection
     if "tts" not in config:
         config["tts"] = {}
     config["tts"]["provider"] = selected
+    if selected == "fish":
+        fish_config = config.setdefault("tts", {}).setdefault("fish", {})
+        existing_voice_id = str(fish_config.get("voice_id") or "").strip()
+        if existing_voice_id:
+            print_info(f"Keeping existing Fish Audio voice ID: {existing_voice_id}")
+        else:
+            print()
+            voice_id = prompt("Fish Audio voice ID (required)", default="")
+            if voice_id:
+                fish_config["voice_id"] = voice_id.strip()
+            else:
+                print_warning("No Fish Audio voice ID provided. Falling back to Edge TTS.")
+                config["tts"]["provider"] = "edge"
+
+        if config["tts"]["provider"] == "fish":
+            current_model = str(fish_config.get("model") or "s2-pro").strip() or "s2-pro"
+            model = prompt("Fish Audio model", default=current_model).strip() or current_model
+            fish_config["model"] = model
     save_config(config)
-    print_success(f"TTS provider set to: {provider_labels.get(selected, selected)}")
+    final_provider = config["tts"]["provider"]
+    print_success(f"TTS provider set to: {provider_labels.get(final_provider, final_provider)}")
 
 
 def setup_tts(config: dict):
