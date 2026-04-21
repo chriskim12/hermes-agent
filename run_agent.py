@@ -339,6 +339,124 @@ def _paths_overlap(left: Path, right: Path) -> bool:
 
 _SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
 
+_QUESTION_INTENT_IDENTITY_RE = re.compile(
+    r"(무슨\s+[\w-]+|무슨\s+lane|어느\s+[\w-]+|뭐(야|지|임|인데)|뭔(데|가)|정체|무엇|what\s+is|which\s+lane)",
+    re.IGNORECASE,
+)
+_QUESTION_INTENT_POSSIBILITY_RE = re.compile(
+    r"(할\s*수\s*있|받을\s*수\s*있|알\s*수\s*있|될까|되나|가능(해|한가|하냐|하지)|can\s|possible|possible\?)",
+    re.IGNORECASE,
+)
+_QUESTION_INTENT_CAUSE_RE = re.compile(
+    r"(왜|원인|이유|때문|why|cause)",
+    re.IGNORECASE,
+)
+_QUESTION_INTENT_STATUS_RE = re.compile(
+    r"(깨끗|정상|끝났|됐|되었|남아|있어|없어|완료|성공|실패|열려|닫혀|clean|done|finished|remaining|left)",
+    re.IGNORECASE,
+)
+_QUESTION_CARRYOVER_PROGRESS_RE = re.compile(
+    r"(현재|상태|진행|브리핑|남은\s+건|확정|active|phase|progress|status|approved|in progress|still)",
+    re.IGNORECASE,
+)
+
+
+
+def _normalize_question_guard_text(text: str) -> str:
+    return " ".join((text or "").strip().split())
+
+
+
+def _classify_latest_question_intent(text: str) -> str | None:
+    """Classify a short user turn into a minimal question-intent bucket.
+
+    This is intentionally heuristic and narrow — it exists only to catch the
+    most common continuation-bias failure modes (status vs identity vs cause vs
+    possibility) on the current turn.
+    """
+    normalized = _normalize_question_guard_text(text)
+    if not normalized:
+        return None
+
+    if _QUESTION_INTENT_CAUSE_RE.search(normalized):
+        return "cause"
+    if _QUESTION_INTENT_IDENTITY_RE.search(normalized):
+        return "identity"
+    if _QUESTION_INTENT_POSSIBILITY_RE.search(normalized):
+        return "possibility"
+    if _QUESTION_INTENT_STATUS_RE.search(normalized):
+        return "status"
+    return None
+
+
+
+def _find_previous_message_content(
+    messages: list[dict[str, Any]],
+    *,
+    before_idx: int,
+    role: str,
+) -> str:
+    for idx in range(before_idx - 1, -1, -1):
+        msg = messages[idx]
+        if msg.get("role") != role:
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+    return ""
+
+
+
+def _build_latest_question_guard_note(
+    user_message: str,
+    messages: list[dict[str, Any]],
+    *,
+    current_turn_user_idx: int,
+) -> str:
+    """Build an ephemeral current-turn guard against continuation bias.
+
+    The note is injected only into the live API request, never persisted. It
+    tells the model to answer the latest question type first when the previous
+    turn creates a conflicting status/progress frame.
+    """
+    current_intent = _classify_latest_question_intent(user_message)
+    if current_intent is None:
+        return ""
+
+    previous_user = _find_previous_message_content(
+        messages, before_idx=current_turn_user_idx, role="user"
+    )
+    previous_assistant = _find_previous_message_content(
+        messages, before_idx=current_turn_user_idx, role="assistant"
+    )
+    previous_intent = _classify_latest_question_intent(previous_user)
+    progress_carryover = bool(_QUESTION_CARRYOVER_PROGRESS_RE.search(previous_assistant))
+    intent_switched = bool(previous_intent and previous_intent != current_intent)
+
+    if current_intent not in {"status", "identity", "cause", "possibility"}:
+        return ""
+    if not intent_switched and not progress_carryover:
+        return ""
+
+    first_sentence_rules = {
+        "status": "In the first sentence, answer the current live status directly.",
+        "identity": "In the first sentence, explain what the referenced thing/lane is.",
+        "cause": "In the first sentence, state the cause or reason directly.",
+        "possibility": "In the first sentence, answer whether it is possible and name the detection/path if known.",
+    }
+
+    note_parts = [
+        "[Current-turn question-type guard]",
+        f"The latest user message is a {current_intent} question.",
+        first_sentence_rules[current_intent],
+        "Do not start by repeating the previous turn's status verdict or progress summary.",
+        "Answer the latest question first, then add prior status/progress only if it still helps.",
+    ]
+    if previous_intent and previous_intent != current_intent:
+        note_parts.append(
+            f"Previous user-turn intent was {previous_intent}; do not keep answering that older frame."
+        )
+    return " ".join(note_parts)
 
 
 
@@ -8098,6 +8216,13 @@ class AIAgent:
                 # never mutated, so nothing leaks into session persistence.
                 if idx == current_turn_user_idx and msg.get("role") == "user":
                     _injections = []
+                    _latest_question_guard = _build_latest_question_guard_note(
+                        original_user_message,
+                        messages,
+                        current_turn_user_idx=current_turn_user_idx,
+                    )
+                    if _latest_question_guard:
+                        _injections.append(_latest_question_guard)
                     if _ext_prefetch_cache:
                         _fenced = build_memory_context_block(_ext_prefetch_cache)
                         if _fenced:
