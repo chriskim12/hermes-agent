@@ -8,6 +8,7 @@ import tools.approval as approval_module
 from tools.approval import (
     _get_approval_mode,
     approve_session,
+    check_all_command_guards,
     detect_dangerous_command,
     is_approved,
     load_permanent,
@@ -521,7 +522,7 @@ class TestForkBombDetection:
 
 
 class TestGatewayProtection:
-    """Prevent agents from starting the gateway outside systemd management."""
+    """Prevent agents from disrupting the gateway without explicit approval."""
 
     def test_gateway_run_with_disown_detected(self):
         cmd = "kill 1605 && cd ~/.hermes/hermes-agent && source venv/bin/activate && python -m hermes_cli.main gateway run --replace &disown; echo done"
@@ -550,9 +551,26 @@ class TestGatewayProtection:
         dangerous, key, desc = detect_dangerous_command(cmd)
         assert dangerous is False
 
-    def test_systemctl_restart_not_flagged(self):
-        """Using systemctl to manage the gateway is the correct approach."""
+    def test_hermes_gateway_restart_detected(self):
+        cmd = "hermes gateway restart"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert desc == "restart hermes gateway"
+
+    def test_python_module_gateway_restart_detected(self):
+        cmd = "python -m hermes_cli.main gateway restart"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert desc == "restart hermes gateway"
+
+    def test_systemctl_restart_detected(self):
         cmd = "systemctl --user restart hermes-gateway"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert desc == "restart hermes gateway"
+
+    def test_systemctl_status_not_flagged(self):
+        cmd = "systemctl --user status hermes-gateway"
         dangerous, key, desc = detect_dangerous_command(cmd)
         assert dangerous is False
 
@@ -818,5 +836,30 @@ class TestChmodExecuteCombo:
         cmd = "chmod +x script.sh"
         dangerous, _, _ = detect_dangerous_command(cmd)
         assert dangerous is False
+
+
+class TestRestartApprovalOverride:
+    def test_restart_still_requires_approval_when_global_approvals_off(self):
+        with mock_patch("tools.approval._get_approval_config", return_value={"mode": "off"}):
+            with mock_patch.dict("os.environ", {
+                "HERMES_EXEC_ASK": "1",
+                "HERMES_SESSION_KEY": "restart-off-test",
+            }, clear=False):
+                result = check_all_command_guards("hermes gateway restart", "local")
+
+        assert result["approved"] is False
+        assert result["status"] == "approval_required"
+        assert result["description"] == "restart hermes gateway"
+
+    def test_non_restart_commands_still_bypass_when_global_approvals_off(self):
+        with mock_patch("tools.approval._get_approval_config", return_value={"mode": "off"}):
+            with mock_patch.dict("os.environ", {
+                "HERMES_EXEC_ASK": "1",
+                "HERMES_SESSION_KEY": "restart-off-control",
+            }, clear=False):
+                result = check_all_command_guards("rm -rf /important", "local")
+
+        assert result["approved"] is True
+        assert result["message"] is None
 
 

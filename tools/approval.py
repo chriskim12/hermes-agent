@@ -101,9 +101,13 @@ DANGEROUS_PATTERNS = [
     (r'\bxargs\s+.*\brm\b', "xargs with rm"),
     (r'\bfind\b.*-exec\s+(/\S*/)?rm\b', "find -exec rm"),
     (r'\bfind\b.*-delete\b', "find -delete"),
-    # Gateway protection: never start gateway outside systemd management
+    # Gateway protection: never start gateway outside systemd management,
+    # and require explicit approval before disruptive gateway restarts.
     (r'gateway\s+run\b.*(&\s*$|&\s*;|\bdisown\b|\bsetsid\b)', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
     (r'\bnohup\b.*gateway\s+run\b', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
+    (r'(?:^|[;&|()]\s*|\s)(?:[\w./-]+/)?hermes\s+gateway\s+restart\b', "restart hermes gateway"),
+    (r'\bpython[23]?(?:\.\d+)?\b.*(?:^|\s)-m\s+hermes_cli\.main\s+gateway\s+restart\b', "restart hermes gateway"),
+    (r'\bsystemctl\s+(?:--user\s+)?(?:restart|try-restart|reload-or-restart)\s+hermes-gateway\b', "restart hermes gateway"),
     # Self-termination protection: prevent agent from killing its own process
     (r'\b(pkill|killall)\b.*\b(hermes|gateway|cli\.py)\b', "kill hermes/gateway process (self-termination)"),
     # Self-termination via kill + command substitution (pgrep/pidof).
@@ -190,6 +194,17 @@ def detect_dangerous_command(command: str) -> tuple:
             pattern_key = description
             return (True, pattern_key, description)
     return (False, None, None)
+
+
+def _requires_manual_restart_approval(command: str) -> bool:
+    """Gateway restarts stay approval-gated even when approvals.mode=off.
+
+    Restarting the gateway can interrupt unrelated active sessions, so this
+    one action stays fail-closed instead of inheriting the global approval-off
+    bypass used for normal terminal commands.
+    """
+    is_dangerous, pattern_key, _description = detect_dangerous_command(command)
+    return bool(is_dangerous and pattern_key == "restart hermes gateway")
 
 
 # =========================================================================
@@ -590,6 +605,10 @@ def check_dangerous_command(command: str, env_type: str,
     if os.getenv("HERMES_YOLO_MODE") or is_current_session_yolo_enabled():
         return {"approved": True, "message": None}
 
+    approval_mode = _get_approval_mode()
+    if approval_mode == "off" and not _requires_manual_restart_approval(command):
+        return {"approved": True, "message": None}
+
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
     if not is_dangerous:
         return {"approved": True, "message": None}
@@ -690,7 +709,9 @@ def check_all_command_guards(command: str, env_type: str,
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
-    if os.getenv("HERMES_YOLO_MODE") or is_current_session_yolo_enabled() or approval_mode == "off":
+    if os.getenv("HERMES_YOLO_MODE") or is_current_session_yolo_enabled():
+        return {"approved": True, "message": None}
+    if approval_mode == "off" and not _requires_manual_restart_approval(command):
         return {"approved": True, "message": None}
 
     is_cli = os.getenv("HERMES_INTERACTIVE")
