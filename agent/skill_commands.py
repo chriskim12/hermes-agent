@@ -71,6 +71,31 @@ def _default_runtime_note_for_skill(skill_name: str) -> str:
     return ""
 
 
+def get_discord_thread_boundary_runtime_note(
+    message_text: str,
+    *,
+    platform: str | None = None,
+    chat_type: str | None = None,
+    thread_id: str | None = None,
+) -> str:
+    normalized = " ".join((message_text or "").strip().split())
+    if not normalized or normalized.startswith("/"):
+        return ""
+
+    platform_name = (platform or "").strip().lower()
+    chat_kind = (chat_type or "").strip().lower()
+    if platform_name != "discord" or chat_kind != "thread" or not thread_id:
+        return ""
+
+    return _merge_runtime_notes(
+        (
+            "This is a plain Discord-thread message rather than an explicit state-recovery skill invocation. "
+            "Preserve the same boundary discipline before inferring the current lane or the next follow-up."
+        ),
+        _discord_thread_state_recovery_boundary_note(),
+    )
+
+
 def resolve_natural_skill_invocation(
     message_text: str,
     *,

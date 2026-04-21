@@ -3594,11 +3594,13 @@ class GatewayRunner:
         """
         history = history or []
         message_text = event.text or ""
+        discord_thread_boundary_note = ""
 
         if message_text and not event.media_urls:
             try:
                 from agent.skill_commands import (
                     build_skill_invocation_message,
+                    get_discord_thread_boundary_runtime_note,
                     resolve_natural_skill_invocation,
                 )
 
@@ -3617,6 +3619,13 @@ class GatewayRunner:
                     )
                     if injected:
                         return injected
+
+                discord_thread_boundary_note = get_discord_thread_boundary_runtime_note(
+                    message_text,
+                    platform=source.platform.value if source.platform else None,
+                    chat_type=source.chat_type,
+                    thread_id=source.thread_id,
+                )
             except Exception:
                 logger.debug(
                     "Natural skill routing failed for %s/%s",
@@ -3632,6 +3641,9 @@ class GatewayRunner:
         )
         if _is_shared_thread and source.user_name:
             message_text = f"[{source.user_name}] {message_text}"
+
+        if discord_thread_boundary_note:
+            message_text = f"[Runtime note: {discord_thread_boundary_note}]\n{message_text}"
 
         if event.media_urls:
             image_paths = []

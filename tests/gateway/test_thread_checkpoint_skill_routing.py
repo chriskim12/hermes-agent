@@ -103,6 +103,43 @@ async def test_prepare_inbound_message_text_promotes_discord_thread_resume_to_st
 
 
 @pytest.mark.asyncio
+async def test_prepare_inbound_message_text_injects_boundary_note_for_general_discord_thread_message():
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig()
+    runner.adapters = {}
+    runner._model = "test-model"
+    runner._base_url = ""
+    runner._has_setup_skill = lambda: False
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="thread",
+        thread_id="thread-1",
+        user_name="Chris",
+    )
+    event = MessageEvent(
+        text="CH-144 기준으로 다음 뭐지?",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert result is not None
+    assert result.startswith("[Runtime note: ")
+    assert "explicit parent > child recency > semantic similarity" in result
+    assert "확인 필요" in result
+    assert result.endswith("[Chris] CH-144 기준으로 다음 뭐지?")
+
+
+@pytest.mark.asyncio
 async def test_prepare_inbound_message_text_leaves_non_thread_checkpoint_as_plain_text():
     from gateway.run import GatewayRunner
 
