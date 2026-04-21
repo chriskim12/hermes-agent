@@ -243,6 +243,51 @@ def _mock_response(
 # ===================================================================
 
 
+class TestLatestQuestionIntentGuardHelpers:
+    def test_classifies_real_regression_question_types(self):
+        assert run_agent._classify_latest_question_intent("git 그러면 깨끗하지?") == "status"
+        assert run_agent._classify_latest_question_intent("저건 무슨 lane인데?") == "identity"
+        assert run_agent._classify_latest_question_intent("clawhip이 없으면 nudge받을수 있어?") == "possibility"
+
+    def test_builds_guard_for_status_to_identity_switch(self):
+        messages = [
+            {"role": "user", "content": "git 그러면 깨끗하지?"},
+            {"role": "assistant", "content": "아니요. 아직 1개 남아 있어요."},
+            {"role": "user", "content": "저건 무슨 lane인데?"},
+        ]
+
+        note = run_agent._build_latest_question_guard_note(
+            messages[-1]["content"],
+            messages,
+            current_turn_user_idx=2,
+        )
+
+        assert "identity question" in note
+        assert "first sentence" in note.lower()
+        assert "status verdict or progress summary" in note
+        assert "Previous user-turn intent was status" in note
+
+    def test_builds_guard_for_possibility_after_progress_briefing(self):
+        messages = [
+            {"role": "user", "content": "oh-my-codex repo에서 진행되는거야?"},
+            {
+                "role": "assistant",
+                "content": "현재 OMX 상태: ralplan active, phase = planning, 아직 final approved plan은 안 나왔어요.",
+            },
+            {"role": "user", "content": "clawhip이 없으면 ralplan이 끝나면 네가 nudge받을수 있어?"},
+        ]
+
+        note = run_agent._build_latest_question_guard_note(
+            messages[-1]["content"],
+            messages,
+            current_turn_user_idx=2,
+        )
+
+        assert "possibility question" in note
+        assert "whether it is possible" in note
+        assert "status verdict or progress summary" in note
+
+
 class TestHasContentAfterThinkBlock:
     def test_none_returns_false(self, agent):
         assert agent._has_content_after_think_block(None) is False
@@ -1668,6 +1713,58 @@ class TestRunConversation:
         assert all(call["session_id"] == agent.session_id for call in pre_request_calls)
         assert all("message_count" in c and "messages" not in c for c in pre_request_calls)
         assert all("usage" in c and "response" not in c for c in post_request_calls)
+
+    def test_injects_question_type_guard_for_status_to_identity_switch(self, agent):
+        self._setup_agent(agent)
+        resp = _mock_response(content="lane answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+        history = [
+            {"role": "user", "content": "git 그러면 깨끗하지?"},
+            {"role": "assistant", "content": "아니요. 아직 1개 남아 있어요."},
+        ]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("저건 무슨 lane인데?", conversation_history=history)
+
+        assert result["final_response"] == "lane answer"
+        call_args = agent.client.chat.completions.create.call_args
+        api_messages = call_args.kwargs.get("messages") or call_args[1].get("messages")
+        assert "Current-turn question-type guard" in api_messages[-1]["content"]
+        assert "identity question" in api_messages[-1]["content"]
+        assert "Previous user-turn intent was status" in api_messages[-1]["content"]
+
+    def test_injects_question_type_guard_for_possibility_after_progress_briefing(self, agent):
+        self._setup_agent(agent)
+        resp = _mock_response(content="가능 여부 answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+        history = [
+            {"role": "user", "content": "oh-my-codex repo에서 진행되는거야?"},
+            {
+                "role": "assistant",
+                "content": "현재 OMX 상태: ralplan active, phase = planning, 아직 final approved plan은 안 나왔어요.",
+            },
+        ]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "clawhip이 없으면 ralplan이 끝나면 네가 nudge받을수 있어?",
+                conversation_history=history,
+            )
+
+        assert result["final_response"] == "가능 여부 answer"
+        call_args = agent.client.chat.completions.create.call_args
+        api_messages = call_args.kwargs.get("messages") or call_args[1].get("messages")
+        assert "Current-turn question-type guard" in api_messages[-1]["content"]
+        assert "possibility question" in api_messages[-1]["content"]
+        assert "status verdict or progress summary" in api_messages[-1]["content"]
 
     def test_interrupt_breaks_loop(self, agent):
         self._setup_agent(agent)
