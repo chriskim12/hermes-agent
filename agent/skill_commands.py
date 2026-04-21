@@ -43,6 +43,18 @@ _DISCORD_THREAD_FOLLOWUP_ALIASES = {
     "follow-up",
 }
 
+_LINEAR_ISSUE_ID_RE = re.compile(r"\b[A-Z]{1,6}-\d+\b")
+
+_DISCORD_THREAD_ISSUE_SCOPED_FOLLOWUP_CUES = (
+    "기준으로 다음",
+    "다음 뭐지",
+    "다음 단계",
+    "다음 카드",
+    "진행상황",
+    "뭐 하던 거였지",
+    "follow-up",
+)
+
 
 def _merge_runtime_notes(*notes: str) -> str:
     merged: list[str] = []
@@ -160,6 +172,19 @@ def resolve_natural_skill_invocation(
             "/discord-thread-state-recovery",
             normalized,
             _discord_thread_state_recovery_runtime_note("follow-up"),
+        )
+
+    if (
+        platform_name == "discord"
+        and chat_kind == "thread"
+        and thread_id
+        and _LINEAR_ISSUE_ID_RE.search(normalized)
+        and any(cue in normalized_lower for cue in _DISCORD_THREAD_ISSUE_SCOPED_FOLLOWUP_CUES)
+    ):
+        return (
+            "/discord-thread-state-recovery",
+            normalized,
+            _discord_thread_state_recovery_runtime_note("issue-scoped follow-up"),
         )
 
     return None
