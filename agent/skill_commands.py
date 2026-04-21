@@ -27,6 +27,49 @@ _DISCORD_THREAD_CHECKPOINT_ALIASES = {
     "checkpoint",
 }
 
+_DISCORD_THREAD_RESUME_ALIASES = {
+    "상태 복원",
+    "스레드 복원",
+    "여기 뭐 하던 거였지?",
+    "여기 진행상황",
+    "resume",
+}
+
+
+def _merge_runtime_notes(*notes: str) -> str:
+    merged: list[str] = []
+    for note in notes:
+        cleaned = " ".join((note or "").strip().split())
+        if cleaned and cleaned not in merged:
+            merged.append(cleaned)
+    return " ".join(merged)
+
+
+def _discord_thread_state_recovery_boundary_note() -> str:
+    return (
+        "First classify whether the user wants to recover the current thread itself or analyze another incident/thread. "
+        "If the answer becomes incident-scoped, confirm the explicit parent and live child set before presenting a current lane. "
+        "Apply the priority order explicit parent > child recency > semantic similarity when reconstructing that lane. "
+        "If that boundary cannot be confirmed, fail closed with `확인 필요`. "
+        "Keep issues outside the allowed parent+child set as comparison cases only."
+    )
+
+
+def _discord_thread_state_recovery_runtime_note(mode: str) -> str:
+    return _merge_runtime_notes(
+        (
+            f"The user's exact message matched a Discord-thread {mode} alias. "
+            f"Enter {mode} mode for the current thread before considering broader planning or Linear workflows."
+        ),
+        _discord_thread_state_recovery_boundary_note(),
+    )
+
+
+def _default_runtime_note_for_skill(skill_name: str) -> str:
+    if (skill_name or "").strip().casefold() == "discord-thread-state-recovery":
+        return _discord_thread_state_recovery_boundary_note()
+    return ""
+
 
 def resolve_natural_skill_invocation(
     message_text: str,
@@ -59,9 +102,19 @@ def resolve_natural_skill_invocation(
         return (
             "/discord-thread-state-recovery",
             normalized,
-            "The user's exact message matched a Discord-thread checkpoint alias. "
-            "Enter checkpoint mode for the current thread before considering "
-            "broader planning or Linear workflows.",
+            _discord_thread_state_recovery_runtime_note("checkpoint"),
+        )
+
+    if (
+        platform_name == "discord"
+        and chat_kind == "thread"
+        and thread_id
+        and normalized_lower in {alias.casefold() for alias in _DISCORD_THREAD_RESUME_ALIASES}
+    ):
+        return (
+            "/discord-thread-state-recovery",
+            normalized,
+            _discord_thread_state_recovery_runtime_note("resume"),
         )
 
     return None
@@ -359,6 +412,10 @@ def build_skill_invocation_message(
         return f"[Failed to load skill: {skill_info['name']}]"
 
     loaded_skill, skill_dir, skill_name = loaded
+    runtime_note = _merge_runtime_notes(
+        runtime_note,
+        _default_runtime_note_for_skill(skill_name),
+    )
     activation_note = (
         f'[SYSTEM: The user has invoked the "{skill_name}" skill, indicating they want '
         "you to follow its instructions. The full skill content is loaded below.]"

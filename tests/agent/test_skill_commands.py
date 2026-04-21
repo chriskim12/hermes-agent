@@ -253,6 +253,19 @@ Generate some audio.
         assert "test-skill" in msg
         assert "do stuff" in msg
 
+    def test_discord_thread_state_recovery_includes_default_boundary_runtime_note(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "discord-thread-state-recovery")
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/discord-thread-state-recovery", "상태 복원")
+
+        assert msg is not None
+        assert "Runtime note:" in msg
+        assert "explicit parent" in msg.lower()
+        assert "semantic similarity" in msg.lower()
+        assert "incident/thread" in msg.lower()
+        assert "확인 필요" in msg
+
     def test_returns_none_for_unknown(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             scan_skill_commands()
