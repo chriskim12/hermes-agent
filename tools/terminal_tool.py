@@ -141,6 +141,7 @@ def set_approval_callback(cb):
 from tools.approval import (
     check_all_command_guards as _check_all_guards_impl,
 )
+from tools.release_policy import build_release_push_block_error
 from tools.worktree_policy import (
     build_dedicated_worktree_error,
     command_is_repo_mutating,
@@ -1407,6 +1408,14 @@ def terminal_tool(
                 }, ensure_ascii=False)
 
         effective_workdir = workdir or cwd
+        release_push_error = build_release_push_block_error(effective_workdir, command)
+        if release_push_error:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": release_push_error,
+                "status": "blocked",
+            }, ensure_ascii=False)
         if command_is_repo_mutating(command) and requires_dedicated_worktree_for_path(
             effective_workdir,
             cwd_hint=effective_workdir,
