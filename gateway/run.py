@@ -1563,6 +1563,10 @@ class GatewayRunner:
         state = str(payload.get("state", "")).strip() or str(payload.get("normalized_event", "")).strip().replace("-", "_")
         next_action = str(payload.get("next_action", "")).strip()
         proof = str(payload.get("proof", "")).strip()
+        current_lane = str(payload.get("current_lane", "")).strip() or None
+        planning_gate = str(payload.get("planning_gate", "")).strip() or None
+        next_execution_branch = str(payload.get("next_execution_branch", "")).strip() or None
+        close_authority = str(payload.get("close_authority", "")).strip() or None
 
         if owner != "hermes" or executor != "omx" or not next_action or not proof:
             return {
@@ -1631,6 +1635,24 @@ class GatewayRunner:
                 "http_status": 404,
             }
 
+        from gateway.work_state import resolve_omx_lane_truth
+
+        try:
+            lane_truth = resolve_omx_lane_truth(
+                current_lane=current_lane or getattr(record, "current_lane", None),
+                planning_gate=planning_gate or getattr(record, "planning_gate", None),
+                next_execution_branch=next_execution_branch or getattr(record, "next_execution_branch", None),
+                close_authority=close_authority or getattr(record, "close_authority", None),
+            )
+        except ValueError:
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": "invalid_delegated_lane_transition",
+                "resolution": "invalid",
+                "http_status": 400,
+            }
+
         now = datetime.now().astimezone()
         if state == "retry_needed":
             dispatch_result = self._dispatch_delegated_retry_followup(
@@ -1659,6 +1681,10 @@ class GatewayRunner:
                     tmux_session=tmux_session or record.tmux_session,
                     repo_path=repo_path or record.repo_path,
                     worktree_path=worktree_path or record.worktree_path,
+                    current_lane=lane_truth["current_lane"],
+                    planning_gate=lane_truth["planning_gate"],
+                    next_execution_branch=lane_truth["next_execution_branch"],
+                    close_authority=lane_truth["close_authority"],
                 )
                 return {
                     "status": "accepted",
@@ -1685,6 +1711,10 @@ class GatewayRunner:
             tmux_session=tmux_session or record.tmux_session,
             repo_path=repo_path or record.repo_path,
             worktree_path=worktree_path or record.worktree_path,
+            current_lane=lane_truth["current_lane"],
+            planning_gate=lane_truth["planning_gate"],
+            next_execution_branch=lane_truth["next_execution_branch"],
+            close_authority=lane_truth["close_authority"],
         )
 
         owner_result = await self.handle_owner_ingress_packet(
@@ -1810,11 +1840,35 @@ class GatewayRunner:
         worktree_path: Optional[str] = None,
         next_action: str = "Resume the delegated OMX work",
         proof: str = "delegated_handoff",
+        current_lane: Optional[str] = None,
+        planning_gate: Optional[str] = None,
+        next_execution_branch: Optional[str] = None,
+        close_authority: Optional[str] = None,
     ) -> bool:
         if not work_id:
             return False
         work_state_store = getattr(self, "work_state_store", None)
         if work_state_store is None:
+            return False
+        existing_records = work_state_store.find_matching_records(
+            work_id,
+            owner_session_id=session_key,
+            live_only=False,
+        )
+        existing = existing_records[0] if existing_records else None
+
+        from gateway.work_state import resolve_omx_lane_truth
+
+        try:
+            lane_truth = resolve_omx_lane_truth(
+                current_lane=current_lane or getattr(existing, "current_lane", None),
+                planning_gate=planning_gate or getattr(existing, "planning_gate", None),
+                next_execution_branch=(
+                    next_execution_branch or getattr(existing, "next_execution_branch", None)
+                ),
+                close_authority=close_authority or getattr(existing, "close_authority", None),
+            )
+        except ValueError:
             return False
         now = datetime.now().astimezone()
         return work_state_store.update_record(
@@ -1830,6 +1884,10 @@ class GatewayRunner:
             worktree_path=worktree_path,
             next_action=next_action,
             proof=proof,
+            current_lane=lane_truth["current_lane"],
+            planning_gate=lane_truth["planning_gate"],
+            next_execution_branch=lane_truth["next_execution_branch"],
+            close_authority=lane_truth["close_authority"],
         )
 
     def _update_delegated_work_for_process(

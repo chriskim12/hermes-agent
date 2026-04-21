@@ -85,6 +85,10 @@ def test_background_omx_command_marks_current_gateway_work_record_delegated(tmp_
     assert record.tmux_session == "omx-ch36"
     assert record.repo_path == "/repo/demo"
     assert record.worktree_path == "/repo/demo"
+    assert record.current_lane == "omx_exec"
+    assert record.planning_gate == "closed"
+    assert record.next_execution_branch == "none"
+    assert record.close_authority == "hermes"
     assert record.next_action == "Resume the delegated OMX work"
     assert record.proof == "terminal_background:omx_exec"
 
@@ -134,3 +138,91 @@ def test_background_non_omx_command_does_not_rewrite_work_state(tmp_path, monkey
     assert record.repo_path is None
     assert record.worktree_path is None
     assert record.proof == "message_ingress:discord"
+
+
+def test_background_ralplan_command_marks_planning_open_lane_fields(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools.terminal_tool import terminal_tool
+
+    session_key = "agent:discord:thread:test"
+    _seed_direct_record(tmp_path, session_key)
+
+    mock_env = MagicMock()
+    mock_env.env = {}
+
+    mock_proc_session = MagicMock()
+    mock_proc_session.id = "proc-omx-plan-1"
+    mock_proc_session.pid = 8765
+
+    mock_registry = MagicMock()
+    mock_registry.spawn_local.return_value = mock_proc_session
+
+    command = "tmux new-session -d -s omx-plan 'bash -lc \"cd /repo/demo && omx ralplan -C /repo/demo --json\"'"
+
+    with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
+         patch("tools.terminal_tool._start_cleanup_thread"), \
+         patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
+         patch("tools.terminal_tool._last_activity", {"default": 0}), \
+         patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}), \
+         patch("tools.process_registry.process_registry", mock_registry), \
+         patch("tools.approval.get_current_session_key", return_value=session_key):
+        result = json.loads(
+            terminal_tool(
+                command=command,
+                background=True,
+                workdir="/repo/demo",
+            )
+        )
+
+    assert result["session_id"] == "proc-omx-plan-1"
+    fresh_store = WorkStateStore(tmp_path / "gateway_work_state.json")
+    record = fresh_store.list_records()[0]
+    assert record.current_lane == "ralplan"
+    assert record.planning_gate == "open"
+    assert record.next_execution_branch == "none"
+    assert record.close_authority == "hermes"
+
+
+def test_background_team_command_marks_approved_team_lane_fields(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools.terminal_tool import terminal_tool
+
+    session_key = "agent:discord:thread:test"
+    _seed_direct_record(tmp_path, session_key)
+
+    mock_env = MagicMock()
+    mock_env.env = {}
+
+    mock_proc_session = MagicMock()
+    mock_proc_session.id = "proc-omx-team-1"
+    mock_proc_session.pid = 2468
+
+    mock_registry = MagicMock()
+    mock_registry.spawn_local.return_value = mock_proc_session
+
+    command = "tmux new-session -d -s omx-team 'bash -lc \"cd /repo/demo && omx team -C /repo/demo --json\"'"
+
+    with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
+         patch("tools.terminal_tool._start_cleanup_thread"), \
+         patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
+         patch("tools.terminal_tool._last_activity", {"default": 0}), \
+         patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}), \
+         patch("tools.process_registry.process_registry", mock_registry), \
+         patch("tools.approval.get_current_session_key", return_value=session_key):
+        result = json.loads(
+            terminal_tool(
+                command=command,
+                background=True,
+                workdir="/repo/demo",
+            )
+        )
+
+    assert result["session_id"] == "proc-omx-team-1"
+    fresh_store = WorkStateStore(tmp_path / "gateway_work_state.json")
+    record = fresh_store.list_records()[0]
+    assert record.current_lane == "team"
+    assert record.planning_gate == "closed"
+    assert record.next_execution_branch == "team"
+    assert record.close_authority == "hermes"
