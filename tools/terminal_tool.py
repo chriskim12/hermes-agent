@@ -141,6 +141,7 @@ def set_approval_callback(cb):
 from tools.approval import (
     check_all_command_guards as _check_all_guards_impl,
 )
+from tools.linear_close_policy import build_linear_done_block_error
 from tools.release_policy import build_release_push_block_error
 from tools.worktree_policy import (
     build_dedicated_worktree_error,
@@ -1408,6 +1409,14 @@ def terminal_tool(
                 }, ensure_ascii=False)
 
         effective_workdir = workdir or cwd
+        linear_done_error = build_linear_done_block_error(effective_workdir, command)
+        if linear_done_error:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": linear_done_error,
+                "status": "blocked",
+            }, ensure_ascii=False)
         release_push_error = build_release_push_block_error(effective_workdir, command)
         if release_push_error:
             return json.dumps({
