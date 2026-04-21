@@ -222,3 +222,43 @@ def test_terminal_tool_allows_repo_mutating_command_inside_managed_worktree(tmp_
     assert result["exit_code"] == 0
     assert result["output"] == "ok"
     mock_env.execute.assert_called_once()
+
+
+
+def test_command_is_repo_mutating_detects_wrapper_env_mutations():
+    from tools.worktree_policy import command_is_repo_mutating
+
+    assert command_is_repo_mutating(
+        "npx @dotenvx/dotenvx set ADMIN_SECRET rotated --env-file env/.env.production"
+    )
+    assert command_is_repo_mutating("vercel env pull env/.env.preview")
+    assert command_is_repo_mutating("vercel env add ADMIN_SECRET production")
+    assert command_is_repo_mutating("vercel env update ADMIN_SECRET production")
+    assert command_is_repo_mutating("vercel env rm ADMIN_SECRET production --yes")
+    assert command_is_repo_mutating("npx tsx scripts/sync-env.ts --target vercel-production")
+
+
+
+def test_terminal_tool_blocks_wrapper_env_mutation_command_in_base_checkout(tmp_path):
+    from tools.terminal_tool import terminal_tool
+
+    repo = _init_git_repo(tmp_path / "repo")
+    mock_env = MagicMock()
+    mock_env.execute.return_value = {"output": "should not run", "returncode": 0}
+
+    with patch("tools.terminal_tool._get_env_config", return_value={"env_type": "local", "env_name": "default", "cwd": str(repo), "timeout": 180}), \
+         patch("tools.terminal_tool._start_cleanup_thread"), \
+         patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
+         patch("tools.terminal_tool._last_activity", {"default": 0}), \
+         patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
+        result = json.loads(
+            terminal_tool(
+                command="npx @dotenvx/dotenvx set ADMIN_SECRET rotated --env-file env/.env.production",
+                workdir=str(repo),
+            )
+        )
+
+    assert result["exit_code"] == -1
+    assert result["status"] == "blocked"
+    assert "dedicated worktree" in result["error"].lower()
+    mock_env.execute.assert_not_called()
