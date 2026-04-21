@@ -189,6 +189,12 @@ TOOL_CATEGORIES = {
                 "env_vars": [],
                 "tts_provider": "kittentts",
                 "post_setup": "kittentts",
+                "name": "Fish Audio",
+                "tag": "Voice-model TTS, needs FISH_AUDIO_API_KEY + tts.fish.voice_id",
+                "env_vars": [
+                    {"key": "FISH_AUDIO_API_KEY", "prompt": "Fish Audio API key", "url": "https://fish.audio/app/api-keys"},
+                ],
+                "tts_provider": "fish",
             },
         ],
     },
@@ -1384,6 +1390,8 @@ def _configure_provider(provider: dict, config: dict):
         _run_post_setup(provider["post_setup"])
 
     if all_configured:
+        if provider.get("tts_provider") == "fish":
+            _configure_fish_tts_settings(config, update_existing=False)
         _print_success(f"  {provider['name']} configured!")
         plugin_name = provider.get("image_gen_plugin_name")
         if plugin_name:
@@ -1396,6 +1404,28 @@ def _configure_provider(provider: dict, config: dict):
             img_cfg = config.setdefault("image_gen", {})
             if isinstance(img_cfg, dict) and img_cfg.get("provider") not in (None, "", "fal"):
                 img_cfg["provider"] = "fal"
+
+
+def _configure_fish_tts_settings(config: dict, update_existing: bool):
+    """Prompt for Fish Audio config values stored in config.yaml."""
+    fish_config = config.setdefault("tts", {}).setdefault("fish", {})
+    existing_voice_id = str(fish_config.get("voice_id") or "").strip()
+    existing_model = str(fish_config.get("model") or "s2-pro").strip() or "s2-pro"
+
+    if existing_voice_id:
+        prompt_label = "    Fish Audio voice ID (Enter to keep current)" if update_existing else "    Fish Audio voice ID"
+        voice_id = _prompt(prompt_label, default=existing_voice_id)
+        fish_config["voice_id"] = (voice_id or existing_voice_id).strip()
+    else:
+        voice_id = _prompt("    Fish Audio voice ID", default="")
+        if voice_id and voice_id.strip():
+            fish_config["voice_id"] = voice_id.strip()
+        else:
+            _print_warning("    Fish Audio voice ID not set — provider will fail closed until tts.fish.voice_id is configured.")
+
+    model_label = "    Fish Audio model (Enter to keep current)" if update_existing else "    Fish Audio model"
+    model = _prompt(model_label, default=existing_model).strip() or existing_model
+    fish_config["model"] = model
 
 
 def _configure_simple_requirements(ts_key: str):
@@ -1625,6 +1655,8 @@ def _reconfigure_provider(provider: dict, config: dict):
             if isinstance(img_cfg, dict):
                 img_cfg["provider"] = "fal"
                 img_cfg["use_gateway"] = False
+    if provider.get("tts_provider") == "fish":
+        _configure_fish_tts_settings(config, update_existing=True)
 
 
 def _reconfigure_simple_requirements(ts_key: str):

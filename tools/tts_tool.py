@@ -9,6 +9,7 @@ Supports seven TTS providers:
 - MiniMax TTS: High-quality with voice cloning, needs MINIMAX_API_KEY
 - Mistral (Voxtral TTS): Multilingual, native Opus, needs MISTRAL_API_KEY
 - Google Gemini TTS: Controllable, 30 prebuilt voices, needs GEMINI_API_KEY
+- Fish Audio TTS: Voice-model based TTS, needs FISH_AUDIO_API_KEY
 - NeuTTS (local, free, no API key): On-device TTS via neutts_cli, needs neutts installed
 
 Output formats:
@@ -115,6 +116,8 @@ DEFAULT_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_TTS_SAMPLE_RATE = 24000
 GEMINI_TTS_CHANNELS = 1
 GEMINI_TTS_SAMPLE_WIDTH = 2  # 16-bit PCM (L16)
+DEFAULT_FISH_TTS_MODEL = "s2-pro"
+DEFAULT_FISH_TTS_BASE_URL = "https://api.fish.audio/v1/tts"
 
 def _get_default_output_dir() -> str:
     from hermes_constants import get_hermes_dir
@@ -195,6 +198,10 @@ def _resolve_max_text_length(
             return mapped
 
     return PROVIDER_MAX_TEXT_LENGTH.get(key, FALLBACK_MAX_TEXT_LENGTH)
+MAX_TEXT_LENGTH = 4000
+SUPPORTED_TTS_PROVIDERS = {
+    "edge", "elevenlabs", "openai", "xai", "minimax", "mistral", "gemini", "fish", "neutts", "kittentts"
+}
 
 
 # ===========================================================================
@@ -759,6 +766,83 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
             os.remove(wav_path)
         except OSError:
             pass
+# Provider: Fish Audio TTS
+# ===========================================================================
+def _generate_fish_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate audio using Fish Audio's REST TTS API."""
+    import urllib.error
+    import urllib.request
+
+    api_key = os.getenv("FISH_AUDIO_API_KEY", "")
+    if not api_key:
+        raise ValueError("FISH_AUDIO_API_KEY not set. Get one at https://fish.audio/")
+
+    fish_config = tts_config.get("fish", {})
+    model = str(fish_config.get("model") or DEFAULT_FISH_TTS_MODEL).strip()
+    voice_id = str(fish_config.get("voice_id") or "").strip()
+    if not voice_id:
+        raise ValueError("Fish Audio voice_id not set under tts.fish.voice_id")
+
+    base_url = str(fish_config.get("base_url") or DEFAULT_FISH_TTS_BASE_URL).strip()
+    speed = float(fish_config.get("speed", tts_config.get("speed", 1.0)))
+    normalize_loudness = bool(fish_config.get("normalize_loudness", True))
+
+    if output_path.endswith(".wav"):
+        audio_format = "wav"
+    else:
+        audio_format = "mp3"
+
+    payload = {
+        "text": text,
+        "reference_id": voice_id,
+        "format": audio_format,
+        "sample_rate": int(fish_config.get("sample_rate", 44100)),
+        "latency": fish_config.get("latency", "normal"),
+        "normalize": bool(fish_config.get("normalize", True)),
+        "prosody": {
+            "speed": speed,
+            "volume": float(fish_config.get("volume", 0)),
+            "normalize_loudness": normalize_loudness,
+        },
+    }
+    if audio_format == "mp3":
+        payload["mp3_bitrate"] = int(fish_config.get("mp3_bitrate", 128))
+
+    request = urllib.request.Request(
+        base_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "model": model,
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            audio_bytes = response.read()
+    except urllib.error.HTTPError as e:
+        detail = e.reason
+        try:
+            body = e.read().decode("utf-8", errors="ignore").strip()
+            if body:
+                try:
+                    parsed = json.loads(body)
+                    detail = parsed.get("message") or parsed.get("detail") or body
+                except json.JSONDecodeError:
+                    detail = body
+        except Exception:
+            pass
+        raise RuntimeError(f"Fish Audio TTS API error ({e.code}): {detail}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Fish Audio TTS request failed: {e.reason}") from e
+
+    if not audio_bytes:
+        raise RuntimeError("Fish Audio TTS returned empty audio data")
+
+    with open(output_path, "wb") as f:
+        f.write(audio_bytes)
 
     return output_path
 
@@ -940,6 +1024,8 @@ def text_to_speech_tool(
 
     tts_config = _load_tts_config()
     provider = _get_provider(tts_config)
+    if provider not in SUPPORTED_TTS_PROVIDERS:
+        return tool_error(f"Unsupported TTS provider: {provider}", success=False)
 
     # Truncate very long text with a warning. The cap is per-provider
     # (OpenAI 4096, xAI 15k, MiniMax 10k, ElevenLabs model-aware, etc.).
@@ -1024,6 +1110,9 @@ def text_to_speech_tool(
         elif provider == "gemini":
             logger.info("Generating speech with Google Gemini TTS...")
             _generate_gemini_tts(text, file_str, tts_config)
+        elif provider == "fish":
+            logger.info("Generating speech with Fish Audio TTS...")
+            _generate_fish_tts(text, file_str, tts_config)
 
         elif provider == "neutts":
             if not _check_neutts_available():
@@ -1170,6 +1259,8 @@ def check_tts_requirements() -> bool:
             return True
     except ImportError:
         pass
+    if os.getenv("FISH_AUDIO_API_KEY"):
+        return True
     if _check_neutts_available():
         return True
     if _check_kittentts_available():
