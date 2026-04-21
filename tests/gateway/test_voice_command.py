@@ -58,14 +58,21 @@ from gateway.platforms.base import MessageEvent, MessageType, SessionSource
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_event(text: str = "", message_type=MessageType.TEXT, chat_id="123") -> MessageEvent:
+def _make_event(
+    text: str = "",
+    message_type=MessageType.TEXT,
+    chat_id="123",
+    *,
+    platform="telegram",
+    thread_id=None,
+) -> MessageEvent:
     source = SessionSource(
         chat_id=chat_id,
         user_id="user1",
         platform=MagicMock(),
     )
-    source.platform.value = "telegram"
-    source.thread_id = None
+    source.platform.value = platform
+    source.thread_id = thread_id
     event = MessageEvent(text=text, message_type=message_type, source=source)
     event.message_id = "msg42"
     return event
@@ -77,6 +84,7 @@ def _make_runner(tmp_path):
     runner = object.__new__(GatewayRunner)
     runner.adapters = {}
     runner._voice_mode = {}
+    runner._generated_tts_recent = {}
     runner._VOICE_MODE_PATH = tmp_path / "gateway_voice_mode.json"
     runner._session_db = None
     runner.session_store = MagicMock()
@@ -2611,6 +2619,56 @@ class TestVoiceTTSPlayback:
         assert self._call_should_reply(
             runner, "all", MessageType.VOICE, agent_msgs=agent_msgs, already_sent=True,
         ) is False
+
+
+class TestGeneratedYuukaTtsPolicy:
+    @pytest.fixture
+    def runner(self, tmp_path):
+        return _make_runner(tmp_path)
+
+    def _event(self, response_text="좋아요. 잘 됐어요."):
+        return _make_event(
+            response_text,
+            MessageType.TEXT,
+            chat_id="123",
+            platform="discord",
+            thread_id="thread-1",
+        )
+
+    def test_allow_case_on_discord_thread(self, runner):
+        event = self._event()
+        assert runner._should_send_generated_tts_reply(event, event.text, []) is True
+
+    def test_blocks_when_not_discord_thread(self, runner):
+        event = _make_event("좋아요. 잘 됐어요.", MessageType.TEXT, chat_id="123", platform="discord")
+        assert runner._should_send_generated_tts_reply(event, event.text, []) is False
+
+    def test_blocks_when_voice_mode_enabled(self, runner):
+        event = self._event()
+        runner._voice_mode[event.source.chat_id] = "all"
+        assert runner._should_send_generated_tts_reply(event, event.text, []) is False
+
+    def test_blocks_technical_response(self, runner):
+        event = self._event("좋아요. `pytest tests/ -q`로 다시 확인해요.")
+        assert runner._should_send_generated_tts_reply(event, event.text, []) is False
+
+    def test_blocks_response_over_soft_cap(self, runner):
+        event = self._event("좋아요. " + ("정리할 내용이 많아서 조금 길게 설명해볼게요. " * 8))
+        assert runner._should_send_generated_tts_reply(event, event.text, []) is False
+
+    def test_blocks_when_yuuka_clip_tool_already_used(self, runner):
+        event = self._event()
+        agent_msgs = [{"role": "assistant", "tool_calls": [
+            {"id": "1", "type": "function", "function": {"name": "yuuka_voice_reply", "arguments": "{}"}}
+        ]}]
+        assert runner._should_send_generated_tts_reply(event, event.text, agent_msgs) is False
+
+    def test_blocks_when_recent_generated_tts_is_in_cooldown(self, runner):
+        event = self._event()
+        runner._record_generated_tts_use(event, now=1000.0)
+        assert runner._generated_tts_in_cooldown(event, now=1200.0) is True
+        with patch("gateway.run.time.time", return_value=1200.0):
+            assert runner._should_send_generated_tts_reply(event, event.text, []) is False
 
 
 class TestUDPKeepalive:

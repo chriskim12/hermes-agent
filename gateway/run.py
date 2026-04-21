@@ -631,6 +631,9 @@ class GatewayRunner:
 
         # Per-chat voice reply mode: "off" | "voice_only" | "all"
         self._voice_mode: Dict[str, str] = self._load_voice_modes()
+        # Per-thread recency guard for generated Yuuka TTS auto replies.
+        # Key: "<platform>:<chat_id>:<thread_id>", Value: last-send unix timestamp.
+        self._generated_tts_recent: Dict[str, float] = {}
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
@@ -4652,6 +4655,14 @@ class GatewayRunner:
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
                 await self._send_voice_reply(event, response)
 
+            # Generated Yuuka TTS hybrid policy: lightweight Discord-thread auto path.
+            # Explicit text_to_speech requests still flow through tool calls; this path
+            # only adds a fail-closed automatic generated reply for short, non-technical
+            # responses when no clip/audio tool already claimed the turn.
+            if self._should_send_generated_tts_reply(event, response, agent_messages):
+                await self._send_voice_reply(event, response)
+                self._record_generated_tts_use(event)
+
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
             # sends raw text chunks that include MEDIA: tags — the normal
@@ -5926,6 +5937,104 @@ class GatewayRunner:
 
         await adapter.handle_message(event)
 
+    def _agent_called_tool(self, agent_messages: list, tool_name: str) -> bool:
+        tool_name = str(tool_name or "").strip()
+        if not tool_name:
+            return False
+        return any(
+            msg.get("role") == "assistant"
+            and any(
+                tc.get("function", {}).get("name") == tool_name
+                for tc in (msg.get("tool_calls") or [])
+            )
+            for msg in (agent_messages or [])
+        )
+
+    def _generated_tts_scope_key(self, event: MessageEvent) -> Optional[str]:
+        platform_name = str(getattr(getattr(event, "source", None), "platform", "") or "")
+        platform_value = getattr(getattr(event, "source", None), "platform", None)
+        if hasattr(platform_value, "value"):
+            platform_name = str(platform_value.value)
+        platform_name = platform_name.lower().strip()
+        chat_id = str(getattr(getattr(event, "source", None), "chat_id", "") or "").strip()
+        thread_id = str(getattr(getattr(event, "source", None), "thread_id", "") or "").strip()
+        if platform_name != "discord" or not chat_id or not thread_id:
+            return None
+        return f"{platform_name}:{chat_id}:{thread_id}"
+
+    def _generated_tts_in_cooldown(self, event: MessageEvent, *, now: Optional[float] = None) -> bool:
+        scope = self._generated_tts_scope_key(event)
+        if not scope:
+            return False
+        now = time.time() if now is None else now
+        recent_map = getattr(self, "_generated_tts_recent", {})
+        last_sent = recent_map.get(scope)
+        if last_sent is None:
+            return False
+        return (now - last_sent) < 300
+
+    def _record_generated_tts_use(self, event: MessageEvent, *, now: Optional[float] = None) -> None:
+        scope = self._generated_tts_scope_key(event)
+        if not scope:
+            return
+        if not hasattr(self, "_generated_tts_recent") or not isinstance(self._generated_tts_recent, dict):
+            self._generated_tts_recent = {}
+        self._generated_tts_recent[scope] = time.time() if now is None else now
+
+    def _looks_like_generated_tts_allow_case(self, response: str) -> bool:
+        from tools.tts_tool import _strip_markdown_for_tts
+
+        raw = str(response or "")
+        if not raw.strip():
+            return False
+        if any(marker in raw for marker in ("```", "`", "http://", "https://", "MEDIA:", "[[audio_as_voice]]")):
+            return False
+        if re.search(r"^\s*[-*]\s+", raw, flags=re.MULTILINE):
+            return False
+        if raw.count("\n") >= 4:
+            return False
+
+        cleaned = re.sub(r"\s+", " ", _strip_markdown_for_tts(raw[:4000])).strip()
+        if not cleaned:
+            return False
+        if len(cleaned) > 120:
+            return False
+
+        sentences = [part.strip() for part in re.split(r"(?<=[.!?。！？])\s+|\n+", cleaned) if part.strip()]
+        if len(sentences) > 3:
+            return False
+
+        lowered = cleaned.lower()
+        allow_hints = (
+            "좋", "잘", "감사", "고마", "수고", "조심", "쉬", "늦", "계획", "정리",
+            "시작", "성공", "알겠", "확인", "맞아", "괜찮", "thanks", "thank", "good",
+            "great", "nice", "rest", "careful", "late", "plan", "start", "success",
+            "got it", "okay",
+        )
+        return any(hint in lowered for hint in allow_hints)
+
+    def _should_send_generated_tts_reply(
+        self,
+        event: MessageEvent,
+        response: str,
+        agent_messages: list,
+    ) -> bool:
+        if not response or response.startswith("Error:"):
+            return False
+        if event.message_type != MessageType.TEXT:
+            return False
+        if self._generated_tts_scope_key(event) is None:
+            return False
+        if self._voice_mode.get(event.source.chat_id, "off") != "off":
+            return False
+        if self._agent_called_tool(agent_messages, "text_to_speech"):
+            return False
+        if self._agent_called_tool(agent_messages, "yuuka_voice_reply"):
+            return False
+        if self._generated_tts_in_cooldown(event):
+            return False
+        return self._looks_like_generated_tts_allow_case(response)
+
     def _should_send_voice_reply(
         self,
         event: MessageEvent,
@@ -5959,15 +6068,7 @@ class GatewayRunner:
             return False
 
         # Dedup: agent already called TTS tool
-        has_agent_tts = any(
-            msg.get("role") == "assistant"
-            and any(
-                tc.get("function", {}).get("name") == "text_to_speech"
-                for tc in (msg.get("tool_calls") or [])
-            )
-            for msg in agent_messages
-        )
-        if has_agent_tts:
+        if self._agent_called_tool(agent_messages, "text_to_speech"):
             return False
 
         # Dedup: base adapter auto-TTS already handles voice input
