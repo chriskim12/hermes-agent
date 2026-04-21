@@ -3595,6 +3595,36 @@ class GatewayRunner:
         history = history or []
         message_text = event.text or ""
 
+        if message_text and not event.media_urls:
+            try:
+                from agent.skill_commands import (
+                    build_skill_invocation_message,
+                    resolve_natural_skill_invocation,
+                )
+
+                natural_skill = resolve_natural_skill_invocation(
+                    message_text,
+                    platform=source.platform.value if source.platform else None,
+                    chat_type=source.chat_type,
+                    thread_id=source.thread_id,
+                )
+                if natural_skill is not None:
+                    cmd_key, user_instruction, runtime_note = natural_skill
+                    injected = build_skill_invocation_message(
+                        cmd_key,
+                        user_instruction,
+                        runtime_note=runtime_note,
+                    )
+                    if injected:
+                        return injected
+            except Exception:
+                logger.debug(
+                    "Natural skill routing failed for %s/%s",
+                    source.platform.value if source.platform else "?",
+                    source.chat_type,
+                    exc_info=True,
+                )
+
         _is_shared_thread = (
             source.chat_type != "dm"
             and source.thread_id

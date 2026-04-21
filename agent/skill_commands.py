@@ -20,6 +20,52 @@ _PLAN_SLUG_RE = re.compile(r"[^a-z0-9]+")
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
 
+_DISCORD_THREAD_CHECKPOINT_ALIASES = {
+    "체크포인트",
+    "여기서 멈춤",
+    "지금까지 정리",
+    "checkpoint",
+}
+
+
+def resolve_natural_skill_invocation(
+    message_text: str,
+    *,
+    platform: str | None = None,
+    chat_type: str | None = None,
+    thread_id: str | None = None,
+) -> tuple[str, str, str] | None:
+    """Resolve exact free-text phrases that should preload a skill.
+
+    Keep this intentionally narrow and fail-closed. These routes should only
+    exist when a plain-text message has a stable, user-approved interpretation
+    that is safer than letting the model infer intent from surrounding context.
+    """
+
+    normalized = " ".join((message_text or "").strip().split())
+    if not normalized:
+        return None
+
+    normalized_lower = normalized.casefold()
+    platform_name = (platform or "").strip().lower()
+    chat_kind = (chat_type or "").strip().lower()
+
+    if (
+        platform_name == "discord"
+        and chat_kind == "thread"
+        and thread_id
+        and normalized_lower in {alias.casefold() for alias in _DISCORD_THREAD_CHECKPOINT_ALIASES}
+    ):
+        return (
+            "/discord-thread-state-recovery",
+            normalized,
+            "The user's exact message matched a Discord-thread checkpoint alias. "
+            "Enter checkpoint mode for the current thread before considering "
+            "broader planning or Linear workflows.",
+        )
+
+    return None
+
 
 def build_plan_path(
     user_instruction: str = "",
