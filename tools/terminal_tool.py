@@ -1175,6 +1175,8 @@ def _maybe_mark_gateway_work_delegated(
         worktree_path=worktree_path,
         next_action="Resume the delegated OMX work",
         proof="terminal_background:omx_exec",
+        usable_outcome=None,
+        close_disposition=None,
     )
 
 

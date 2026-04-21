@@ -35,6 +35,21 @@ WAKE_STATES = frozenset({
     "failed",
 })
 
+USABLE_OUTCOMES = frozenset({
+    "no_progress_theater",
+    "red_only_partial_handoff",
+    "blocked",
+    "stale",
+    "retry_needed",
+    "handoff_needed",
+    "runtime_contamination",
+})
+
+CLOSE_DISPOSITIONS = frozenset({
+    "update",
+    "close",
+})
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -53,6 +68,65 @@ def _normalize_path_value(value: Optional[str]) -> Optional[str]:
             return str(Path(text).expanduser())
         except Exception:
             return text
+
+
+def normalize_usable_outcome(value: Optional[str]) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return text if text in USABLE_OUTCOMES else None
+
+
+def normalize_close_disposition(value: Optional[str]) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return text if text in CLOSE_DISPOSITIONS else None
+
+
+def map_usable_outcome_to_owner_state(usable_outcome: str) -> Optional[str]:
+    if usable_outcome in {"blocked", "stale", "retry_needed", "handoff_needed"}:
+        return usable_outcome
+    if usable_outcome in {"no_progress_theater", "red_only_partial_handoff"}:
+        return "handoff_needed"
+    if usable_outcome == "runtime_contamination":
+        return "failed"
+    return None
+
+
+def bound_next_action(next_action: Optional[str], *, fallback: str) -> str:
+    text = " ".join(str(next_action or "").split())
+    if not text:
+        text = fallback
+    if len(text) <= 200:
+        return text
+    return text[:197].rstrip() + "..."
+
+
+def delegated_process_exit_closeout(exit_code: Optional[int]) -> Dict[str, str]:
+    proof = f"background_process_exit:{exit_code}"
+    if exit_code == 0:
+        return {
+            "state": "handoff_needed",
+            "usable_outcome": "no_progress_theater",
+            "close_disposition": "close",
+            "next_action": "Inspect the OMX run diff before claiming progress",
+            "proof": proof,
+        }
+    return {
+        "state": "failed",
+        "usable_outcome": "runtime_contamination",
+        "close_disposition": "close",
+        "next_action": "Inspect runtime contamination before any retry or handoff",
+        "proof": proof,
+    }
+
+
+def record_has_closed_usable_outcome(record: Any) -> bool:
+    return bool(
+        getattr(record, "usable_outcome", None)
+        and getattr(record, "close_disposition", None) == "close"
+    )
 
 
 @dataclass
@@ -74,6 +148,8 @@ class WorkRecord:
     worktree_path: Optional[str] = None
     escalation_target: Optional[str] = None
     proof: Optional[str] = None
+    usable_outcome: Optional[str] = None
+    close_disposition: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -101,6 +177,8 @@ class WorkRecord:
             worktree_path=data.get("worktree_path"),
             escalation_target=data.get("escalation_target"),
             proof=data.get("proof"),
+            usable_outcome=data.get("usable_outcome"),
+            close_disposition=data.get("close_disposition"),
         )
 
 
