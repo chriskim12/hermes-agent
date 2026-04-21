@@ -609,6 +609,8 @@ async def test_handle_delegated_ingress_packet_resolves_single_match_and_injects
             "tmux_session": "omx-hermes-test",
             "repo_path": "/repo/demo",
             "worktree_path": "/repo/demo",
+            "usable_outcome": "blocked",
+            "close_disposition": "close",
             "next_action": "Wake the owner and inspect the blocked OMX run",
             "proof": "clawhip:session.blocked",
         },
@@ -669,6 +671,8 @@ async def test_handle_delegated_ingress_packet_preserves_discord_thread_source_f
             "tmux_session": "omx-discord-thread-test",
             "repo_path": "/repo/demo",
             "worktree_path": "/repo/demo",
+            "usable_outcome": "blocked",
+            "close_disposition": "close",
             "next_action": "Relay the actionable alert into the owning Discord thread",
             "proof": "clawhip:session.blocked",
         },
@@ -735,6 +739,8 @@ async def test_handle_delegated_ingress_packet_rejects_missing_discord_thread_so
             "tmux_session": "omx-discord-thread-missing",
             "repo_path": "/repo/demo",
             "worktree_path": "/repo/demo",
+            "usable_outcome": "blocked",
+            "close_disposition": "close",
             "next_action": "Do not leak this alert into the parent channel",
             "proof": "clawhip:session.blocked",
         },
@@ -811,6 +817,8 @@ async def test_handle_delegated_ingress_packet_retry_needed_prefers_executor_fol
             "tmux_session": "omx-retry-test",
             "repo_path": "/repo/demo",
             "worktree_path": "/repo/demo",
+            "usable_outcome": "retry_needed",
+            "close_disposition": "update",
             "next_action": "Retry the OMX lane exactly once using the current session context",
             "proof": "clawhip:retry-needed",
         },
@@ -840,6 +848,8 @@ async def test_handle_delegated_ingress_packet_retry_needed_prefers_executor_fol
         live_only=False,
     )["record"]
     assert record.state == "running"
+    assert record.usable_outcome == "retry_needed"
+    assert record.close_disposition == "update"
     assert record.next_action == "Wait for delegated executor retry outcome"
     assert record.proof == "retry_dispatch:process_stdin|source=clawhip:retry-needed"
 
@@ -898,6 +908,8 @@ async def test_handle_delegated_ingress_packet_retry_needed_falls_back_to_owner_
             "tmux_session": "omx-retry-missing",
             "repo_path": "/repo/demo",
             "worktree_path": "/repo/demo",
+            "usable_outcome": "retry_needed",
+            "close_disposition": "update",
             "next_action": "Retry the OMX lane exactly once using the current session context",
             "proof": "clawhip:retry-needed",
         },
@@ -923,8 +935,238 @@ async def test_handle_delegated_ingress_packet_retry_needed_falls_back_to_owner_
         live_only=False,
     )["record"]
     assert record.state == "retry_needed"
+    assert record.usable_outcome == "retry_needed"
+    assert record.close_disposition == "close"
     assert record.next_action == "Retry the OMX lane exactly once using the current session context"
     assert record.proof == "clawhip:retry-needed"
+
+
+@pytest.mark.asyncio
+async def test_handle_delegated_ingress_packet_retry_needed_update_is_bounded_to_one_executor_retry(
+    tmp_path,
+    monkeypatch,
+):
+    runner, store, work_state_store = _make_runner(tmp_path)
+    source = _make_source()
+    session_entry = store.get_or_create_session(source)
+    now = datetime.now(timezone.utc)
+    work_state_store.upsert(
+        WorkRecord(
+            work_id="wk-delegated-retry-bounded-1",
+            title="delegated bounded retry work",
+            objective="runtime should refuse a second executor-side retry after the bounded retry budget is already spent",
+            owner="hermes",
+            executor="omx",
+            mode="delegated",
+            owner_session_id=session_entry.session_key,
+            state="running",
+            started_at=now,
+            last_progress_at=now,
+            next_action="Wait for delegated executor retry outcome",
+            executor_session_id="proc-retry-bounded-1",
+            tmux_session="omx-retry-bounded",
+            repo_path="/repo/demo",
+            worktree_path="/repo/demo",
+            usable_outcome="retry_needed",
+            close_disposition="update",
+            proof="retry_dispatch:process_stdin|source=clawhip:retry-needed",
+        )
+    )
+
+    dispatched = {"count": 0}
+
+    def _fake_dispatch(self, record, *, next_action, proof, route_name=""):
+        dispatched["count"] += 1
+        return {
+            "status": "accepted",
+            "route": "process_stdin",
+            "target": record.executor_session_id,
+        }
+
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_dispatch_delegated_retry_followup",
+        _fake_dispatch,
+        raising=False,
+    )
+
+    result = await GatewayRunner.handle_delegated_ingress_packet(
+        runner,
+        {
+            "owner": "hermes",
+            "state": "retry_needed",
+            "normalized_event": "retry-needed",
+            "executor": "omx",
+            "executor_session_id": "proc-retry-bounded-1",
+            "tmux_session": "omx-retry-bounded",
+            "repo_path": "/repo/demo",
+            "worktree_path": "/repo/demo",
+            "usable_outcome": "retry_needed",
+            "close_disposition": "update",
+            "next_action": "Stop retrying blindly; wake the owner with the bounded retry evidence",
+            "proof": "clawhip:retry-needed:again",
+        },
+        route_name="delegated-ingress",
+        delivery_id="delegated-retry-bounded-001",
+    )
+
+    assert dispatched == {"count": 0}
+    assert result["status"] == "accepted"
+    assert result["verdict"] == "accepted"
+    assert result["resolution"] == "single_match"
+    assert result["reaction"] == "owner_fallback"
+    assert result["dispatch_reason"] == "retry_budget_exhausted"
+
+    capture_adapter = runner.adapters[Platform.TELEGRAM]
+    assert len(capture_adapter.events) == 1
+    assert "wk-delegated-retry-bounded-1" in capture_adapter.events[0].text
+    assert "Stop retrying blindly; wake the owner with the bounded retry evidence" in capture_adapter.events[0].text
+
+    record = work_state_store.resolve_delegated_signal_candidate(
+        work_id="wk-delegated-retry-bounded-1",
+        live_only=False,
+    )["record"]
+    assert record.state == "retry_needed"
+    assert record.usable_outcome == "retry_needed"
+    assert record.close_disposition == "close"
+    assert record.next_action == "Stop retrying blindly; wake the owner with the bounded retry evidence"
+    assert record.proof == "clawhip:retry-needed:again"
+
+
+@pytest.mark.asyncio
+async def test_handle_delegated_ingress_packet_no_progress_theater_records_owner_handoff(tmp_path):
+    runner, store, work_state_store = _make_runner(tmp_path)
+    source = _make_source()
+    session_entry = store.get_or_create_session(source)
+    now = datetime.now(timezone.utc)
+    work_state_store.upsert(
+        WorkRecord(
+            work_id="wk-delegated-no-progress-1",
+            title="delegated no progress theater work",
+            objective="no-diff stall must classify as non-success rather than looking like active progress",
+            owner="hermes",
+            executor="omx",
+            mode="delegated",
+            owner_session_id=session_entry.session_key,
+            state="running",
+            started_at=now,
+            last_progress_at=now,
+            next_action="Wait for delegated executor signal",
+            executor_session_id="omx-no-progress-1",
+            tmux_session="omx-no-progress-test",
+            repo_path="/repo/demo",
+            worktree_path="/repo/demo",
+            proof="delegated_handoff:test",
+        )
+    )
+
+    result = await GatewayRunner.handle_delegated_ingress_packet(
+        runner,
+        {
+            "owner": "hermes",
+            "state": "handoff_needed",
+            "normalized_event": "handoff-needed",
+            "executor": "omx",
+            "executor_session_id": "omx-no-progress-1",
+            "tmux_session": "omx-no-progress-test",
+            "repo_path": "/repo/demo",
+            "worktree_path": "/repo/demo",
+            "usable_outcome": "no_progress_theater",
+            "close_disposition": "close",
+            "next_action": "Wake the owner and verify whether OMX produced any real diff before claiming progress",
+            "proof": "clawhip:no-progress-theater",
+        },
+        route_name="delegated-ingress",
+        delivery_id="delegated-no-progress-001",
+    )
+
+    assert result["status"] == "accepted"
+    assert result["verdict"] == "accepted"
+    assert result["resolution"] == "single_match"
+    assert result["reaction"] == "owner_handoff"
+    assert result["work_id"] == "wk-delegated-no-progress-1"
+
+    capture_adapter = runner.adapters[Platform.TELEGRAM]
+    assert len(capture_adapter.events) == 1
+    assert "wk-delegated-no-progress-1" in capture_adapter.events[0].text
+    assert "Wake the owner and verify whether OMX produced any real diff before claiming progress" in capture_adapter.events[0].text
+
+    record = work_state_store.resolve_delegated_signal_candidate(
+        work_id="wk-delegated-no-progress-1",
+        live_only=False,
+    )["record"]
+    assert record.state == "handoff_needed"
+    assert record.usable_outcome == "no_progress_theater"
+    assert record.close_disposition == "close"
+    assert record.proof == "clawhip:no-progress-theater"
+
+
+@pytest.mark.asyncio
+async def test_handle_delegated_ingress_packet_red_only_partial_handoff_records_owner_handoff(tmp_path):
+    runner, store, work_state_store = _make_runner(tmp_path)
+    source = _make_source()
+    session_entry = store.get_or_create_session(source)
+    now = datetime.now(timezone.utc)
+    work_state_store.upsert(
+        WorkRecord(
+            work_id="wk-delegated-red-only-1",
+            title="delegated red only partial handoff work",
+            objective="RED-only partial handoff must stay classified non-success instead of sounding like progress",
+            owner="hermes",
+            executor="omx",
+            mode="delegated",
+            owner_session_id=session_entry.session_key,
+            state="running",
+            started_at=now,
+            last_progress_at=now,
+            next_action="Wait for delegated executor signal",
+            executor_session_id="omx-red-only-1",
+            tmux_session="omx-red-only-test",
+            repo_path="/repo/demo",
+            worktree_path="/repo/demo",
+            proof="delegated_handoff:test",
+        )
+    )
+
+    result = await GatewayRunner.handle_delegated_ingress_packet(
+        runner,
+        {
+            "owner": "hermes",
+            "state": "handoff_needed",
+            "normalized_event": "handoff-needed",
+            "executor": "omx",
+            "executor_session_id": "omx-red-only-1",
+            "tmux_session": "omx-red-only-test",
+            "repo_path": "/repo/demo",
+            "worktree_path": "/repo/demo",
+            "usable_outcome": "red_only_partial_handoff",
+            "close_disposition": "close",
+            "next_action": "Wake the owner with the RED-only evidence and require a bounded next action",
+            "proof": "clawhip:red-only-partial-handoff",
+        },
+        route_name="delegated-ingress",
+        delivery_id="delegated-red-only-001",
+    )
+
+    assert result["status"] == "accepted"
+    assert result["verdict"] == "accepted"
+    assert result["resolution"] == "single_match"
+    assert result["reaction"] == "owner_handoff"
+    assert result["work_id"] == "wk-delegated-red-only-1"
+
+    capture_adapter = runner.adapters[Platform.TELEGRAM]
+    assert len(capture_adapter.events) == 1
+    assert "wk-delegated-red-only-1" in capture_adapter.events[0].text
+    assert "Wake the owner with the RED-only evidence and require a bounded next action" in capture_adapter.events[0].text
+
+    record = work_state_store.resolve_delegated_signal_candidate(
+        work_id="wk-delegated-red-only-1",
+        live_only=False,
+    )["record"]
+    assert record.state == "handoff_needed"
+    assert record.usable_outcome == "red_only_partial_handoff"
+    assert record.close_disposition == "close"
+    assert record.proof == "clawhip:red-only-partial-handoff"
 
 
 @pytest.mark.asyncio
@@ -944,6 +1186,8 @@ async def test_handle_delegated_ingress_packet_rejects_missing_match(tmp_path):
             "tmux_session": "omx-missing",
             "repo_path": "/repo/demo",
             "worktree_path": "/repo/demo",
+            "usable_outcome": "blocked",
+            "close_disposition": "close",
             "next_action": "Do not broad-wake anyone",
             "proof": "clawhip:session.blocked",
         },
@@ -998,6 +1242,8 @@ async def test_handle_delegated_ingress_packet_rejects_ambiguous_match(tmp_path)
             "tmux_session": "omx-shared",
             "repo_path": "/repo/demo",
             "worktree_path": "/repo/demo",
+            "usable_outcome": "blocked",
+            "close_disposition": "close",
             "next_action": "Do not broad-wake delegated work",
             "proof": "clawhip:session.blocked",
         },
@@ -1049,7 +1295,7 @@ def test_resolve_delegated_signal_candidate_refreshes_external_store_updates(tmp
     assert resolution["record"].executor_session_id == "proc-refresh-1"
 
 
-def test_update_delegated_work_for_process_marks_finished_on_success(tmp_path):
+def test_update_delegated_work_for_process_fail_closes_clean_exit_as_no_progress_theater(tmp_path):
     runner, store, work_state_store = _make_runner(tmp_path)
     source = _make_source()
     session_entry = store.get_or_create_session(source)
@@ -1086,9 +1332,11 @@ def test_update_delegated_work_for_process_marks_finished_on_success(tmp_path):
         work_id="wk-delegated-finish-1",
         live_only=False,
     )["record"]
-    assert record.state == "finished"
+    assert record.state == "handoff_needed"
+    assert record.usable_outcome == "no_progress_theater"
+    assert record.close_disposition == "close"
     assert record.proof == "background_process_exit:0"
-    assert record.next_action == "Inspect the completed OMX run"
+    assert record.next_action == "Inspect the OMX run diff before claiming progress"
 
 
 def test_update_delegated_work_for_process_marks_failed_on_nonzero_exit(tmp_path):
@@ -1129,8 +1377,10 @@ def test_update_delegated_work_for_process_marks_failed_on_nonzero_exit(tmp_path
         live_only=False,
     )["record"]
     assert record.state == "failed"
+    assert record.usable_outcome == "runtime_contamination"
+    assert record.close_disposition == "close"
     assert record.proof == "background_process_exit:23"
-    assert record.next_action == "Inspect the failed OMX run"
+    assert record.next_action == "Inspect runtime contamination before any retry or handoff"
 
 
 def test_finish_direct_work_record_does_not_overwrite_delegated_record_state_or_proof(tmp_path):
@@ -1222,18 +1472,20 @@ async def test_delegated_ingress_webhook_route_calls_gateway_runner(tmp_path):
     async with TestClient(TestServer(app)) as cli:
         resp = await cli.post(
             "/webhooks/delegated-ingress",
-            json={
-                "owner": "hermes",
-                "state": "blocked",
-                "normalized_event": "blocked",
-                "executor": "omx",
-                "executor_session_id": "omx-session-webhook",
-                "tmux_session": "omx-webhook",
-                "repo_path": "/repo/webhook",
-                "worktree_path": "/repo/webhook",
-                "next_action": "Wake the owner from delegated ingress webhook",
-                "proof": "clawhip:session.blocked",
-            },
+                json={
+                    "owner": "hermes",
+                    "state": "blocked",
+                    "normalized_event": "blocked",
+                    "executor": "omx",
+                    "executor_session_id": "omx-session-webhook",
+                    "tmux_session": "omx-webhook",
+                    "repo_path": "/repo/webhook",
+                    "worktree_path": "/repo/webhook",
+                    "usable_outcome": "blocked",
+                    "close_disposition": "close",
+                    "next_action": "Wake the owner from delegated ingress webhook",
+                    "proof": "clawhip:session.blocked",
+                },
             headers={"X-Request-ID": "delegated-ingress-001"},
         )
         assert resp.status == 202

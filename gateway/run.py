@@ -1564,7 +1564,27 @@ class GatewayRunner:
         next_action = str(payload.get("next_action", "")).strip()
         proof = str(payload.get("proof", "")).strip()
 
-        if owner != "hermes" or executor != "omx" or not next_action or not proof:
+        from gateway.work_state import (
+            WAKE_STATES,
+            bound_next_action,
+            map_usable_outcome_to_owner_state,
+            normalize_close_disposition,
+            normalize_usable_outcome,
+        )
+
+        usable_outcome = normalize_usable_outcome(payload.get("usable_outcome"))
+        close_disposition = normalize_close_disposition(payload.get("close_disposition"))
+        expected_state = map_usable_outcome_to_owner_state(usable_outcome or "") if usable_outcome else None
+
+        if (
+            owner != "hermes"
+            or executor != "omx"
+            or not next_action
+            or not proof
+            or not usable_outcome
+            or not close_disposition
+            or expected_state is None
+        ):
             return {
                 "status": "reject",
                 "verdict": "reject",
@@ -1573,13 +1593,20 @@ class GatewayRunner:
                 "http_status": 400,
             }
 
-        from gateway.work_state import WAKE_STATES
-
-        if state not in WAKE_STATES:
+        state = state or expected_state
+        if state != expected_state or state not in WAKE_STATES:
             return {
                 "status": "reject",
                 "verdict": "reject",
                 "reason": "invalid_delegated_ingress_state",
+                "resolution": "invalid",
+                "http_status": 400,
+            }
+        if close_disposition == "update" and usable_outcome != "retry_needed":
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": "invalid_delegated_ingress_packet",
                 "resolution": "invalid",
                 "http_status": 400,
             }
@@ -1632,55 +1659,77 @@ class GatewayRunner:
             }
 
         now = datetime.now().astimezone()
-        if state == "retry_needed":
-            dispatch_result = self._dispatch_delegated_retry_followup(
-                record,
-                next_action=next_action,
-                proof=proof,
-                route_name=route_name,
+        bounded_next = bound_next_action(
+            next_action,
+            fallback="Inspect the delegated OMX outcome honestly",
+        )
+        dispatch_result = None
+        dispatch_reason = None
+
+        if close_disposition == "update":
+            prior_retry_dispatched = (
+                getattr(record, "usable_outcome", None) == "retry_needed"
+                and getattr(record, "close_disposition", None) == "update"
+                and str(getattr(record, "proof", "") or "").startswith("retry_dispatch:")
             )
-            if dispatch_result.get("status") == "accepted":
-                dispatch_route = str(dispatch_result.get("route", "executor_surface") or "executor_surface")
-                target_executor_id = (
-                    dispatch_result.get("target")
-                    or executor_session_id
-                    or record.executor_session_id
-                    or tmux_session
-                    or record.tmux_session
+            if prior_retry_dispatched:
+                close_disposition = "close"
+                dispatch_reason = "retry_budget_exhausted"
+            else:
+                dispatch_result = self._dispatch_delegated_retry_followup(
+                    record,
+                    next_action=bounded_next,
+                    proof=proof,
+                    route_name=route_name,
                 )
-                work_state_store.update_record(
-                    record.work_id,
-                    record.owner_session_id,
-                    state="running",
-                    last_progress_at=now,
-                    next_action="Wait for delegated executor retry outcome",
-                    proof=f"retry_dispatch:{dispatch_route}|source={proof}",
-                    executor_session_id=executor_session_id or record.executor_session_id,
-                    tmux_session=tmux_session or record.tmux_session,
-                    repo_path=repo_path or record.repo_path,
-                    worktree_path=worktree_path or record.worktree_path,
-                )
-                return {
-                    "status": "accepted",
-                    "verdict": "accepted",
-                    "reason": "eligible",
-                    "resolution": "single_match",
-                    "reaction": "executor_first",
-                    "dispatch_route": dispatch_route,
-                    "target_executor_id": target_executor_id,
-                    "work_id": record.work_id,
-                    "http_status": 202,
-                }
-        else:
-            dispatch_result = None
+                if dispatch_result.get("status") == "accepted":
+                    dispatch_route = str(dispatch_result.get("route", "executor_surface") or "executor_surface")
+                    target_executor_id = (
+                        dispatch_result.get("target")
+                        or executor_session_id
+                        or record.executor_session_id
+                        or tmux_session
+                        or record.tmux_session
+                    )
+                    work_state_store.update_record(
+                        record.work_id,
+                        record.owner_session_id,
+                        state="running",
+                        last_progress_at=now,
+                        next_action="Wait for delegated executor retry outcome",
+                        proof=f"retry_dispatch:{dispatch_route}|source={proof}",
+                        usable_outcome=usable_outcome,
+                        close_disposition="update",
+                        executor_session_id=executor_session_id or record.executor_session_id,
+                        tmux_session=tmux_session or record.tmux_session,
+                        repo_path=repo_path or record.repo_path,
+                        worktree_path=worktree_path or record.worktree_path,
+                    )
+                    return {
+                        "status": "accepted",
+                        "verdict": "accepted",
+                        "reason": "eligible",
+                        "resolution": "single_match",
+                        "reaction": "executor_first",
+                        "dispatch_route": dispatch_route,
+                        "target_executor_id": target_executor_id,
+                        "work_id": record.work_id,
+                        "usable_outcome": usable_outcome,
+                        "close_disposition": "update",
+                        "http_status": 202,
+                    }
+                dispatch_reason = dispatch_result.get("reason")
+                close_disposition = "close"
 
         work_state_store.update_record(
             record.work_id,
             record.owner_session_id,
             state=state,
             last_progress_at=now,
-            next_action=next_action,
+            next_action=bounded_next,
             proof=proof,
+            usable_outcome=usable_outcome,
+            close_disposition=close_disposition,
             executor_session_id=executor_session_id or record.executor_session_id,
             tmux_session=tmux_session or record.tmux_session,
             repo_path=repo_path or record.repo_path,
@@ -1693,17 +1742,21 @@ class GatewayRunner:
                 "owner": "hermes",
                 "owner_session_id": record.owner_session_id,
                 "state": state,
-                "next_action": next_action,
+                "next_action": bounded_next,
                 "proof": proof,
             },
             route_name=route_name,
             delivery_id=delivery_id,
         )
         owner_result["work_id"] = record.work_id
-        if state == "retry_needed":
+        owner_result["usable_outcome"] = usable_outcome
+        owner_result["close_disposition"] = close_disposition
+        if usable_outcome == "retry_needed":
             owner_result["reaction"] = "owner_fallback"
-            if dispatch_result:
-                owner_result["dispatch_reason"] = dispatch_result.get("reason")
+            if dispatch_reason:
+                owner_result["dispatch_reason"] = dispatch_reason
+        elif state == "handoff_needed":
+            owner_result["reaction"] = "owner_handoff"
         else:
             owner_result["reaction"] = "owner_second"
         return owner_result
@@ -1830,6 +1883,8 @@ class GatewayRunner:
             worktree_path=worktree_path,
             next_action=next_action,
             proof=proof,
+            usable_outcome=None,
+            close_disposition=None,
         )
 
     def _update_delegated_work_for_process(
@@ -1852,15 +1907,21 @@ class GatewayRunner:
         record = resolution.get("record")
         if record is None:
             return False
+        from gateway.work_state import delegated_process_exit_closeout, record_has_closed_usable_outcome
+
         now = datetime.now().astimezone()
-        succeeded = exit_code == 0
+        if record_has_closed_usable_outcome(record):
+            return True
+        closeout = delegated_process_exit_closeout(exit_code)
         return work_state_store.update_record(
             record.work_id,
             record.owner_session_id,
-            state="finished" if succeeded else "failed",
+            state=closeout["state"],
             last_progress_at=now,
-            next_action="Inspect the completed OMX run" if succeeded else "Inspect the failed OMX run",
-            proof=f"background_process_exit:{exit_code}",
+            next_action=closeout["next_action"],
+            proof=closeout["proof"],
+            usable_outcome=closeout["usable_outcome"],
+            close_disposition=closeout["close_disposition"],
         )
 
     def _begin_direct_work_record(

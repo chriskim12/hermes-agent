@@ -332,7 +332,7 @@ class TestCompletionConsumed:
         assert result["status"] == "exited"
         assert registry.is_completion_consumed("proc_poll")
 
-    def test_poll_updates_matching_delegated_work_record_on_exit(self, registry, monkeypatch, tmp_path):
+    def test_poll_fail_closes_matching_delegated_work_record_on_clean_exit(self, registry, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         store = WorkStateStore(tmp_path / "gateway_work_state.json")
         now = datetime.now(timezone.utc)
@@ -340,12 +340,12 @@ class TestCompletionConsumed:
             WorkRecord(
                 work_id="wk-delegated-poll-1",
                 title="delegated poll finish",
-                objective="poll should close delegated work on exited process observation",
+                objective="poll should fail-close delegated OMX exit so clean process termination cannot pretend to be verified progress",
                 owner="hermes",
                 executor="omx",
                 mode="delegated",
                 owner_session_id="agent:discord:thread:test",
-                state="blocked",
+                state="running",
                 started_at=now,
                 last_progress_at=now,
                 next_action="Resume delegated run",
@@ -369,9 +369,11 @@ class TestCompletionConsumed:
             work_id="wk-delegated-poll-1",
             live_only=False,
         )["record"]
-        assert record.state == "finished"
+        assert record.state == "handoff_needed"
+        assert record.usable_outcome == "no_progress_theater"
+        assert record.close_disposition == "close"
         assert record.proof == "background_process_exit:0"
-        assert record.next_action == "Inspect the completed OMX run"
+        assert record.next_action == "Inspect the OMX run diff before claiming progress"
 
     def test_log_marks_completion_consumed(self, registry):
         """read_log() on exited session marks as consumed."""

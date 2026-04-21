@@ -628,7 +628,11 @@ class ProcessRegistry:
         if session is None or not session.exited or not session.id:
             return
         try:
-            from gateway.work_state import WorkStateStore
+            from gateway.work_state import (
+                WorkStateStore,
+                delegated_process_exit_closeout,
+                record_has_closed_usable_outcome,
+            )
 
             store = WorkStateStore()
             resolution = store.resolve_delegated_signal_candidate(
@@ -640,14 +644,18 @@ class ProcessRegistry:
             record = resolution.get("record")
             if record is None:
                 return
-            succeeded = session.exit_code == 0
+            if record_has_closed_usable_outcome(record):
+                return
+            closeout = delegated_process_exit_closeout(session.exit_code)
             store.update_record(
                 record.work_id,
                 record.owner_session_id,
-                state="finished" if succeeded else "failed",
+                state=closeout["state"],
                 last_progress_at=datetime.now().astimezone(),
-                next_action="Inspect the completed OMX run" if succeeded else "Inspect the failed OMX run",
-                proof=f"background_process_exit:{session.exit_code}",
+                next_action=closeout["next_action"],
+                proof=closeout["proof"],
+                usable_outcome=closeout["usable_outcome"],
+                close_disposition=closeout["close_disposition"],
             )
         except Exception:
             logger.debug("Failed to propagate delegated work-state from process observation", exc_info=True)

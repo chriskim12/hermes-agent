@@ -87,6 +87,8 @@ def test_background_omx_command_marks_current_gateway_work_record_delegated(tmp_
     assert record.worktree_path == "/repo/demo"
     assert record.next_action == "Resume the delegated OMX work"
     assert record.proof == "terminal_background:omx_exec"
+    assert record.usable_outcome is None
+    assert record.close_disposition is None
 
 
 def test_background_non_omx_command_does_not_rewrite_work_state(tmp_path, monkeypatch):
