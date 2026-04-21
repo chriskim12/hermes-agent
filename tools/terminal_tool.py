@@ -1130,6 +1130,33 @@ def _looks_like_omx_delegation(command: str) -> bool:
     return infer_omx_lane_from_command(command) is not None
 
 
+def _apply_default_omx_launch_flags(command: str) -> str:
+    from gateway.work_state import infer_omx_lane_from_command
+
+    if infer_omx_lane_from_command(command) is None:
+        return command
+
+    needs = []
+    if "--madmax" not in command:
+        needs.append("--madmax")
+    if "--high" not in command:
+        needs.append("--high")
+    if not needs:
+        return command
+
+    pattern = re.compile(
+        r"\bomx(?P<flags>(?:\s+(?:--[A-Za-z0-9_-]+(?:=\S+)?|-w(?:=\S+)?(?:\s+\S+)?))*)\s+(?P<subcmd>exec|plan|ralplan|ralph|team)\b"
+    )
+
+    def _rewrite(match: re.Match[str]) -> str:
+        flags = match.group("flags") or ""
+        injected = " ".join(needs)
+        return f"omx {injected}{flags} {match.group('subcmd')}"
+
+    rewritten, count = pattern.subn(_rewrite, command, count=1)
+    return rewritten if count else command
+
+
 def _maybe_mark_gateway_work_delegated(
     *,
     command: str,
@@ -1245,6 +1272,8 @@ def terminal_tool(
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
                 "status": "error",
             }, ensure_ascii=False)
+
+        command = _apply_default_omx_launch_flags(command)
 
         # Get configuration
         config = _get_env_config()

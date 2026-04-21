@@ -8,6 +8,7 @@ broad chat/session heuristics.
 from __future__ import annotations
 
 import json
+import re
 import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -39,6 +40,31 @@ OMX_LANES = frozenset({"omx_exec", "plan", "ralplan", "ralph", "team"})
 PLANNING_GATES = frozenset({"open", "closed"})
 NEXT_EXECUTION_BRANCHES = frozenset({"none", "pending", "ralph", "team"})
 CLOSE_AUTHORITIES = frozenset({"hermes"})
+OMX_GLOBAL_BOOLEAN_FLAGS = frozenset({
+    "--madmax",
+    "--high",
+    "--xhigh",
+    "--spark",
+    "--madmax-spark",
+    "--notify-temp",
+    "--tmux",
+    "--discord",
+    "--slack",
+    "--telegram",
+    "--force",
+    "--dry-run",
+    "--keep-config",
+    "--purge",
+    "--verbose",
+})
+OMX_GLOBAL_FLAGS_WITH_VALUES = frozenset({"--custom", "--scope", "--skill-target"})
+OMX_LANE_SUBCOMMANDS = {
+    "exec": "omx_exec",
+    "plan": "plan",
+    "ralplan": "ralplan",
+    "ralph": "ralph",
+    "team": "team",
+}
 
 
 def _utcnow() -> datetime:
@@ -115,19 +141,52 @@ def _normalize_close_authority(value: Optional[str]) -> Optional[str]:
 
 
 def infer_omx_lane_from_command(command: str) -> Optional[str]:
-    normalized = " ".join((command or "").lower().split())
-    if not normalized:
+    normalized = str(command or "").lower()
+    if not normalized.strip():
         return None
-    if "omx exec" in normalized:
-        return "omx_exec"
-    if "omx ralplan" in normalized or "$ralplan" in normalized:
+    if "$ralplan" in normalized:
         return "ralplan"
-    if "omx ralph" in normalized or "$ralph" in normalized:
+    if "$ralph" in normalized:
         return "ralph"
-    if "omx team" in normalized or "$team" in normalized:
+    if "$team" in normalized:
         return "team"
-    if "omx plan" in normalized:
-        return "plan"
+
+    shellish = re.sub(r"[\n\r\t\"'`|&;()\[\]{}<>]", " ", normalized)
+    tokens = [token for token in shellish.split() if token]
+    if not tokens:
+        return None
+
+    for idx, token in enumerate(tokens):
+        if token != "omx":
+            continue
+        cursor = idx + 1
+        while cursor < len(tokens):
+            current = tokens[cursor]
+            lane = OMX_LANE_SUBCOMMANDS.get(current)
+            if lane:
+                return lane
+            if current in OMX_GLOBAL_BOOLEAN_FLAGS:
+                cursor += 1
+                continue
+            if current in OMX_GLOBAL_FLAGS_WITH_VALUES:
+                cursor += 2
+                continue
+            if any(current.startswith(f"{flag}=") for flag in OMX_GLOBAL_FLAGS_WITH_VALUES):
+                cursor += 1
+                continue
+            if current == "-w":
+                if cursor + 1 < len(tokens) and not tokens[cursor + 1].startswith("-"):
+                    cursor += 2
+                else:
+                    cursor += 1
+                continue
+            if current.startswith("-w="):
+                cursor += 1
+                continue
+            if current.startswith("-"):
+                cursor += 1
+                continue
+            break
     return None
 
 

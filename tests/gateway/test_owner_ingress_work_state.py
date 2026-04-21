@@ -12,7 +12,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, SessionStore
-from gateway.work_state import WorkRecord, WorkStateStore
+from gateway.work_state import WorkRecord, WorkStateStore, infer_omx_lane_from_command
 
 
 class _CaptureAdapter:
@@ -85,6 +85,12 @@ def _make_runner(tmp_path):
     runner.work_state_store = work_state_store
     runner.adapters = {Platform.TELEGRAM: _CaptureAdapter()}
     return runner, store, work_state_store
+
+
+def test_infer_omx_lane_from_flag_prefixed_commands():
+    assert infer_omx_lane_from_command("omx --madmax --high exec -C /repo/demo --json") == "omx_exec"
+    assert infer_omx_lane_from_command("omx --madmax --high ralplan -C /repo/demo --json") == "ralplan"
+    assert infer_omx_lane_from_command("tmux new-session -d -s omx-team 'bash -lc \"cd /repo/demo && omx --madmax --high team -C /repo/demo --json\"'") == "team"
 
 
 @pytest.mark.asyncio
