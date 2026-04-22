@@ -2670,6 +2670,32 @@ class TestGeneratedYuukaTtsPolicy:
         with patch("gateway.run.time.time", return_value=1200.0):
             assert runner._should_send_generated_tts_reply(event, event.text, []) is False
 
+    @pytest.mark.asyncio
+    async def test_records_recent_use_only_after_successful_send(self, runner):
+        event = self._event()
+        runner._should_send_generated_tts_reply = MagicMock(return_value=True)
+        runner._send_voice_reply = AsyncMock(return_value=True)
+        runner._record_generated_tts_use = MagicMock()
+
+        result = await runner._maybe_send_generated_tts_reply(event, event.text, [])
+
+        assert result is True
+        runner._send_voice_reply.assert_awaited_once_with(event, event.text)
+        runner._record_generated_tts_use.assert_called_once_with(event)
+
+    @pytest.mark.asyncio
+    async def test_does_not_record_recent_use_when_send_fails(self, runner):
+        event = self._event()
+        runner._should_send_generated_tts_reply = MagicMock(return_value=True)
+        runner._send_voice_reply = AsyncMock(return_value=False)
+        runner._record_generated_tts_use = MagicMock()
+
+        result = await runner._maybe_send_generated_tts_reply(event, event.text, [])
+
+        assert result is False
+        runner._send_voice_reply.assert_awaited_once_with(event, event.text)
+        runner._record_generated_tts_use.assert_not_called()
+
 
 class TestUDPKeepalive:
     """UDP keepalive prevents Discord from dropping the voice session."""
