@@ -1563,10 +1563,6 @@ class GatewayRunner:
         state = str(payload.get("state", "")).strip() or str(payload.get("normalized_event", "")).strip().replace("-", "_")
         next_action = str(payload.get("next_action", "")).strip()
         proof = str(payload.get("proof", "")).strip()
-        current_lane = str(payload.get("current_lane", "")).strip() or None
-        planning_gate = str(payload.get("planning_gate", "")).strip() or None
-        next_execution_branch = str(payload.get("next_execution_branch", "")).strip() or None
-        close_authority = str(payload.get("close_authority", "")).strip() or None
 
         from gateway.work_state import (
             WAKE_STATES,
@@ -1574,15 +1570,21 @@ class GatewayRunner:
             map_usable_outcome_to_owner_state,
             normalize_close_disposition,
             normalize_usable_outcome,
-            resolve_omx_lane_truth,
         )
 
         usable_outcome = normalize_usable_outcome(payload.get("usable_outcome"))
         close_disposition = normalize_close_disposition(payload.get("close_disposition"))
         expected_state = map_usable_outcome_to_owner_state(usable_outcome or "") if usable_outcome else None
-        legacy_lane_only = usable_outcome is None and close_disposition is None
 
-        if owner != "hermes" or executor != "omx" or not next_action or not proof:
+        if (
+            owner != "hermes"
+            or executor != "omx"
+            or not next_action
+            or not proof
+            or not usable_outcome
+            or not close_disposition
+            or expected_state is None
+        ):
             return {
                 "status": "reject",
                 "verdict": "reject",
@@ -1591,41 +1593,23 @@ class GatewayRunner:
                 "http_status": 400,
             }
 
-        if legacy_lane_only:
-            if state not in WAKE_STATES:
-                return {
-                    "status": "reject",
-                    "verdict": "reject",
-                    "reason": "invalid_delegated_ingress_state",
-                    "resolution": "invalid",
-                    "http_status": 400,
-                }
-        else:
-            if not usable_outcome or not close_disposition or expected_state is None:
-                return {
-                    "status": "reject",
-                    "verdict": "reject",
-                    "reason": "invalid_delegated_ingress_packet",
-                    "resolution": "invalid",
-                    "http_status": 400,
-                }
-            state = state or expected_state
-            if state != expected_state or state not in WAKE_STATES:
-                return {
-                    "status": "reject",
-                    "verdict": "reject",
-                    "reason": "invalid_delegated_ingress_state",
-                    "resolution": "invalid",
-                    "http_status": 400,
-                }
-            if close_disposition == "update" and usable_outcome != "retry_needed":
-                return {
-                    "status": "reject",
-                    "verdict": "reject",
-                    "reason": "invalid_delegated_ingress_packet",
-                    "resolution": "invalid",
-                    "http_status": 400,
-                }
+        state = state or expected_state
+        if state != expected_state or state not in WAKE_STATES:
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": "invalid_delegated_ingress_state",
+                "resolution": "invalid",
+                "http_status": 400,
+            }
+        if close_disposition == "update" and usable_outcome != "retry_needed":
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": "invalid_delegated_ingress_packet",
+                "resolution": "invalid",
+                "http_status": 400,
+            }
 
         work_state_store = getattr(self, "work_state_store", None)
         if work_state_store is None:
@@ -1674,22 +1658,6 @@ class GatewayRunner:
                 "http_status": 404,
             }
 
-        try:
-            lane_truth = resolve_omx_lane_truth(
-                current_lane=current_lane or getattr(record, "current_lane", None),
-                planning_gate=planning_gate or getattr(record, "planning_gate", None),
-                next_execution_branch=next_execution_branch or getattr(record, "next_execution_branch", None),
-                close_authority=close_authority or getattr(record, "close_authority", None),
-            )
-        except ValueError:
-            return {
-                "status": "reject",
-                "verdict": "reject",
-                "reason": "invalid_delegated_lane_transition",
-                "resolution": "invalid",
-                "http_status": 400,
-            }
-
         now = datetime.now().astimezone()
         bounded_next = bound_next_action(
             next_action,
@@ -1697,11 +1665,8 @@ class GatewayRunner:
         )
         dispatch_result = None
         dispatch_reason = None
-        wants_retry_update = close_disposition == "update" or (
-            legacy_lane_only and state == "retry_needed"
-        )
 
-        if wants_retry_update:
+        if close_disposition == "update":
             prior_retry_dispatched = (
                 getattr(record, "usable_outcome", None) == "retry_needed"
                 and getattr(record, "close_disposition", None) == "update"
@@ -1739,10 +1704,6 @@ class GatewayRunner:
                         tmux_session=tmux_session or record.tmux_session,
                         repo_path=repo_path or record.repo_path,
                         worktree_path=worktree_path or record.worktree_path,
-                        current_lane=lane_truth["current_lane"],
-                        planning_gate=lane_truth["planning_gate"],
-                        next_execution_branch=lane_truth["next_execution_branch"],
-                        close_authority=lane_truth["close_authority"],
                     )
                     return {
                         "status": "accepted",
@@ -1758,8 +1719,7 @@ class GatewayRunner:
                         "http_status": 202,
                     }
                 dispatch_reason = dispatch_result.get("reason")
-                if not legacy_lane_only:
-                    close_disposition = "close"
+                close_disposition = "close"
 
         work_state_store.update_record(
             record.work_id,
@@ -1774,10 +1734,6 @@ class GatewayRunner:
             tmux_session=tmux_session or record.tmux_session,
             repo_path=repo_path or record.repo_path,
             worktree_path=worktree_path or record.worktree_path,
-            current_lane=lane_truth["current_lane"],
-            planning_gate=lane_truth["planning_gate"],
-            next_execution_branch=lane_truth["next_execution_branch"],
-            close_authority=lane_truth["close_authority"],
         )
 
         owner_result = await self.handle_owner_ingress_packet(
@@ -1795,7 +1751,7 @@ class GatewayRunner:
         owner_result["work_id"] = record.work_id
         owner_result["usable_outcome"] = usable_outcome
         owner_result["close_disposition"] = close_disposition
-        if usable_outcome == "retry_needed" or (legacy_lane_only and state == "retry_needed"):
+        if usable_outcome == "retry_needed":
             owner_result["reaction"] = "owner_fallback"
             if dispatch_reason:
                 owner_result["dispatch_reason"] = dispatch_reason
@@ -1907,35 +1863,11 @@ class GatewayRunner:
         worktree_path: Optional[str] = None,
         next_action: str = "Resume the delegated OMX work",
         proof: str = "delegated_handoff",
-        current_lane: Optional[str] = None,
-        planning_gate: Optional[str] = None,
-        next_execution_branch: Optional[str] = None,
-        close_authority: Optional[str] = None,
     ) -> bool:
         if not work_id:
             return False
         work_state_store = getattr(self, "work_state_store", None)
         if work_state_store is None:
-            return False
-        existing_records = work_state_store.find_matching_records(
-            work_id,
-            owner_session_id=session_key,
-            live_only=False,
-        )
-        existing = existing_records[0] if existing_records else None
-
-        from gateway.work_state import resolve_omx_lane_truth
-
-        try:
-            lane_truth = resolve_omx_lane_truth(
-                current_lane=current_lane or getattr(existing, "current_lane", None),
-                planning_gate=planning_gate or getattr(existing, "planning_gate", None),
-                next_execution_branch=(
-                    next_execution_branch or getattr(existing, "next_execution_branch", None)
-                ),
-                close_authority=close_authority or getattr(existing, "close_authority", None),
-            )
-        except ValueError:
             return False
         now = datetime.now().astimezone()
         return work_state_store.update_record(
@@ -1953,10 +1885,6 @@ class GatewayRunner:
             proof=proof,
             usable_outcome=None,
             close_disposition=None,
-            current_lane=lane_truth["current_lane"],
-            planning_gate=lane_truth["planning_gate"],
-            next_execution_branch=lane_truth["next_execution_branch"],
-            close_authority=lane_truth["close_authority"],
         )
 
     def _update_delegated_work_for_process(
@@ -1995,6 +1923,96 @@ class GatewayRunner:
             usable_outcome=closeout["usable_outcome"],
             close_disposition=closeout["close_disposition"],
         )
+
+    @staticmethod
+    def _ralplan_state_is_terminal(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("approved") is True:
+            return True
+        current_phase = str(payload.get("current_phase", "") or "").strip().lower()
+        status = str(payload.get("status", "") or "").strip().lower()
+        return current_phase in {"complete", "completed"} or status == "completed"
+
+    async def _consume_owner_wake_files_once(self) -> int:
+        work_state_store = getattr(self, "work_state_store", None)
+        if work_state_store is None:
+            return 0
+
+        from gateway.work_state import record_has_closed_usable_outcome
+
+        roots: list[Path] = []
+        seen_roots: set[str] = set()
+        for record in work_state_store.list_records():
+            if record.owner != "hermes" or record.executor != "omx" or record.mode != "delegated":
+                continue
+            if record.state not in {"created", "running", "blocked", "stale", "retry_needed", "handoff_needed", "failed"}:
+                continue
+            if record_has_closed_usable_outcome(record):
+                continue
+            root_text = str(record.worktree_path or record.repo_path or "").strip()
+            if not root_text:
+                continue
+            if root_text in seen_roots:
+                continue
+            seen_roots.add(root_text)
+            roots.append(Path(root_text))
+
+        consumed = 0
+        for root in roots:
+            candidate_files: list[Path] = []
+            direct_state = root / ".omx" / "ralplan-state.json"
+            if direct_state.exists():
+                candidate_files.append(direct_state)
+            sessions_dir = root / ".omx" / "state" / "sessions"
+            if sessions_dir.exists():
+                candidate_files.extend(sorted(sessions_dir.glob("*/ralplan-state.json")))
+
+            for state_path in candidate_files:
+                try:
+                    payload = json.loads(state_path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if not self._ralplan_state_is_terminal(payload):
+                    continue
+
+                next_action = str(payload.get("next_action", "") or "").strip()
+                if not next_action:
+                    next_action = "Inspect the approved ralplan before continuing execution"
+                proof = str(payload.get("proof", "") or "").strip()
+                if not proof:
+                    proof = f"ralplan_state:{state_path}"
+                executor_session_id = str(payload.get("executor_session_id", "") or "").strip() or None
+
+                result = await self.handle_delegated_ingress_packet(
+                    {
+                        "owner": "hermes",
+                        "executor": "omx",
+                        "executor_session_id": executor_session_id,
+                        "worktree_path": str(root),
+                        "state": "handoff_needed",
+                        "usable_outcome": "handoff_needed",
+                        "close_disposition": "close",
+                        "next_action": next_action,
+                        "proof": proof,
+                    },
+                    route_name="owner-wake-file",
+                    delivery_id=str(state_path),
+                )
+                if result.get("status") == "accepted" and result.get("resolution") == "single_match":
+                    consumed += 1
+                    break
+        return consumed
+
+    async def _owner_wake_file_watcher(self, interval: int = 5) -> None:
+        while self._running:
+            try:
+                await self._consume_owner_wake_files_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("Owner wake file watcher iteration failed", exc_info=True)
+            await asyncio.sleep(interval)
 
     def _begin_direct_work_record(
         self,
@@ -2506,7 +2524,13 @@ class GatewayRunner:
             logger.error("Recovered watcher setup error: %s", e)
 
         # Start background session expiry watcher for proactive memory flushing
-        asyncio.create_task(self._session_expiry_watcher())
+        _expiry_task = asyncio.create_task(self._session_expiry_watcher())
+        self._background_tasks.add(_expiry_task)
+        _expiry_task.add_done_callback(self._background_tasks.discard)
+
+        _owner_wake_task = asyncio.create_task(self._owner_wake_file_watcher())
+        self._background_tasks.add(_owner_wake_task)
+        _owner_wake_task.add_done_callback(self._background_tasks.discard)
 
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
@@ -2515,7 +2539,9 @@ class GatewayRunner:
                 len(self._failed_platforms),
                 ", ".join(p.value for p in self._failed_platforms),
             )
-        asyncio.create_task(self._platform_reconnect_watcher())
+        _reconnect_task = asyncio.create_task(self._platform_reconnect_watcher())
+        self._background_tasks.add(_reconnect_task)
+        _reconnect_task.add_done_callback(self._background_tasks.discard)
 
         logger.info("Press Ctrl+C to stop")
         
@@ -8126,11 +8152,41 @@ class GatewayRunner:
             last_output_len = current_output_len
 
             if session.exited:
+                delegated_owner_wake_result = None
                 try:
-                    self._update_delegated_work_for_process(
+                    updated = self._update_delegated_work_for_process(
                         executor_session_id=session_id,
                         exit_code=session.exit_code,
                     )
+                    if updated:
+                        work_state_store = getattr(self, "work_state_store", None)
+                        if work_state_store is not None:
+                            resolution = work_state_store.resolve_delegated_signal_candidate(
+                                executor_session_id=session_id,
+                                live_only=False,
+                            )
+                            if resolution.get("status") == "single_match":
+                                record = resolution.get("record")
+                                if record is not None and getattr(record, "usable_outcome", None) and getattr(record, "close_disposition", None) == "close":
+                                    delegated_owner_wake_result = await self.handle_delegated_ingress_packet(
+                                        {
+                                            "work_id": record.work_id,
+                                            "owner": "hermes",
+                                            "owner_session_id": record.owner_session_id,
+                                            "executor": "omx",
+                                            "executor_session_id": record.executor_session_id,
+                                            "tmux_session": record.tmux_session,
+                                            "repo_path": record.repo_path,
+                                            "worktree_path": record.worktree_path,
+                                            "state": record.state,
+                                            "usable_outcome": record.usable_outcome,
+                                            "close_disposition": record.close_disposition,
+                                            "next_action": record.next_action,
+                                            "proof": record.proof,
+                                        },
+                                        route_name="process-watcher",
+                                        delivery_id=session_id,
+                                    )
                 except Exception:
                     logger.debug(
                         "Failed to update delegated work-state from process completion",
@@ -8139,7 +8195,12 @@ class GatewayRunner:
                 # --- Agent-triggered completion: inject synthetic message ---
                 # Skip if the agent already consumed the result via wait/poll/log
                 from tools.process_registry import process_registry as _pr_check
-                if agent_notify and not _pr_check.is_completion_consumed(session_id):
+                delegated_owner_wake_accepted = (
+                    isinstance(delegated_owner_wake_result, dict)
+                    and delegated_owner_wake_result.get("status") == "accepted"
+                    and delegated_owner_wake_result.get("resolution") == "single_match"
+                )
+                if agent_notify and not delegated_owner_wake_accepted and not _pr_check.is_completion_consumed(session_id):
                     from tools.ansi_strip import strip_ansi
                     _out = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
                     synth_text = (
@@ -8183,6 +8244,8 @@ class GatewayRunner:
 
                 # --- Normal text-only notification ---
                 # Decide whether to notify based on mode
+                if delegated_owner_wake_accepted:
+                    break
                 should_notify = (
                     notify_mode in ("all", "result")
                     or (notify_mode == "error" and session.exit_code not in (0, None))

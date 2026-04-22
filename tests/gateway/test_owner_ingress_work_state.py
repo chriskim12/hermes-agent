@@ -12,7 +12,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, SessionStore
-from gateway.work_state import WorkRecord, WorkStateStore, infer_omx_lane_from_command
+from gateway.work_state import WorkRecord, WorkStateStore
 
 
 class _CaptureAdapter:
@@ -85,12 +85,6 @@ def _make_runner(tmp_path):
     runner.work_state_store = work_state_store
     runner.adapters = {Platform.TELEGRAM: _CaptureAdapter()}
     return runner, store, work_state_store
-
-
-def test_infer_omx_lane_from_flag_prefixed_commands():
-    assert infer_omx_lane_from_command("omx --madmax --high exec -C /repo/demo --json") == "omx_exec"
-    assert infer_omx_lane_from_command("omx --madmax --high ralplan -C /repo/demo --json") == "ralplan"
-    assert infer_omx_lane_from_command("tmux new-session -d -s omx-team 'bash -lc \"cd /repo/demo && omx --madmax --high team -C /repo/demo --json\"'") == "team"
 
 
 @pytest.mark.asyncio
@@ -575,44 +569,6 @@ def test_mark_work_record_delegated_handoff_writes_executor_correlation_fields(t
     assert record.worktree_path == "/repo/demo"
     assert record.next_action == "Resume the OMX-owned delegated run"
     assert record.proof == "delegated_handoff:test"
-
-
-def test_mark_work_record_delegated_handoff_writes_planning_closed_pending_branch_fields(tmp_path):
-    runner, store, work_state_store = _make_runner(tmp_path)
-    source = _make_source()
-    session_entry = store.get_or_create_session(source)
-
-    work_id = GatewayRunner._begin_direct_work_record(
-        runner,
-        session_id=session_entry.session_id,
-        session_key=session_entry.session_key,
-        message_text="delegate this task to OMX planning",
-        platform="telegram",
-        event_message_id="msg-ralplan",
-    )
-
-    updated = GatewayRunner._mark_work_record_delegated(
-        runner,
-        work_id,
-        session_entry.session_key,
-        executor_session_id="omx-session-plan-123",
-        tmux_session="omx-plan-test",
-        repo_path="/repo/demo",
-        worktree_path="/repo/demo",
-        next_action="Wait for approved branch selection",
-        proof="delegated_handoff:ralplan",
-        current_lane="ralplan",
-        planning_gate="closed",
-        next_execution_branch="pending",
-        close_authority="hermes",
-    )
-
-    assert updated is True
-    record = work_state_store.list_records()[0]
-    assert record.current_lane == "ralplan"
-    assert record.planning_gate == "closed"
-    assert record.next_execution_branch == "pending"
-    assert record.close_authority == "hermes"
 
 
 @pytest.mark.asyncio
@@ -1304,16 +1260,20 @@ async def test_handle_delegated_ingress_packet_rejects_ambiguous_match(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_handle_delegated_ingress_packet_materializes_planning_closed_pending_branch(tmp_path):
+async def test_consume_owner_wake_files_once_wakes_owner_for_single_match_ralplan_state(tmp_path):
     runner, store, work_state_store = _make_runner(tmp_path)
     source = _make_source()
     session_entry = store.get_or_create_session(source)
+    worktree_path = tmp_path / "delegated-worktree"
+    state_dir = worktree_path / ".omx"
+    state_dir.mkdir(parents=True)
+    state_path = state_dir / "ralplan-state.json"
     now = datetime.now(timezone.utc)
     work_state_store.upsert(
         WorkRecord(
-            work_id="wk-delegated-plan-close-1",
-            title="delegated planning close",
-            objective="materialize planning-closed as a real lane transition",
+            work_id="wk-ralplan-single-1",
+            title="delegated ralplan work",
+            objective="wake the owner thread when ralplan reaches an approved terminal state",
             owner="hermes",
             executor="omx",
             mode="delegated",
@@ -1321,108 +1281,131 @@ async def test_handle_delegated_ingress_packet_materializes_planning_closed_pend
             state="running",
             started_at=now,
             last_progress_at=now,
-            next_action="Wait for planning review",
-            executor_session_id="omx-plan-close-1",
-            tmux_session="omx-plan-close",
+            next_action="Wait for ralplan approval",
+            executor_session_id="omx-ralplan-session-1",
+            tmux_session="omx-ralplan-single",
             repo_path="/repo/demo",
-            worktree_path="/repo/demo",
+            worktree_path=str(worktree_path),
             proof="delegated_handoff:test",
-            current_lane="ralplan",
-            planning_gate="open",
-            next_execution_branch="none",
-            close_authority="hermes",
         )
     )
-
-    result = await GatewayRunner.handle_delegated_ingress_packet(
-        runner,
-        {
-            "owner": "hermes",
-            "state": "blocked",
-            "normalized_event": "blocked",
-            "executor": "omx",
-            "executor_session_id": "omx-plan-close-1",
-            "tmux_session": "omx-plan-close",
-            "repo_path": "/repo/demo",
-            "worktree_path": "/repo/demo",
-            "current_lane": "ralplan",
-            "planning_gate": "closed",
-            "next_execution_branch": "pending",
-            "close_authority": "hermes",
-            "next_action": "Select ralph or team after approval",
-            "proof": "clawhip:planning-approved",
-        },
-        route_name="delegated-ingress",
-        delivery_id="delegated-plan-close-001",
+    state_path.write_text(
+        json.dumps(
+            {
+                "approved": True,
+                "current_phase": "complete",
+                "executor_session_id": "omx-ralplan-session-1",
+                "next_action": "Inspect the approved ralplan before continuing execution",
+                "proof": "ralplan-state:approved",
+            }
+        ),
+        encoding="utf-8",
     )
 
-    assert result["status"] == "accepted"
+    consumed = await GatewayRunner._consume_owner_wake_files_once(runner)
+
+    assert consumed == 1
+    capture_adapter = runner.adapters[Platform.TELEGRAM]
+    assert len(capture_adapter.events) == 1
+    event = capture_adapter.events[0]
+    assert event.internal is True
+    assert "wk-ralplan-single-1" in event.text
+    assert "Inspect the approved ralplan before continuing execution" in event.text
+    assert "ralplan-state:approved" in event.text
+
     record = work_state_store.resolve_delegated_signal_candidate(
-        work_id="wk-delegated-plan-close-1",
+        work_id="wk-ralplan-single-1",
         live_only=False,
     )["record"]
-    assert record.current_lane == "ralplan"
-    assert record.planning_gate == "closed"
-    assert record.next_execution_branch == "pending"
-    assert record.close_authority == "hermes"
+    assert record.state == "handoff_needed"
+    assert record.close_disposition == "close"
+    assert record.usable_outcome == "handoff_needed"
 
 
 @pytest.mark.asyncio
-async def test_handle_delegated_ingress_packet_rejects_invalid_lane_transition(tmp_path):
+@pytest.mark.parametrize("case_name", ["missing", "ambiguous"])
+async def test_consume_owner_wake_files_once_fails_closed_for_ralplan_state_without_single_match(
+    tmp_path,
+    case_name,
+):
     runner, store, work_state_store = _make_runner(tmp_path)
     source = _make_source()
     session_entry = store.get_or_create_session(source)
+    worktree_path = tmp_path / f"delegated-worktree-{case_name}"
+    state_dir = worktree_path / ".omx"
+    state_dir.mkdir(parents=True)
+    state_path = state_dir / "ralplan-state.json"
     now = datetime.now(timezone.utc)
-    work_state_store.upsert(
-        WorkRecord(
-            work_id="wk-delegated-invalid-transition-1",
-            title="delegated invalid transition",
-            objective="reject lane truth that collapses back to generic delegated state",
-            owner="hermes",
-            executor="omx",
-            mode="delegated",
-            owner_session_id=session_entry.session_key,
-            state="running",
-            started_at=now,
-            last_progress_at=now,
-            next_action="Wait for OMX signal",
-            executor_session_id="omx-invalid-1",
-            tmux_session="omx-invalid",
-            repo_path="/repo/demo",
-            worktree_path="/repo/demo",
-            proof="delegated_handoff:test",
-            current_lane="ralplan",
-            planning_gate="open",
-            next_execution_branch="none",
-            close_authority="hermes",
+
+    if case_name == "missing":
+        work_state_store.upsert(
+            WorkRecord(
+                work_id="wk-ralplan-missing-1",
+                title="delegated ralplan work missing correlation",
+                objective="fail closed when the ralplan wake packet does not match a live delegated record",
+                owner="hermes",
+                executor="omx",
+                mode="delegated",
+                owner_session_id=session_entry.session_key,
+                state="running",
+                started_at=now,
+                last_progress_at=now,
+                next_action="Wait for ralplan approval",
+                executor_session_id="omx-ralplan-session-live",
+                tmux_session="omx-ralplan-missing",
+                repo_path="/repo/demo",
+                worktree_path=str(worktree_path),
+                proof="delegated_handoff:test",
+            )
         )
-    )
+        payload = {
+            "approved": True,
+            "current_phase": "completed",
+            "executor_session_id": "omx-ralplan-session-other",
+            "next_action": "Do not wake when executor correlation misses",
+            "proof": "ralplan-state:missing",
+        }
+    else:
+        for idx in (1, 2):
+            work_state_store.upsert(
+                WorkRecord(
+                    work_id=f"wk-ralplan-ambiguous-{idx}",
+                    title="delegated ralplan work ambiguous correlation",
+                    objective="fail closed when the ralplan wake packet resolves to multiple live delegated records",
+                    owner="hermes",
+                    executor="omx",
+                    mode="delegated",
+                    owner_session_id=session_entry.session_key,
+                    state="running",
+                    started_at=now,
+                    last_progress_at=now,
+                    next_action="Wait for ralplan approval",
+                    executor_session_id=f"omx-ralplan-session-{idx}",
+                    tmux_session=f"omx-ralplan-ambiguous-{idx}",
+                    repo_path="/repo/demo",
+                    worktree_path=str(worktree_path),
+                    proof="delegated_handoff:test",
+                )
+            )
+        payload = {
+            "approved": True,
+            "current_phase": "complete",
+            "next_action": "Do not broad-wake ambiguous ralplan work",
+            "proof": "ralplan-state:ambiguous",
+        }
 
-    result = await GatewayRunner.handle_delegated_ingress_packet(
-        runner,
-        {
-            "owner": "hermes",
-            "state": "blocked",
-            "normalized_event": "blocked",
-            "executor": "omx",
-            "executor_session_id": "omx-invalid-1",
-            "tmux_session": "omx-invalid",
-            "repo_path": "/repo/demo",
-            "worktree_path": "/repo/demo",
-            "current_lane": "plan",
-            "planning_gate": "closed",
-            "next_execution_branch": "pending",
-            "close_authority": "hermes",
-            "next_action": "This should be rejected",
-            "proof": "clawhip:invalid-transition",
-        },
-        route_name="delegated-ingress",
-        delivery_id="delegated-invalid-001",
-    )
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    assert result["status"] == "reject"
-    assert result["reason"] == "invalid_delegated_lane_transition"
-    assert result["http_status"] == 400
+    consumed = await GatewayRunner._consume_owner_wake_files_once(runner)
+
+    assert consumed == 0
+    capture_adapter = runner.adapters[Platform.TELEGRAM]
+    assert capture_adapter.events == []
+    records = {
+        record.work_id: record
+        for record in work_state_store.list_records()
+    }
+    assert all(record.state == "running" for record in records.values())
 
 
 def test_resolve_delegated_signal_candidate_refreshes_external_store_updates(tmp_path):
@@ -1549,16 +1532,22 @@ def test_update_delegated_work_for_process_marks_failed_on_nonzero_exit(tmp_path
     assert record.next_action == "Inspect runtime contamination before any retry or handoff"
 
 
-def test_update_delegated_work_for_process_preserves_lane_truth_on_non_success(tmp_path):
+@pytest.mark.asyncio
+async def test_run_process_watcher_routes_process_completion_through_delegated_owner_wake_path(
+    tmp_path,
+    monkeypatch,
+):
+    from tools.process_registry import process_registry
+
     runner, store, work_state_store = _make_runner(tmp_path)
     source = _make_source()
     session_entry = store.get_or_create_session(source)
     now = datetime.now(timezone.utc)
     work_state_store.upsert(
         WorkRecord(
-            work_id="wk-delegated-team-fail-1",
-            title="delegated team fail",
-            objective="terminal non-success should not erase lane truth",
+            work_id="wk-process-path-1",
+            title="delegated process completion",
+            objective="route process completion through the same delegated owner-wake mechanism",
             owner="hermes",
             executor="omx",
             mode="delegated",
@@ -1566,35 +1555,63 @@ def test_update_delegated_work_for_process_preserves_lane_truth_on_non_success(t
             state="running",
             started_at=now,
             last_progress_at=now,
-            next_action="Wait for team branch completion",
-            executor_session_id="proc-team-fail-1",
-            tmux_session="omx-team-fail",
+            next_action="Wait for OMX completion",
+            executor_session_id="proc-owner-wake-1",
+            tmux_session="omx-process-path",
             repo_path="/repo/demo",
-            worktree_path="/repo/demo",
+            worktree_path="/repo/demo/.worktrees/path-1",
             proof="delegated_handoff:test",
-            current_lane="team",
-            planning_gate="closed",
-            next_execution_branch="team",
-            close_authority="hermes",
         )
     )
 
-    updated = GatewayRunner._update_delegated_work_for_process(
+    class _ExitedProcess:
+        output_buffer = ""
+        exited = True
+        exit_code = 0
+        command = "omx ralph"
+
+    delegated_packets = []
+
+    async def _fake_handle_delegated_ingress_packet(payload, *, route_name="", delivery_id=None):
+        delegated_packets.append(
+            {
+                "payload": payload,
+                "route_name": route_name,
+                "delivery_id": delivery_id,
+            }
+        )
+        return {"status": "accepted", "resolution": "single_match"}
+
+    monkeypatch.setattr(runner, "_load_background_notifications_mode", lambda: "result")
+    monkeypatch.setattr(runner, "handle_delegated_ingress_packet", _fake_handle_delegated_ingress_packet)
+    monkeypatch.setattr(process_registry, "get", lambda session_id: _ExitedProcess() if session_id == "proc-owner-wake-1" else None)
+
+    await GatewayRunner._run_process_watcher(
         runner,
-        executor_session_id="proc-team-fail-1",
-        exit_code=17,
+        {
+            "session_id": "proc-owner-wake-1",
+            "check_interval": 0,
+            "session_key": session_entry.session_key,
+            "notify_on_complete": False,
+            "platform": "",
+            "chat_id": "",
+            "thread_id": "",
+            "user_id": "",
+            "user_name": "",
+        },
     )
 
-    assert updated is True
-    record = work_state_store.resolve_delegated_signal_candidate(
-        work_id="wk-delegated-team-fail-1",
-        live_only=False,
-    )["record"]
-    assert record.state == "failed"
-    assert record.current_lane == "team"
-    assert record.planning_gate == "closed"
-    assert record.next_execution_branch == "team"
-    assert record.close_authority == "hermes"
+    assert len(delegated_packets) == 1
+    packet = delegated_packets[0]["payload"]
+    assert delegated_packets[0]["route_name"] == "process-watcher"
+    assert delegated_packets[0]["delivery_id"] == "proc-owner-wake-1"
+    assert packet["work_id"] == "wk-process-path-1"
+    assert packet["owner_session_id"] == session_entry.session_key
+    assert packet["executor_session_id"] == "proc-owner-wake-1"
+    assert packet["state"] == "handoff_needed"
+    assert packet["usable_outcome"] == "no_progress_theater"
+    assert packet["close_disposition"] == "close"
+    assert packet["proof"] == "background_process_exit:0"
 
 
 def test_finish_direct_work_record_does_not_overwrite_delegated_record_state_or_proof(tmp_path):
