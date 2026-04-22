@@ -756,6 +756,94 @@ def _path_is_within_root(path: Path, root: Path) -> bool:
         return False
 
 
+def _normalize_repo_path(path: str | Path) -> str:
+    """Return a canonical absolute path for workspace/base-checkout comparisons."""
+    return str(Path(path).expanduser().resolve())
+
+
+def _validate_mutable_workspace_paths(
+    base_checkout_path: str | Path,
+    workspace_path: str | Path,
+    *,
+    executor_workdir: str | Path | None = None,
+) -> Optional[str]:
+    """Reject base-checkout reuse for mutable workspace or executor lanes."""
+    base = _normalize_repo_path(base_checkout_path)
+    workspace = _normalize_repo_path(workspace_path)
+    if base == workspace:
+        return "Mutable workspace path must differ from the base checkout path."
+
+    if executor_workdir is not None:
+        exec_dir = _normalize_repo_path(executor_workdir)
+        if exec_dir == base:
+            return "Executor workdir must not point at the base checkout path."
+
+    return None
+
+
+def _workspace_close_residue_report(info: Dict[str, str]) -> Dict[str, Any]:
+    """Return a residue report after worktree cleanup."""
+    import subprocess
+
+    wt_path = _normalize_repo_path(info["path"])
+    branch = info["branch"]
+    repo_root = _normalize_repo_path(info["repo_root"])
+
+    categories: list[str] = []
+    details: dict[str, Any] = {}
+
+    if Path(wt_path).exists():
+        categories.append("workspace_filesystem")
+        details["workspace_path"] = wt_path
+
+    try:
+        wt_result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, timeout=10, cwd=repo_root,
+        )
+        wt_stdout = wt_result.stdout or ""
+        if wt_path in wt_stdout:
+            categories.append("worktree_registration")
+            details["registered_worktree"] = wt_path
+        if "prunable" in wt_stdout:
+            categories.append("prunable_worktree_registration")
+            details["prunable_entries_present"] = True
+    except Exception as exc:
+        categories.append("worktree_registration_check_failed")
+        details["worktree_registration_error"] = str(exc)
+
+    try:
+        branch_result = subprocess.run(
+            ["git", "branch", "--list", branch],
+            capture_output=True, text=True, timeout=10, cwd=repo_root,
+        )
+        if branch_result.stdout.strip():
+            categories.append("branch_residue")
+            details["branch"] = branch
+    except Exception as exc:
+        categories.append("branch_check_failed")
+        details["branch_error"] = str(exc)
+
+    try:
+        status_result = subprocess.run(
+            ["git", "status", "--short"],
+            capture_output=True, text=True, timeout=10, cwd=repo_root,
+        )
+        status_lines = [line for line in status_result.stdout.splitlines() if line.strip()]
+        if status_lines:
+            categories.append("base_checkout_dirtiness")
+            details["status_lines"] = status_lines
+    except Exception as exc:
+        categories.append("base_checkout_status_failed")
+        details["status_error"] = str(exc)
+
+    return {
+        "clean": not categories,
+        "categories": categories,
+        "details": details,
+    }
+
+
 def _setup_worktree(repo_root: str = None) -> Optional[Dict[str, str]]:
     """Create an isolated git worktree for this CLI session.
 
@@ -779,18 +867,25 @@ def _setup_worktree(repo_root: str = None) -> Optional[Dict[str, str]]:
 
     wt_path = worktrees_dir / wt_name
 
-    # Ensure .worktrees/ is in .gitignore
-    gitignore = Path(repo_root) / ".gitignore"
+    _path_error = _validate_mutable_workspace_paths(repo_root, wt_path)
+    if _path_error:
+        print(f"\033[31m✗ Failed to create worktree: {_path_error}\033[0m")
+        return None
+
+    # Keep managed worktree artifacts out of git status without mutating the
+    # shared checkout.
+    exclude_file = Path(repo_root) / ".git" / "info" / "exclude"
     _ignore_entry = ".worktrees/"
     try:
-        existing = gitignore.read_text() if gitignore.exists() else ""
+        existing = exclude_file.read_text() if exclude_file.exists() else ""
         if _ignore_entry not in existing.splitlines():
-            with open(gitignore, "a") as f:
+            exclude_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(exclude_file, "a") as f:
                 if existing and not existing.endswith("\n"):
                     f.write("\n")
                 f.write(f"{_ignore_entry}\n")
     except Exception as e:
-        logger.debug("Could not update .gitignore: %s", e)
+        logger.debug("Could not update .git/info/exclude: %s", e)
 
     # Create the worktree
     try:
@@ -855,7 +950,7 @@ def _setup_worktree(repo_root: str = None) -> Optional[Dict[str, str]]:
     return info
 
 
-def _cleanup_worktree(info: Dict[str, str] = None) -> None:
+def _cleanup_worktree(info: Dict[str, str] = None) -> bool:
     """Remove a worktree and its branch on exit.
 
     Preserves the worktree only if it has unpushed commits (real work
@@ -866,7 +961,7 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     global _active_worktree
     info = info or _active_worktree
     if not info:
-        return
+        return False
 
     import subprocess
 
@@ -875,7 +970,7 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     repo_root = info["repo_root"]
 
     if not Path(wt_path).exists():
-        return
+        return False
 
     # Check for unpushed commits — commits reachable from HEAD but not
     # from any remote branch.  These represent real work the agent did
@@ -894,7 +989,7 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
         print(f"\n\033[33m⚠ Worktree has unpushed commits, keeping: {wt_path}\033[0m")
         print(f"  To clean up manually: git worktree remove --force {wt_path}")
         _active_worktree = None
-        return
+        return False
 
     # Remove worktree (even if working tree is dirty — uncommitted
     # changes without unpushed commits are just artifacts)
@@ -916,7 +1011,13 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
         logger.debug("Failed to delete branch %s: %s", branch, e)
 
     _active_worktree = None
+    residue_report = _workspace_close_residue_report(info)
+    if not residue_report["clean"]:
+        print(f"\033[33m⚠ Worktree cleanup left residue: {', '.join(residue_report['categories'])}\033[0m")
+        return False
+
     print(f"\033[32m✓ Worktree cleaned up: {wt_path}\033[0m")
+    return True
 
 
 def _run_state_db_auto_maintenance(session_db) -> None:
