@@ -18,6 +18,10 @@ from tools.file_operations import (
 )
 from tools import file_state
 from agent.redact import redact_sensitive_text
+from tools.worktree_policy import (
+    build_dedicated_worktree_error,
+    requires_dedicated_worktree_for_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -616,8 +620,25 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
     return None
 
 
+def _resolve_policy_context(task_id: str) -> tuple[str | None, str | None]:
+    """Return (cwd_hint, host_cwd_hint) for worktree policy checks."""
+    try:
+        from tools.terminal_tool import _get_env_config, _task_env_overrides
+
+        config = _get_env_config()
+        overrides = _task_env_overrides.get(task_id, {})
+        cwd_hint = overrides.get("cwd") or config.get("cwd")
+        host_cwd_hint = config.get("host_cwd")
+        return cwd_hint, host_cwd_hint
+    except Exception:
+        return None, None
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
     """Write content to a file."""
+    cwd_hint, host_cwd_hint = _resolve_policy_context(task_id)
+    if requires_dedicated_worktree_for_path(path, cwd_hint=cwd_hint, host_cwd_hint=host_cwd_hint):
+        return tool_error(build_dedicated_worktree_error(path))
     sensitive_err = _check_sensitive_path(path)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -672,6 +693,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
                task_id: str = "default") -> str:
     """Patch a file using replace mode or V4A patch format."""
+    cwd_hint, host_cwd_hint = _resolve_policy_context(task_id)
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
     if path:
@@ -681,6 +703,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         for _m in _re.finditer(r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
             _paths_to_check.append(_m.group(1).strip())
     for _p in _paths_to_check:
+        if requires_dedicated_worktree_for_path(_p, cwd_hint=cwd_hint, host_cwd_hint=host_cwd_hint):
+            return tool_error(build_dedicated_worktree_error(_p))
         sensitive_err = _check_sensitive_path(_p)
         if sensitive_err:
             return tool_error(sensitive_err)
