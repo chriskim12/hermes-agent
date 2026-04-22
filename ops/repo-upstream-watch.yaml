@@ -14,13 +14,14 @@ repos:
     base_branch: main
     smoke_test: npm test
     apply_window: manual-review
-    bootstrap_required: true
+    bootstrap_required: false
     notes:
       - initial baseline catch-up was reviewed before broad auto-apply
       - 2026-04-20: baseline fast-forward completed to v0.14.0 and the tree is clean/tracking upstream/main
       - 2026-04-20: ARM64 hydration-fixture blocker was fixed on branch `ch-122-arm64-smoke-blocker`; `npm test` passes there on this host
       - 2026-04-20: remote alias was normalized from `origin` to `upstream` on this checkout to reduce lane-name ambiguity
-      - keep bootstrap_required until that fix is landed/reconciled onto the mainline update lane
+      - 2026-04-22: CH-123 absorbed the ARM64 hydration-fixture fix onto local canonical `main` at `7c6c28be`; `npm run build`, `npm run test:explore`, and `npm test` all passed on the canonical-closeout worktree at the same commit
+      - 2026-04-22: bootstrap_required cleared after the local canonical lane absorbed the fix; current steady-state gate verdict is expected to reflect the local carry relative to `upstream/main`, not the old bootstrap block
       - fast-forward-only apply remains the intended steady-state lane after bootstrap clears
   - name: clawhip
     path: /home/ubuntu/repos/clawhip
