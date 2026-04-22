@@ -374,6 +374,29 @@ class TestSendVoiceReply:
         assert call_args.kwargs.get("chat_id") == "123"
 
     @pytest.mark.asyncio
+    async def test_voice_channel_playback_failure_returns_false(self, runner):
+        mock_adapter = MagicMock()
+        mock_adapter.is_in_voice_channel = MagicMock(return_value=True)
+        mock_adapter.play_in_voice_channel = AsyncMock(return_value=False)
+        mock_adapter.send_voice = AsyncMock()
+        event = _make_event(platform="discord")
+        event.raw_message = SimpleNamespace(guild_id=111, guild=None)
+        runner.adapters[event.source.platform] = mock_adapter
+
+        tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
+
+        with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result), \
+             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("os.path.isfile", return_value=True), \
+             patch("os.unlink"), \
+             patch("os.makedirs"):
+            result = await runner._send_voice_reply(event, "Hello world")
+
+        assert result is False
+        mock_adapter.play_in_voice_channel.assert_awaited_once_with(111, "/tmp/test.ogg")
+        mock_adapter.send_voice.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_empty_text_after_strip_skips(self, runner):
         event = _make_event()
 
@@ -2650,6 +2673,10 @@ class TestGeneratedYuukaTtsPolicy:
 
     def test_blocks_technical_response(self, runner):
         event = self._event("좋아요. `pytest tests/ -q`로 다시 확인해요.")
+        assert runner._should_send_generated_tts_reply(event, event.text, []) is False
+
+    def test_blocks_plain_text_technical_response(self, runner):
+        event = self._event("좋아요. API 키 확인하고 gateway 재시작해볼게요.")
         assert runner._should_send_generated_tts_reply(event, event.text, []) is False
 
     def test_blocks_response_over_soft_cap(self, runner):

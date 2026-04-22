@@ -6003,6 +6003,15 @@ class GatewayRunner:
             return False
 
         lowered = cleaned.lower()
+        technical_hints = (
+            "api", "gateway", "restart", "pytest", "traceback", "stack trace", "token",
+            "commit", "branch", "diff", "port", "config", "env", "log", "logs",
+            "재시작", "로그", "포트", "토큰", "브랜치", "커밋", "설정", "환경변수",
+            "테스트", "예외", "에러", "오류",
+        )
+        if any(hint in lowered for hint in technical_hints):
+            return False
+
         allow_hints = (
             "좋", "잘", "감사", "고마", "수고", "조심", "쉬", "늦", "계획", "정리",
             "시작", "성공", "알겠", "확인", "맞아", "괜찮", "thanks", "thank", "good",
@@ -6131,8 +6140,8 @@ class GatewayRunner:
                     and hasattr(adapter, "play_in_voice_channel")
                     and hasattr(adapter, "is_in_voice_channel")
                     and adapter.is_in_voice_channel(guild_id)):
-                await adapter.play_in_voice_channel(guild_id, actual_path)
-                return True
+                played = await adapter.play_in_voice_channel(guild_id, actual_path)
+                return bool(played)
             if adapter and hasattr(adapter, "send_voice"):
                 send_kwargs: Dict[str, Any] = {
                     "chat_id": event.source.chat_id,
