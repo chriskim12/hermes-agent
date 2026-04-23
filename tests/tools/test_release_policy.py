@@ -92,7 +92,8 @@ def test_dailychingu_profile_resolves_push_and_release_authority(tmp_path):
 
     assert push_resolution.supported is True
     assert push_resolution.approval_token == "push 승인"
-    assert "develop absorption" in push_resolution.workflow_summary
+    assert "integrates the task result into develop" in push_resolution.workflow_summary
+    assert "merge/ff included" in push_resolution.workflow_summary
     assert release_resolution.supported is True
     assert release_resolution.approval_token == "release 승인"
     assert "develop -> main" in release_resolution.workflow_summary
