@@ -176,6 +176,120 @@ def test_terminal_tool_allows_in_review_transition_with_valid_review_verdict_han
     mock_env.execute.assert_called_once()
 
 
+def test_terminal_tool_blocks_non_profile_push_authority_handoff(tmp_path):
+    from tools.terminal_tool import terminal_tool
+
+    repo = _init_git_repo(tmp_path / "repo")
+    mock_env = MagicMock()
+    mock_env.execute.return_value = {"output": "should not run", "returncode": 0}
+    handoff = "\n".join(
+        [
+            "HANDOFF_CHANGED: Added workflow hooks.",
+            "HANDOFF_VERIFIED: Focused tests passed.",
+            "HANDOFF_RISKS: runtime proof pending.",
+            "HANDOFF_DECISION: push authority",
+        ]
+    )
+    command = _in_review_command(handoff)
+
+    with patch("tools.terminal_tool._get_env_config", return_value={"env_type": "local", "env_name": "default", "cwd": str(repo), "timeout": 180}), \
+         patch("tools.terminal_tool._start_cleanup_thread"), \
+         patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
+         patch("tools.terminal_tool._last_activity", {"default": 0}), \
+         patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
+        result = json.loads(terminal_tool(command=command, workdir=str(repo)))
+
+    assert result["exit_code"] == -1
+    assert result["status"] == "blocked"
+    assert "push authority semantics" in result["error"].lower()
+    mock_env.execute.assert_not_called()
+
+
+def test_terminal_tool_blocks_non_profile_release_authority_handoff(tmp_path):
+    from tools.terminal_tool import terminal_tool
+
+    repo = _init_git_repo(tmp_path / "repo")
+    mock_env = MagicMock()
+    mock_env.execute.return_value = {"output": "should not run", "returncode": 0}
+    handoff = "\n".join(
+        [
+            "HANDOFF_CHANGED: Added workflow hooks.",
+            "HANDOFF_VERIFIED: Focused tests passed.",
+            "HANDOFF_RISKS: runtime proof pending.",
+            "HANDOFF_DECISION: release authority",
+        ]
+    )
+    command = _in_review_command(handoff)
+
+    with patch("tools.terminal_tool._get_env_config", return_value={"env_type": "local", "env_name": "default", "cwd": str(repo), "timeout": 180}), \
+         patch("tools.terminal_tool._start_cleanup_thread"), \
+         patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
+         patch("tools.terminal_tool._last_activity", {"default": 0}), \
+         patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
+        result = json.loads(terminal_tool(command=command, workdir=str(repo)))
+
+    assert result["exit_code"] == -1
+    assert result["status"] == "blocked"
+    assert "release authority semantics" in result["error"].lower()
+    mock_env.execute.assert_not_called()
+
+
+def test_terminal_tool_allows_dailychingu_push_authority_handoff(tmp_path):
+    from tools.terminal_tool import terminal_tool
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+    mock_env = MagicMock()
+    mock_env.execute.return_value = {"output": "ok", "returncode": 0}
+    handoff = "\n".join(
+        [
+            "HANDOFF_CHANGED: Added workflow hooks.",
+            "HANDOFF_VERIFIED: Focused tests passed.",
+            "HANDOFF_RISKS: runtime proof pending.",
+            "HANDOFF_DECISION: push authority",
+        ]
+    )
+    command = _in_review_command(handoff)
+
+    with patch("tools.terminal_tool._get_env_config", return_value={"env_type": "local", "env_name": "default", "cwd": str(repo), "timeout": 180}), \
+         patch("tools.terminal_tool._start_cleanup_thread"), \
+         patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
+         patch("tools.terminal_tool._last_activity", {"default": 0}), \
+         patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
+        result = json.loads(terminal_tool(command=command, workdir=str(repo)))
+
+    assert result["exit_code"] == 0
+    assert result["output"] == "ok"
+    mock_env.execute.assert_called_once()
+
+
+def test_terminal_tool_allows_dailychingu_release_authority_handoff(tmp_path):
+    from tools.terminal_tool import terminal_tool
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+    mock_env = MagicMock()
+    mock_env.execute.return_value = {"output": "ok", "returncode": 0}
+    handoff = "\n".join(
+        [
+            "HANDOFF_CHANGED: Added workflow hooks.",
+            "HANDOFF_VERIFIED: Focused tests passed.",
+            "HANDOFF_RISKS: runtime proof pending.",
+            "HANDOFF_DECISION: release authority",
+        ]
+    )
+    command = _in_review_command(handoff)
+
+    with patch("tools.terminal_tool._get_env_config", return_value={"env_type": "local", "env_name": "default", "cwd": str(repo), "timeout": 180}), \
+         patch("tools.terminal_tool._start_cleanup_thread"), \
+         patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
+         patch("tools.terminal_tool._last_activity", {"default": 0}), \
+         patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
+        result = json.loads(terminal_tool(command=command, workdir=str(repo)))
+
+    assert result["exit_code"] == 0
+    assert result["output"] == "ok"
+    mock_env.execute.assert_called_once()
+
+
 
 def test_dailychingu_done_allows_clean_develop_with_unrelated_review_lane(tmp_path):
     from tools.linear_close_policy import linear_done_close_blockers
