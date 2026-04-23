@@ -76,3 +76,41 @@ def test_terminal_tool_blocks_dailychingu_main_push_when_develop_not_merged(tmp_
     assert result["status"] == "blocked"
     assert "develop -> main" in result["error"]
     mock_env.execute.assert_not_called()
+
+
+def test_dailychingu_profile_resolves_push_and_release_authority(tmp_path):
+    from tools.repo_workflow_profile import (
+        PUSH_AUTHORITY,
+        RELEASE_AUTHORITY,
+        resolve_workflow_handoff_authority,
+    )
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+
+    push_resolution = resolve_workflow_handoff_authority(str(repo), PUSH_AUTHORITY)
+    release_resolution = resolve_workflow_handoff_authority(str(repo), RELEASE_AUTHORITY)
+
+    assert push_resolution.supported is True
+    assert push_resolution.approval_token == "push 승인"
+    assert "develop absorption" in push_resolution.workflow_summary
+    assert release_resolution.supported is True
+    assert release_resolution.approval_token == "release 승인"
+    assert "develop -> main" in release_resolution.workflow_summary
+
+
+def test_non_profile_repo_does_not_inherit_dailychingu_push_or_release_authority(tmp_path):
+    from tools.repo_workflow_profile import (
+        PUSH_AUTHORITY,
+        RELEASE_AUTHORITY,
+        resolve_workflow_handoff_authority,
+    )
+
+    repo = _init_git_repo(tmp_path / "repo")
+
+    push_resolution = resolve_workflow_handoff_authority(str(repo), PUSH_AUTHORITY)
+    release_resolution = resolve_workflow_handoff_authority(str(repo), RELEASE_AUTHORITY)
+
+    assert push_resolution.supported is False
+    assert "fail-closed" in push_resolution.reason.lower()
+    assert release_resolution.supported is False
+    assert "fail-closed" in release_resolution.reason.lower()
