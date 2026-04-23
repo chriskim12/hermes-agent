@@ -317,6 +317,16 @@ def _reset_cached_sudo_passwords() -> None:
 from tools.approval import (
     check_all_command_guards as _check_all_guards_impl,
 )
+from tools.linear_close_policy import (
+    build_linear_done_block_error,
+    build_linear_in_review_block_error,
+)
+from tools.release_policy import build_release_push_block_error
+from tools.worktree_policy import (
+    build_dedicated_worktree_error,
+    command_is_repo_mutating,
+    requires_dedicated_worktree_for_path,
+)
 
 
 def _check_all_guards(command: str, env_type: str) -> dict:
@@ -1873,6 +1883,43 @@ def terminal_tool(
                     "error": workdir_error,
                     "status": "blocked"
                 }, ensure_ascii=False)
+
+        effective_workdir = workdir or cwd
+        linear_in_review_error = build_linear_in_review_block_error(effective_workdir, command)
+        if linear_in_review_error:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": linear_in_review_error,
+                "status": "blocked",
+            }, ensure_ascii=False)
+        linear_done_error = build_linear_done_block_error(effective_workdir, command)
+        if linear_done_error:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": linear_done_error,
+                "status": "blocked",
+            }, ensure_ascii=False)
+        release_push_error = build_release_push_block_error(effective_workdir, command)
+        if release_push_error:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": release_push_error,
+                "status": "blocked",
+            }, ensure_ascii=False)
+        if command_is_repo_mutating(command) and requires_dedicated_worktree_for_path(
+            effective_workdir,
+            cwd_hint=effective_workdir,
+            host_cwd_hint=config.get("host_cwd"),
+        ):
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": build_dedicated_worktree_error(effective_workdir),
+                "status": "blocked",
+            }, ensure_ascii=False)
 
         # Prepare command for execution
         pty_disabled_reason = None
