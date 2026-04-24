@@ -112,6 +112,10 @@ DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
 DEFAULT_GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
 DEFAULT_GEMINI_TTS_VOICE = "Kore"
 DEFAULT_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+DEFAULT_NORMALIZE_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
+DEFAULT_NORMALIZE_SUFFIX = ".normalized"
+DEFAULT_NORMALIZE_TIMEOUT_SECONDS = 30
+DEFAULT_NORMALIZE_PLATFORMS = ("discord",)
 # PCM output specs for Gemini TTS (fixed by the API)
 GEMINI_TTS_SAMPLE_RATE = 24000
 GEMINI_TTS_CHANNELS = 1
@@ -239,6 +243,120 @@ def _has_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+def _get_normalization_config(tts_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return normalized audio postprocess settings from ``tts.postprocess.normalize``."""
+    postprocess = tts_config.get("postprocess")
+    if not isinstance(postprocess, dict):
+        postprocess = {}
+    normalize = postprocess.get("normalize")
+    if not isinstance(normalize, dict):
+        normalize = {}
+
+    enabled = normalize.get("enabled", True)
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() not in {"0", "false", "no", "off"}
+    else:
+        enabled = bool(enabled)
+
+    raw_platforms = normalize.get("platforms", DEFAULT_NORMALIZE_PLATFORMS)
+    if isinstance(raw_platforms, str):
+        raw_platforms = [raw_platforms]
+    if not isinstance(raw_platforms, (list, tuple, set)):
+        raw_platforms = DEFAULT_NORMALIZE_PLATFORMS
+    platforms = [
+        str(platform).strip().lower()
+        for platform in raw_platforms
+        if str(platform).strip()
+    ] or list(DEFAULT_NORMALIZE_PLATFORMS)
+
+    filter_value = normalize.get("filter")
+    if not isinstance(filter_value, str) or not filter_value.strip():
+        filter_value = DEFAULT_NORMALIZE_FILTER
+
+    timeout_seconds = normalize.get("timeout_seconds", DEFAULT_NORMALIZE_TIMEOUT_SECONDS)
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
+        timeout_seconds = DEFAULT_NORMALIZE_TIMEOUT_SECONDS
+
+    suffix = normalize.get("suffix", DEFAULT_NORMALIZE_SUFFIX)
+    if not isinstance(suffix, str) or not suffix.strip():
+        suffix = DEFAULT_NORMALIZE_SUFFIX
+
+    return {
+        "enabled": enabled,
+        "platforms": platforms,
+        "filter": filter_value.strip(),
+        "timeout_seconds": timeout_seconds,
+        "suffix": suffix,
+    }
+
+
+def _should_normalize_generated_audio(file_path: str, platform: str, tts_config: Dict[str, Any]) -> bool:
+    """Whether the generated file should be loudness-normalized before delivery."""
+    if not file_path.lower().endswith(".mp3"):
+        return False
+    normalize_cfg = _get_normalization_config(tts_config)
+    return normalize_cfg["enabled"] and platform.lower() in normalize_cfg["platforms"]
+
+
+def _normalized_audio_output_path(file_path: str, suffix: str) -> str:
+    """Build the normalized output path for a generated MP3."""
+    path = Path(file_path)
+    return str(path.with_name(f"{path.stem}{suffix}{path.suffix}"))
+
+
+def _normalize_generated_audio(mp3_path: str, tts_config: Dict[str, Any]) -> Optional[str]:
+    """Normalize a generated MP3 via ffmpeg loudnorm, returning the new path on success."""
+    normalize_cfg = _get_normalization_config(tts_config)
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        logger.warning("Audio normalization skipped for %s: ffmpeg not found", mp3_path)
+        return None
+
+    try:
+        normalized_path = _normalized_audio_output_path(mp3_path, normalize_cfg["suffix"])
+        result = subprocess.run(
+            [
+                ffmpeg,
+                "-i",
+                mp3_path,
+                "-af",
+                normalize_cfg["filter"],
+                normalized_path,
+                "-y",
+            ],
+            capture_output=True,
+            timeout=normalize_cfg["timeout_seconds"],
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="ignore")[:200]
+            logger.warning(
+                "Audio normalization failed for %s with return code %d: %s",
+                mp3_path,
+                result.returncode,
+                stderr,
+            )
+            return None
+        if os.path.exists(normalized_path) and os.path.getsize(normalized_path) > 0:
+            logger.info("Audio normalization succeeded: %s -> %s", mp3_path, normalized_path)
+            return normalized_path
+        logger.warning(
+            "Audio normalization failed for %s: ffmpeg produced no usable output at %s",
+            mp3_path,
+            normalized_path,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "Audio normalization timed out after %ss for %s",
+            normalize_cfg["timeout_seconds"],
+            mp3_path,
+        )
+    except FileNotFoundError:
+        logger.warning("Audio normalization skipped for %s: ffmpeg not found", mp3_path)
+    except Exception as e:
+        logger.warning("Audio normalization failed for %s: %s", mp3_path, e, exc_info=True)
+    return None
+
+
 def _convert_to_opus(mp3_path: str) -> Optional[str]:
     """
     Convert an MP3 file to OGG Opus format for Telegram voice bubbles.
@@ -254,8 +372,9 @@ def _convert_to_opus(mp3_path: str) -> Optional[str]:
 
     ogg_path = mp3_path.rsplit(".", 1)[0] + ".ogg"
     try:
+        ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
         result = subprocess.run(
-            ["ffmpeg", "-i", mp3_path, "-acodec", "libopus",
+            [ffmpeg, "-i", mp3_path, "-acodec", "libopus",
              "-ac", "1", "-b:a", "64k", "-vbr", "off", ogg_path, "-y"],
             capture_output=True, timeout=30,
         )
@@ -1173,15 +1292,25 @@ def text_to_speech_tool(
                 "error": f"TTS generation produced no output (provider: {provider})"
             }, ensure_ascii=False)
 
+        normalization = {"attempted": False, "applied": False}
+        if _should_normalize_generated_audio(file_str, platform, tts_config):
+            normalization["attempted"] = True
+            normalized_file = _normalize_generated_audio(file_str, tts_config)
+            if normalized_file:
+                file_str = normalized_file
+                normalization["applied"] = True
+            else:
+                normalization["reason"] = "ffmpeg unavailable or normalization failed; using original audio"
+
         # Try Opus conversion for Telegram compatibility
         # Edge TTS outputs MP3, NeuTTS/KittenTTS output WAV — all need ffmpeg conversion
         voice_compatible = False
-        if provider in ("edge", "neutts", "minimax", "xai", "kittentts") and not file_str.endswith(".ogg"):
+        if want_opus and provider in ("edge", "neutts", "minimax", "xai", "kittentts") and not file_str.endswith(".ogg"):
             opus_path = _convert_to_opus(file_str)
             if opus_path:
                 file_str = opus_path
                 voice_compatible = True
-        elif provider in ("elevenlabs", "openai", "mistral", "gemini"):
+        elif want_opus and provider in ("elevenlabs", "openai", "mistral", "gemini"):
             voice_compatible = file_str.endswith(".ogg")
 
         file_size = os.path.getsize(file_str)
@@ -1198,6 +1327,7 @@ def text_to_speech_tool(
             "media_tag": media_tag,
             "provider": provider,
             "voice_compatible": voice_compatible,
+            "normalization": normalization,
         }, ensure_ascii=False)
 
     except ValueError as e:
