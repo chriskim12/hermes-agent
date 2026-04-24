@@ -388,8 +388,14 @@ class SessionDB:
         system_prompt: str = None,
         user_id: str = None,
         parent_session_id: str = None,
+        source_metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Create a new session record. Returns the session_id."""
+        """Create a new session record. Returns the session_id.
+
+        ``source_metadata`` is accepted for gateway compatibility with local
+        carry that passes rich origin metadata.  This checkout's schema does not
+        persist it, so the argument is intentionally ignored.
+        """
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,

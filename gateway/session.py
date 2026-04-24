@@ -83,6 +83,7 @@ class SessionSource:
     jump_url: Optional[str] = None  # Deep link back to the originating Discord message/thread when available
     user_id_alt: Optional[str] = None  # Platform-specific stable alt ID (Signal UUID, Feishu union_id)
     chat_id_alt: Optional[str] = None  # Signal group internal ID
+    is_bot: bool = False  # Whether the originating author is a bot account
     
     @property
     def description(self) -> str:
@@ -116,6 +117,7 @@ class SessionSource:
             "thread_id": self.thread_id,
             "chat_topic": self.chat_topic,
             "jump_url": self.jump_url,
+            "is_bot": self.is_bot,
         }
         if self.user_id_alt:
             d["user_id_alt"] = self.user_id_alt
@@ -137,6 +139,7 @@ class SessionSource:
             jump_url=data.get("jump_url"),
             user_id_alt=data.get("user_id_alt"),
             chat_id_alt=data.get("chat_id_alt"),
+            is_bot=bool(data.get("is_bot", False)),
         )
     
 
