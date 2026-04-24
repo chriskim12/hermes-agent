@@ -55,6 +55,7 @@ def test_phrase_resolver_maps_high_confidence_push_authority():
     from tools.operator_workflow import PUSH_AUTHORITY, normalize_owner_authority_phrase
 
     phrases = [
+        "develop 반영",
         "push 승인",
         "push도 진행해",
         "push까지 진행해",
@@ -100,7 +101,7 @@ def test_dailychingu_push_authority_integrates_develop_cleans_task_lane_and_stop
             task_worktree=task_worktree,
             task_branch="feature/ch-195",
             linear_issue_id="CH-195",
-            owner_phrase="push 승인",
+            owner_phrase="develop 반영",
             evidence_callback=evidence.append,
         )
     )
@@ -127,7 +128,7 @@ def test_push_authority_blocks_without_live_card(tmp_path):
             task_worktree=task_worktree,
             task_branch="feature/ch-195",
             linear_issue_id=None,
-            owner_phrase="push 승인",
+            owner_phrase="develop 반영",
         )
     )
 
@@ -178,7 +179,7 @@ def test_push_authority_applies_dev_migration_gate_before_cleanup(tmp_path):
             task_worktree=task_worktree,
             task_branch="feature/ch-195-migration",
             linear_issue_id="CH-195",
-            owner_phrase="push 승인",
+            owner_phrase="develop 반영",
             dev_db_target="dailychingu-dev",
             dev_migration_callback=apply_dev_migrations,
         )
@@ -205,7 +206,7 @@ def test_push_authority_blocks_migration_without_dev_apply_callback(tmp_path):
             task_worktree=task_worktree,
             task_branch="feature/ch-195-migration",
             linear_issue_id="CH-195",
-            owner_phrase="push 승인",
+            owner_phrase="develop 반영",
             dev_db_target="dailychingu-dev",
         )
     )
@@ -237,7 +238,7 @@ def test_push_authority_blocks_migration_for_non_dev_target(tmp_path):
             task_worktree=task_worktree,
             task_branch="feature/ch-195-migration",
             linear_issue_id="CH-195",
-            owner_phrase="push 승인",
+            owner_phrase="develop 반영",
             dev_db_target="dailychingu-production",
             dev_migration_callback=should_not_apply,
         )
@@ -264,7 +265,7 @@ def test_push_authority_blocks_migration_callback_exception(tmp_path):
             task_worktree=task_worktree,
             task_branch="feature/ch-195-migration",
             linear_issue_id="CH-195",
-            owner_phrase="push 승인",
+            owner_phrase="develop 반영",
             dev_db_target="dailychingu-dev",
             dev_migration_callback=broken_apply,
         )
@@ -296,7 +297,7 @@ def test_push_authority_blocks_migration_detection_failure(tmp_path):
                 task_worktree=task_worktree,
                 task_branch="feature/ch-195-migration",
                 linear_issue_id="CH-195",
-                owner_phrase="push 승인",
+                owner_phrase="develop 반영",
                 dev_db_target="dailychingu-dev",
                 dev_migration_callback=lambda files: operator_workflow.DevMigrationGateResult(success=True),
             )
@@ -331,7 +332,7 @@ def test_push_authority_does_not_apply_dev_migration_when_base_dirty(tmp_path):
             task_worktree=task_worktree,
             task_branch="feature/ch-195-migration",
             linear_issue_id="CH-195",
-            owner_phrase="push 승인",
+            owner_phrase="develop 반영",
             dev_db_target="dailychingu-dev",
             dev_migration_callback=should_not_apply,
         )
@@ -369,7 +370,7 @@ def test_push_authority_does_not_apply_dev_migration_when_branch_not_mergeable(t
             task_worktree=task_worktree,
             task_branch="feature/ch-195-migration",
             linear_issue_id="CH-195",
-            owner_phrase="push 승인",
+            owner_phrase="develop 반영",
             dev_db_target="dailychingu-dev",
             dev_migration_callback=should_not_apply,
         )
@@ -395,7 +396,7 @@ def test_push_authority_blocks_dirty_base_without_checkout_side_effect(tmp_path)
             task_worktree=task_worktree,
             task_branch="feature/ch-195",
             linear_issue_id="CH-195",
-            owner_phrase="push 승인",
+            owner_phrase="develop 반영",
         )
     )
 

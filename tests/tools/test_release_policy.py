@@ -91,7 +91,7 @@ def test_dailychingu_profile_resolves_push_and_release_authority(tmp_path):
     release_resolution = resolve_workflow_handoff_authority(str(repo), RELEASE_AUTHORITY)
 
     assert push_resolution.supported is True
-    assert push_resolution.approval_token == "push 승인"
+    assert push_resolution.approval_token == "develop 반영"
     assert "integrates the task result into develop" in push_resolution.workflow_summary
     assert "merge/ff included" in push_resolution.workflow_summary
     assert release_resolution.supported is True

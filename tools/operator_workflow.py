@@ -108,7 +108,8 @@ class ReleaseWorkflowResult:
         return "completed" if self.success else "blocked"
 
 
-_PUSH_AUTHORITY_PHRASES = {
+_PUSH_AUTHORITY_PHRASES={
+    "develop 반영",
     "push 승인",
     "push도 진행해",
     "push까지 진행해",
@@ -128,7 +129,7 @@ def normalize_owner_authority_phrase(phrase: str) -> AuthorityPhraseResolution:
     """Normalize owner text into a strict internal authority class.
 
     The resolver is deliberately conservative: only high-confidence DailyChingu
-    task-close language maps to ``PUSH_AUTHORITY``.  Vague approval/progress
+    develop-apply / task-close language maps to ``PUSH_AUTHORITY``.  Vague approval/progress
     words stay non-executable so they cannot silently degrade into ``git push``.
     """
     normalized = " ".join((phrase or "").strip().lower().split())
