@@ -621,6 +621,7 @@ def _skill_should_show(
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
+    mode: str = "full",
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -659,6 +660,7 @@ def build_skills_system_prompt(
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
         tuple(sorted(disabled)),
+        str(mode or "full").lower().strip(),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -795,6 +797,7 @@ def build_skills_system_prompt(
     if not skills_by_category:
         result = ""
     else:
+        compact_mode = str(mode or "full").lower().strip() in {"compact", "summary", "categories"}
         index_lines = []
         for category in sorted(skills_by_category.keys()):
             cat_desc = category_descriptions.get(category, "")
@@ -802,6 +805,8 @@ def build_skills_system_prompt(
                 index_lines.append(f"  {category}: {cat_desc}")
             else:
                 index_lines.append(f"  {category}:")
+            if compact_mode:
+                continue
             # Deduplicate and sort skills within each category
             seen = set()
             for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
@@ -813,29 +818,45 @@ def build_skills_system_prompt(
                 else:
                     index_lines.append(f"    - {name}")
 
-        result = (
-            "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
-            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
-            "even if you think you could handle the task with basic tools like web_search or terminal. "
-            "Skills also encode the user's preferred approach, conventions, and quality standards "
-            "for tasks like code review, planning, and testing — load them even for tasks you "
-            "already know how to do, because the skill defines how it should be done here.\n"
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
-            "After difficult/iterative tasks, offer to save as a skill. "
-            "If a skill you loaded was missing steps, had wrong commands, or needed "
-            "pitfalls you discovered, update it before finishing.\n"
-            "\n"
-            "<available_skills>\n"
-            + "\n".join(index_lines) + "\n"
-            "</available_skills>\n"
-            "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
-        )
+        if compact_mode:
+            result = (
+                "## Skills (mandatory)\n"
+                "Skills contain specialized procedures that may outperform general-purpose reasoning. "
+                "Before non-trivial work, use skills_list to discover matching skills, then skill_view(name) "
+                "to load and follow any relevant skill. If you already know the exact relevant skill name, "
+                "load it directly with skill_view(name). If a loaded skill is stale or wrong, patch it with "
+                "skill_manage(action='patch').\n"
+                "\n"
+                "<available_skill_categories>\n"
+                + "\n".join(index_lines) + "\n"
+                "</available_skill_categories>\n"
+                "\n"
+                "Only proceed without skill lookup when the task is clearly simple or no skill category is relevant."
+            )
+        else:
+            result = (
+                "## Skills (mandatory)\n"
+                "Before replying, scan the skills below. If a skill matches or is even partially relevant "
+                "to your task, you MUST load it with skill_view(name) and follow its instructions. "
+                "Err on the side of loading — it is always better to have context you don't need "
+                "than to miss critical steps, pitfalls, or established workflows. "
+                "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
+                "and proven workflows that outperform general-purpose approaches. Load the skill "
+                "even if you think you could handle the task with basic tools like web_search or terminal. "
+                "Skills also encode the user's preferred approach, conventions, and quality standards "
+                "for tasks like code review, planning, and testing — load them even for tasks you "
+                "already know how to do, because the skill defines how it should be done here.\n"
+                "If a skill has issues, fix it with skill_manage(action='patch').\n"
+                "After difficult/iterative tasks, offer to save as a skill. "
+                "If a skill you loaded was missing steps, had wrong commands, or needed "
+                "pitfalls you discovered, update it before finishing.\n"
+                "\n"
+                "<available_skills>\n"
+                + "\n".join(index_lines) + "\n"
+                "</available_skills>\n"
+                "\n"
+                "Only proceed without loading a skill if genuinely none are relevant to the task."
+            )
 
     # ── Store in LRU cache ────────────────────────────────────────────
     with _SKILLS_PROMPT_CACHE_LOCK:
@@ -1040,6 +1061,48 @@ def _load_cursorrules(cwd_path: Path) -> str:
     if not cursorrules_content:
         return ""
     return _truncate_content(cursorrules_content, ".cursorrules")
+
+
+def should_load_context_files_for_session(
+    *,
+    platform: str | None = None,
+    terminal_cwd: str | None = None,
+    mode: str | bool | None = "auto",
+) -> bool:
+    """Return whether project context files should be preloaded for a session.
+
+    Gateway processes often run from the Hermes install checkout.  Loading
+    AGENTS.md from that cwd into every Discord/Telegram/etc. thread is expensive
+    and frequently irrelevant.  In explicit mode, gateway sessions only preload
+    project context when the gateway supplied an explicit TERMINAL_CWD; CLI/local
+    sessions keep the traditional cwd-based discovery.
+    """
+    if mode is False or str(mode).lower().strip() in {"false", "off", "never", "none", "disabled"}:
+        return False
+    if mode is True or str(mode).lower().strip() in {"true", "on", "always", "all"}:
+        return True
+
+    platform_key = (platform or "").lower().strip()
+    gateway_platforms = {
+        "discord", "telegram", "slack", "whatsapp", "signal", "matrix",
+        "mattermost", "email", "sms", "dingtalk", "wecom", "weixin",
+        "feishu", "qqbot", "bluebubbles", "webhook", "api_server",
+        "homeassistant",
+    }
+    mode_key = str(mode or "auto").lower().strip()
+    if mode_key in {"explicit", "gateway_explicit"} and platform_key in gateway_platforms:
+        cwd_text = str(terminal_cwd or "").strip()
+        if not cwd_text:
+            return False
+        try:
+            cwd_path = Path(cwd_text).expanduser().resolve()
+            hermes_checkout = Path(__file__).resolve().parents[1]
+            if cwd_path == hermes_checkout:
+                return False
+        except Exception:
+            pass
+        return True
+    return True
 
 
 def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = False) -> str:

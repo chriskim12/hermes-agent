@@ -96,7 +96,7 @@ from agent.model_metadata import (
 from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
-from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
+from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, should_load_context_files_for_session, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.codex_responses_adapter import (
     _derive_responses_function_call_id as _codex_derive_responses_function_call_id,
@@ -1421,6 +1421,10 @@ class AIAgent:
         # needed later by the startup feasibility check.  Avoid exposing a
         # broad pseudo-public config object on the agent instance.
         self._aux_compression_context_length_config = None
+        _skills_config = _agent_cfg.get("skills", {}) if isinstance(_agent_cfg.get("skills", {}), dict) else {}
+        _context_config = _agent_cfg.get("context", {}) if isinstance(_agent_cfg.get("context", {}), dict) else {}
+        self._skills_prompt_mode = str(_skills_config.get("prompt_index", "full") or "full").lower().strip()
+        self._context_files_mode = _context_config.get("project_files", "auto")
 
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
@@ -4169,6 +4173,7 @@ class AIAgent:
             skills_prompt = build_skills_system_prompt(
                 available_tools=self.valid_tool_names,
                 available_toolsets=avail_toolsets,
+                mode=getattr(self, "_skills_prompt_mode", "full"),
             )
         else:
             skills_prompt = ""
@@ -4181,10 +4186,15 @@ class AIAgent:
             # dir, so os.getcwd() would pick up the repo's AGENTS.md and
             # other dev files — inflating token usage by ~10k for no benefit.
             _context_cwd = os.getenv("TERMINAL_CWD") or None
-            context_files_prompt = build_context_files_prompt(
-                cwd=_context_cwd, skip_soul=_soul_loaded)
-            if context_files_prompt:
-                prompt_parts.append(context_files_prompt)
+            if should_load_context_files_for_session(
+                platform=self.platform,
+                terminal_cwd=_context_cwd,
+                mode=getattr(self, "_context_files_mode", "auto"),
+            ):
+                context_files_prompt = build_context_files_prompt(
+                    cwd=_context_cwd, skip_soul=_soul_loaded)
+                if context_files_prompt:
+                    prompt_parts.append(context_files_prompt)
 
         from hermes_time import now as _hermes_now
         now = _hermes_now()
