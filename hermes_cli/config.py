@@ -733,6 +733,11 @@ DEFAULT_CONFIG = {
     # a plugin in plugins/context_engine/<name>/ or ~/.hermes/plugins/.
     "context": {
         "engine": "compressor",
+        # Project context files (AGENTS.md/HERMES.md/etc.) in the system prompt.
+        # "auto" preserves legacy cwd discovery. "explicit" skips gateway
+        # preload unless TERMINAL_CWD is supplied, avoiding Hermes install
+        # AGENTS.md in every Discord/Telegram thread while keeping CLI behavior.
+        "project_files": "auto",
     },
 
     # Persistent memory -- bounded curated memory injected into system prompt
@@ -814,6 +819,11 @@ DEFAULT_CONFIG = {
         # External hub installs (trusted/community sources) are always
         # scanned regardless of this setting.
         "guard_agent_created": False,
+        # "full" lists every available skill and description in the system
+        # prompt. "compact" keeps only category names/descriptions and tells
+        # the agent to use skills_list/skill_view for discovery, saving tokens
+        # at the cost of one lookup on non-trivial tasks.
+        "prompt_index": "full",
     },
 
     # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.
