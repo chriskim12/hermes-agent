@@ -43,6 +43,13 @@ class AuthorityPhraseResolution:
 
 
 @dataclass(frozen=True)
+class DevMigrationGateResult:
+    success: bool
+    evidence: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class PushWorkflowRequest:
     repo_path: str | Path
     task_worktree: str | Path
@@ -50,6 +57,8 @@ class PushWorkflowRequest:
     linear_issue_id: str | None
     owner_phrase: str
     evidence_callback: Callable[[str], None] | None = None
+    dev_db_target: str | None = None
+    dev_migration_callback: Callable[[tuple[str, ...]], DevMigrationGateResult] | None = None
 
 
 @dataclass
@@ -59,6 +68,8 @@ class PushWorkflowResult:
     evidence: list[str] = field(default_factory=list)
     release_executed: bool = False
     integration_commit: str | None = None
+    dev_migration_files: tuple[str, ...] = ()
+    dev_migrations_applied: bool = False
 
     @property
     def status(self) -> str:
@@ -161,17 +172,74 @@ def _ensure_profile(profile: RepoWorkflowProfile | None) -> bool:
     return bool(profile and profile.name == "dailychingu" and profile.integration_branch and profile.remote_name)
 
 
+def _changed_migration_files(repo: Path, base_ref: str, task_ref: str) -> tuple[tuple[str, ...], str | None]:
+    result = _run_git(repo, "diff", "--name-only", f"{base_ref}...{task_ref}", "--", "supabase/migrations")
+    if result.returncode != 0:
+        reason = result.stderr.strip() or result.stdout.strip() or "git diff failed"
+        return (), reason
+    files = []
+    for line in result.stdout.splitlines():
+        path = line.strip()
+        if path.startswith("supabase/migrations/") and path.endswith(".sql"):
+            files.append(path)
+    return tuple(sorted(files)), None
+
+
+def _target_is_dev(target: str | None) -> bool:
+    normalized = (target or "").strip().lower()
+    if not normalized:
+        return False
+    prod_markers = ("prod", "production", "main")
+    if any(marker in normalized for marker in prod_markers):
+        return False
+    return "dev" in normalized or "development" in normalized
+
+
+def _apply_dev_migration_gate(
+    result: PushWorkflowResult,
+    request: PushWorkflowRequest,
+    migration_files: tuple[str, ...],
+) -> bool:
+    if not migration_files:
+        return True
+    result.dev_migration_files = migration_files
+    if not _target_is_dev(request.dev_db_target):
+        _block(result, "dev_migration_target_not_dev")
+        return False
+    if request.dev_migration_callback is None:
+        _block(result, "dev_migration_apply_missing")
+        return False
+
+    try:
+        gate_result = request.dev_migration_callback(migration_files)
+    except Exception as exc:  # pragma: no cover - exact callback failure types are external
+        _block(result, "dev_migration_apply_failed")
+        _evidence(result, request, f"dev migration failed: {exc}")
+        return False
+    if not gate_result.success:
+        _block(result, "dev_migration_apply_failed")
+        if gate_result.reason:
+            _evidence(result, request, f"dev migration failed: {gate_result.reason}")
+        return False
+
+    result.dev_migrations_applied = True
+    evidence = gate_result.evidence or f"applied {len(migration_files)} dev migration(s)"
+    _evidence(result, request, f"dev migration gate: {evidence}")
+    return True
+
+
 def execute_push_authority_workflow(request: PushWorkflowRequest) -> PushWorkflowResult:
     """Execute DailyChingu PUSH_AUTHORITY through develop integration and cleanup.
 
     Positive path:
     1. resolve live card / phrase / repo profile,
     2. verify task lane is clean and mergeable,
-    3. integrate task branch into ``develop``,
-    4. verify develop contains the task result,
-    5. remove task-owned worktree and local branch,
-    6. record close evidence,
-    7. stop before release.
+    3. detect Supabase migrations and apply/verify them against dev DB only,
+    4. integrate task branch into ``develop``,
+    5. verify develop contains the task result,
+    6. remove task-owned worktree and local branch,
+    7. record close evidence,
+    8. stop before release.
     """
     result = PushWorkflowResult(success=False)
     phrase = normalize_owner_authority_phrase(request.owner_phrase)
@@ -200,6 +268,9 @@ def execute_push_authority_workflow(request: PushWorkflowRequest) -> PushWorkflo
 
     integration_branch = profile.integration_branch or "develop"
     task_commit = _git_output(task_worktree, "rev-parse", "--verify", request.task_branch)
+    migration_files, migration_detection_error = _changed_migration_files(base_repo, integration_branch, request.task_branch)
+    if migration_detection_error:
+        return _block(result, "migration_detection_failed")
     _evidence(result, request, f"review accepted / push authority: {request.linear_issue_id}")
     _evidence(result, request, f"task branch: {request.task_branch} @ {task_commit[:12]}")
 
@@ -212,6 +283,15 @@ def execute_push_authority_workflow(request: PushWorkflowRequest) -> PushWorkflo
         return _block(result, "integration_branch_checkout_failed")
     if not _status_clean(base_repo):
         return _block(result, "dirty_integration_checkout")
+
+    mergeable = _run_git(base_repo, "merge-base", "--is-ancestor", integration_branch, request.task_branch)
+    if mergeable.returncode != 0:
+        return _block(result, "unintegratable_task_branch")
+
+    if migration_files:
+        _evidence(result, request, f"migration files detected: {', '.join(migration_files)}")
+        if not _apply_dev_migration_gate(result, request, migration_files):
+            return result
 
     merge = _run_git(base_repo, "merge", "--ff-only", request.task_branch)
     if merge.returncode != 0:

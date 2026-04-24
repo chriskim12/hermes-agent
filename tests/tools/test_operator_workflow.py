@@ -1,5 +1,6 @@
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 
 def _run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -33,6 +34,20 @@ def _add_task_worktree(repo: Path, branch: str = "feature/ch-195") -> Path:
     (worktree / "task.txt").write_text("task result\n", encoding="utf-8")
     _run(["git", "add", "task.txt"], cwd=worktree)
     _run(["git", "commit", "-m", "task result"], cwd=worktree)
+    return worktree
+
+
+def _add_migration_task_worktree(repo: Path, branch: str = "feature/ch-195-migration") -> Path:
+    worktree = repo / ".worktrees" / "ch-195-migration"
+    _run(["git", "worktree", "add", "-b", branch, str(worktree), "develop"], cwd=repo)
+    migrations = worktree / "supabase" / "migrations"
+    migrations.mkdir(parents=True, exist_ok=True)
+    (migrations / "20260424000100_create_push_gate.sql").write_text(
+        "create table push_gate(id bigint primary key);\n",
+        encoding="utf-8",
+    )
+    _run(["git", "add", "supabase/migrations/20260424000100_create_push_gate.sql"], cwd=worktree)
+    _run(["git", "commit", "-m", "add migration"], cwd=worktree)
     return worktree
 
 
@@ -140,6 +155,230 @@ def test_push_authority_blocks_for_non_profile_repo(tmp_path):
 
     assert result.success is False
     assert "repo_profile_missing_or_not_dailychingu" in result.blockers
+
+
+def test_push_authority_applies_dev_migration_gate_before_cleanup(tmp_path):
+    from tools.operator_workflow import (
+        DevMigrationGateResult,
+        PushWorkflowRequest,
+        execute_push_authority_workflow,
+    )
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+    task_worktree = _add_migration_task_worktree(repo)
+    applied: list[tuple[str, ...]] = []
+
+    def apply_dev_migrations(files: tuple[str, ...]) -> DevMigrationGateResult:
+        applied.append(files)
+        return DevMigrationGateResult(success=True, evidence=f"dev applied: {','.join(files)}")
+
+    result = execute_push_authority_workflow(
+        PushWorkflowRequest(
+            repo_path=repo,
+            task_worktree=task_worktree,
+            task_branch="feature/ch-195-migration",
+            linear_issue_id="CH-195",
+            owner_phrase="push 승인",
+            dev_db_target="dailychingu-dev",
+            dev_migration_callback=apply_dev_migrations,
+        )
+    )
+
+    expected = ("supabase/migrations/20260424000100_create_push_gate.sql",)
+    assert result.success is True
+    assert result.dev_migration_files == expected
+    assert result.dev_migrations_applied is True
+    assert applied == [expected]
+    assert "dev migration gate: dev applied" in "\n".join(result.evidence)
+    assert not task_worktree.exists()
+
+
+def test_push_authority_blocks_migration_without_dev_apply_callback(tmp_path):
+    from tools.operator_workflow import PushWorkflowRequest, execute_push_authority_workflow
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+    task_worktree = _add_migration_task_worktree(repo)
+
+    result = execute_push_authority_workflow(
+        PushWorkflowRequest(
+            repo_path=repo,
+            task_worktree=task_worktree,
+            task_branch="feature/ch-195-migration",
+            linear_issue_id="CH-195",
+            owner_phrase="push 승인",
+            dev_db_target="dailychingu-dev",
+        )
+    )
+
+    assert result.success is False
+    assert "dev_migration_apply_missing" in result.blockers
+    assert task_worktree.exists()
+
+
+def test_push_authority_blocks_migration_for_non_dev_target(tmp_path):
+    from tools.operator_workflow import (
+        DevMigrationGateResult,
+        PushWorkflowRequest,
+        execute_push_authority_workflow,
+    )
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+    task_worktree = _add_migration_task_worktree(repo)
+    called = False
+
+    def should_not_apply(files: tuple[str, ...]) -> DevMigrationGateResult:
+        nonlocal called
+        called = True
+        return DevMigrationGateResult(success=True)
+
+    result = execute_push_authority_workflow(
+        PushWorkflowRequest(
+            repo_path=repo,
+            task_worktree=task_worktree,
+            task_branch="feature/ch-195-migration",
+            linear_issue_id="CH-195",
+            owner_phrase="push 승인",
+            dev_db_target="dailychingu-production",
+            dev_migration_callback=should_not_apply,
+        )
+    )
+
+    assert result.success is False
+    assert "dev_migration_target_not_dev" in result.blockers
+    assert called is False
+    assert task_worktree.exists()
+
+
+def test_push_authority_blocks_migration_callback_exception(tmp_path):
+    from tools.operator_workflow import PushWorkflowRequest, execute_push_authority_workflow
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+    task_worktree = _add_migration_task_worktree(repo)
+
+    def broken_apply(files: tuple[str, ...]):
+        raise RuntimeError("dev db unavailable")
+
+    result = execute_push_authority_workflow(
+        PushWorkflowRequest(
+            repo_path=repo,
+            task_worktree=task_worktree,
+            task_branch="feature/ch-195-migration",
+            linear_issue_id="CH-195",
+            owner_phrase="push 승인",
+            dev_db_target="dailychingu-dev",
+            dev_migration_callback=broken_apply,
+        )
+    )
+
+    assert result.success is False
+    assert "dev_migration_apply_failed" in result.blockers
+    assert "dev db unavailable" in "\n".join(result.evidence)
+    assert task_worktree.exists()
+
+
+def test_push_authority_blocks_migration_detection_failure(tmp_path):
+    import tools.operator_workflow as operator_workflow
+    from tools.operator_workflow import PushWorkflowRequest, execute_push_authority_workflow
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+    task_worktree = _add_migration_task_worktree(repo)
+    original_run_git = operator_workflow._run_git
+
+    def fail_diff(repo_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ("diff", "--name-only"):
+            return subprocess.CompletedProcess(args=["git", *args], returncode=1, stdout="", stderr="bad ref")
+        return original_run_git(repo_path, *args)
+
+    with patch("tools.operator_workflow._run_git", side_effect=fail_diff):
+        result = execute_push_authority_workflow(
+            PushWorkflowRequest(
+                repo_path=repo,
+                task_worktree=task_worktree,
+                task_branch="feature/ch-195-migration",
+                linear_issue_id="CH-195",
+                owner_phrase="push 승인",
+                dev_db_target="dailychingu-dev",
+                dev_migration_callback=lambda files: operator_workflow.DevMigrationGateResult(success=True),
+            )
+        )
+
+    assert result.success is False
+    assert "migration_detection_failed" in result.blockers
+    assert task_worktree.exists()
+
+
+def test_push_authority_does_not_apply_dev_migration_when_base_dirty(tmp_path):
+    from tools.operator_workflow import (
+        DevMigrationGateResult,
+        PushWorkflowRequest,
+        execute_push_authority_workflow,
+    )
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+    task_worktree = _add_migration_task_worktree(repo)
+    _run(["git", "checkout", "main"], cwd=repo)
+    (repo / "base-dirty.txt").write_text("dirty\n", encoding="utf-8")
+    called = False
+
+    def should_not_apply(files: tuple[str, ...]) -> DevMigrationGateResult:
+        nonlocal called
+        called = True
+        return DevMigrationGateResult(success=True)
+
+    result = execute_push_authority_workflow(
+        PushWorkflowRequest(
+            repo_path=repo,
+            task_worktree=task_worktree,
+            task_branch="feature/ch-195-migration",
+            linear_issue_id="CH-195",
+            owner_phrase="push 승인",
+            dev_db_target="dailychingu-dev",
+            dev_migration_callback=should_not_apply,
+        )
+    )
+
+    assert result.success is False
+    assert "dirty_integration_checkout" in result.blockers
+    assert called is False
+    assert _run(["git", "branch", "--show-current"], cwd=repo).stdout.strip() == "main"
+    assert task_worktree.exists()
+
+
+def test_push_authority_does_not_apply_dev_migration_when_branch_not_mergeable(tmp_path):
+    from tools.operator_workflow import (
+        DevMigrationGateResult,
+        PushWorkflowRequest,
+        execute_push_authority_workflow,
+    )
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+    task_worktree = _add_migration_task_worktree(repo)
+    (repo / "develop-advanced.txt").write_text("new develop truth\n", encoding="utf-8")
+    _run(["git", "add", "develop-advanced.txt"], cwd=repo)
+    _run(["git", "commit", "-m", "advance develop"], cwd=repo)
+    called = False
+
+    def should_not_apply(files: tuple[str, ...]) -> DevMigrationGateResult:
+        nonlocal called
+        called = True
+        return DevMigrationGateResult(success=True)
+
+    result = execute_push_authority_workflow(
+        PushWorkflowRequest(
+            repo_path=repo,
+            task_worktree=task_worktree,
+            task_branch="feature/ch-195-migration",
+            linear_issue_id="CH-195",
+            owner_phrase="push 승인",
+            dev_db_target="dailychingu-dev",
+            dev_migration_callback=should_not_apply,
+        )
+    )
+
+    assert result.success is False
+    assert "unintegratable_task_branch" in result.blockers
+    assert called is False
+    assert task_worktree.exists()
 
 
 def test_push_authority_blocks_dirty_base_without_checkout_side_effect(tmp_path):
