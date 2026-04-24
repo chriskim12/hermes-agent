@@ -385,6 +385,111 @@ def _safe_command_preview(command: Any, limit: int = 200) -> str:
     except Exception:
         return f"<{type(command).__name__}>"
 
+def _rewrite_compound_background(command: str) -> str:
+    """Rewrite top-level ``A && B &`` / ``A || B &`` into ``A && { B & }``.
+
+    Bash backgrounds the whole compound list for ``A && B &``.  If ``B`` is a
+    long-lived server, that creates a subshell which waits forever.  Wrapping
+    only the tail command keeps the background job simple and avoids the
+    subshell-wait leak.  This is intentionally conservative: it ignores quoted
+    text, comments, parens/command substitutions, pipes, and semicolon-delimited
+    statements.
+    """
+    if not command:
+        return command
+
+    def rewrite_line(line: str) -> str:
+        n = len(line)
+        i = 0
+        quote: str | None = None
+        escape = False
+        paren_depth = 0
+        last_chain: int | None = None
+        last_separator = 0
+        trailing_amp: int | None = None
+
+        while i < n:
+            ch = line[i]
+
+            if escape:
+                escape = False
+                i += 1
+                continue
+            if ch == "\\":
+                escape = True
+                i += 1
+                continue
+            if quote:
+                if ch == quote:
+                    quote = None
+                i += 1
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                i += 1
+                continue
+            if ch == "#" and line[:i].strip() == "":
+                break
+            if ch == "(":
+                paren_depth += 1
+                i += 1
+                continue
+            if ch == ")" and paren_depth > 0:
+                paren_depth -= 1
+                i += 1
+                continue
+            if paren_depth:
+                i += 1
+                continue
+
+            if line.startswith("&&", i) or line.startswith("||", i):
+                last_chain = i
+                i += 2
+                continue
+            if ch in ";|":
+                last_separator = i + 1
+                last_chain = None
+                i += 1
+                continue
+            if ch == "&":
+                prev_ch = line[i - 1] if i > 0 else ""
+                next_ch = line[i + 1] if i + 1 < n else ""
+                # Keep redirects such as &>, 2>&1, >&2 out of the background check.
+                if next_ch == ">" or prev_ch == ">":
+                    i += 1
+                    continue
+                if line[i + 1:].strip() == "":
+                    trailing_amp = i
+                i += 1
+                continue
+            i += 1
+
+        if trailing_amp is None or last_chain is None or last_chain < last_separator:
+            return line
+
+        tail_start = last_chain + 2
+        leading = line[tail_start:trailing_amp]
+        if leading.strip() == "":
+            return line
+        tail = leading.lstrip(" \t")
+        prefix = line[:tail_start] + leading[: len(leading) - len(tail)]
+        suffix = line[trailing_amp + 1:]
+        return f"{prefix}{{ {tail}& }}{suffix}"
+
+    parts = command.splitlines(keepends=True)
+    if not parts:
+        return command
+    out: list[str] = []
+    for part in parts:
+        newline = ""
+        body = part
+        if part.endswith("\r\n"):
+            body, newline = part[:-2], "\r\n"
+        elif part.endswith("\n"):
+            body, newline = part[:-1], "\n"
+        out.append(rewrite_line(body) + newline)
+    return "".join(out)
+
 def _looks_like_env_assignment(token: str) -> bool:
     """Return True when *token* is a leading shell environment assignment."""
     if "=" not in token or token.startswith("="):

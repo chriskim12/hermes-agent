@@ -10494,12 +10494,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
         return True
     
-    # Write PID file so CLI can detect gateway is running
-    import atexit
-    from gateway.status import write_pid_file, remove_pid_file
-    write_pid_file()
-    atexit.register(remove_pid_file)
-    
+    # PID file was already claimed before platform adapters were started.
+    # Do not write it again here: write_pid_file() uses O_EXCL by design,
+    # so a second call from the same process crashes the gateway after Discord connects.
+    #
     # Start background cron ticker so scheduled jobs fire automatically.
     # Pass the event loop so cron delivery can use live adapters (E2EE support).
     cron_stop = threading.Event()
