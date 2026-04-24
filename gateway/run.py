@@ -677,6 +677,13 @@ class GatewayRunner:
 
     _VOICE_MODE_PATH = _hermes_home / "gateway_voice_mode.json"
 
+    # Generated Yuuka TTS auto-reply policy knobs. Keep these grouped and
+    # named so we can tune the Discord thread heuristic after live use
+    # without rediscovering magic numbers in the predicate logic.
+    _GENERATED_TTS_COOLDOWN_SECONDS = 120
+    _GENERATED_TTS_MAX_CHARS = 220
+    _GENERATED_TTS_MAX_SENTENCES = 4
+
     def _load_voice_modes(self) -> Dict[str, str]:
         try:
             data = json.loads(self._VOICE_MODE_PATH.read_text())
@@ -6162,7 +6169,7 @@ class GatewayRunner:
         last_sent = recent_map.get(scope)
         if last_sent is None:
             return False
-        return (now - last_sent) < 300
+        return (now - last_sent) < self._GENERATED_TTS_COOLDOWN_SECONDS
 
     def _record_generated_tts_use(self, event: MessageEvent, *, now: Optional[float] = None) -> None:
         scope = self._generated_tts_scope_key(event)
@@ -6188,30 +6195,43 @@ class GatewayRunner:
         cleaned = re.sub(r"\s+", " ", _strip_markdown_for_tts(raw[:4000])).strip()
         if not cleaned:
             return False
-        if len(cleaned) > 120:
+        if len(cleaned) > self._GENERATED_TTS_MAX_CHARS:
             return False
 
         sentences = [part.strip() for part in re.split(r"(?<=[.!?。！？])\s+|\n+", cleaned) if part.strip()]
-        if len(sentences) > 3:
+        if len(sentences) > self._GENERATED_TTS_MAX_SENTENCES:
+            return False
+        if any(len(sentence) > 90 for sentence in sentences):
             return False
 
         lowered = cleaned.lower()
         technical_hints = (
             "api", "gateway", "restart", "pytest", "traceback", "stack trace", "token",
             "commit", "branch", "diff", "port", "config", "env", "log", "logs",
+            "debug", "debugging", "exception", "failure", "deploy", "deployment",
+            "markdown", "yaml", "json", "http", "https",
             "재시작", "로그", "포트", "토큰", "브랜치", "커밋", "설정", "환경변수",
-            "테스트", "예외", "에러", "오류",
+            "테스트", "예외", "에러", "오류", "배포", "디버그",
         )
         if any(hint in lowered for hint in technical_hints):
             return False
 
         allow_hints = (
             "좋", "잘", "감사", "고마", "수고", "조심", "쉬", "늦", "계획", "정리",
-            "시작", "성공", "알겠", "확인", "맞아", "괜찮", "thanks", "thank", "good",
-            "great", "nice", "rest", "careful", "late", "plan", "start", "success",
-            "got it", "okay",
+            "시작", "성공", "알겠", "확인", "맞아", "괜찮", "곧", "이따", "잠깐",
+            "먼저", "마저", "마무리", "올릴게", "보낼게", "공유", "업데이트", "later",
+            "soon", "shortly", "thanks", "thank", "good", "great", "nice", "rest",
+            "careful", "late", "plan", "start", "success", "got it", "okay", "ok",
+            "wrap", "follow up", "send", "share", "update", "check back",
         )
         return any(hint in lowered for hint in allow_hints)
+
+    def _agent_messages_claim_audio_turn(self, agent_messages: Optional[list]) -> bool:
+        for msg in agent_messages or []:
+            content = str(msg.get("content") or "")
+            if "MEDIA:" in content or "[[audio_as_voice]]" in content:
+                return True
+        return False
 
     def _should_send_generated_tts_reply(
         self,
@@ -6230,6 +6250,8 @@ class GatewayRunner:
         if self._agent_called_tool(agent_messages, "text_to_speech"):
             return False
         if self._agent_called_tool(agent_messages, "yuuka_voice_reply"):
+            return False
+        if self._agent_messages_claim_audio_turn(agent_messages):
             return False
         if self._generated_tts_in_cooldown(event):
             return False

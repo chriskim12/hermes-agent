@@ -71,6 +71,19 @@ def _make_event(text: str = "", message_type=MessageType.TEXT, chat_id="123") ->
     return event
 
 
+def _make_discord_thread_event(text: str = "", *, chat_id: str = "discord-chat", thread_id: str = "thread-1") -> MessageEvent:
+    source = SessionSource(
+        chat_id=chat_id,
+        user_id="user1",
+        platform=MagicMock(),
+    )
+    source.platform.value = "discord"
+    source.thread_id = thread_id
+    event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
+    event.message_id = "discord-msg-1"
+    return event
+
+
 def _make_runner(tmp_path):
     """Create a bare GatewayRunner without calling __init__."""
     from gateway.run import GatewayRunner
@@ -2638,6 +2651,79 @@ class TestVoiceTTSPlayback:
         assert self._call_should_reply(
             runner, "all", MessageType.VOICE, agent_msgs=agent_msgs, already_sent=True,
         ) is False
+
+
+class TestGeneratedDiscordThreadTtsPolicy:
+    @pytest.fixture
+    def runner(self, tmp_path):
+        return _make_runner(tmp_path)
+
+    def test_short_status_reply_now_allowed(self, runner):
+        event = _make_discord_thread_event()
+        response = "Looks good. I'll finish the cleanup shortly and send the update in a bit."
+
+        assert runner._should_send_generated_tts_reply(event, response, []) is True
+
+    def test_technical_reply_stays_blocked(self, runner):
+        event = _make_discord_thread_event()
+        response = "The gateway restart is done. Check the logs and env config if the Discord thread still fails."
+
+        assert runner._should_send_generated_tts_reply(event, response, []) is False
+
+    def test_generated_tts_cooldown_uses_shorter_window(self, runner):
+        event = _make_discord_thread_event()
+        runner._record_generated_tts_use(event, now=1000.0)
+
+        assert runner._generated_tts_in_cooldown(event, now=1119.0) is True
+        assert runner._generated_tts_in_cooldown(event, now=1120.0) is False
+
+    def test_generated_tts_skips_when_audio_media_already_claimed_turn(self, runner):
+        event = _make_discord_thread_event()
+        agent_messages = [
+            {
+                "role": "tool",
+                "content": '{"success": true, "media_tag": "[[audio_as_voice]]\nMEDIA:/tmp/already-claimed.ogg"}',
+            }
+        ]
+        response = "Okay, I'll send the short update soon."
+
+        assert runner._should_send_generated_tts_reply(event, response, agent_messages) is False
+
+    def test_generated_tts_skips_when_text_to_speech_tool_already_called(self, runner):
+        event = _make_discord_thread_event()
+        agent_messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "1",
+                        "type": "function",
+                        "function": {"name": "text_to_speech", "arguments": "{}"},
+                    }
+                ],
+            }
+        ]
+        response = "Okay, I'll send the short update soon."
+
+        assert runner._should_send_generated_tts_reply(event, response, agent_messages) is False
+
+    def test_generated_tts_skips_when_yuuka_voice_reply_tool_already_called(self, runner):
+        event = _make_discord_thread_event()
+        agent_messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "1",
+                        "type": "function",
+                        "function": {"name": "yuuka_voice_reply", "arguments": "{}"},
+                    }
+                ],
+            }
+        ]
+        response = "Thanks, I'll wrap it up soon."
+
+        assert runner._should_send_generated_tts_reply(event, response, agent_messages) is False
 
 
 class TestUDPKeepalive:
