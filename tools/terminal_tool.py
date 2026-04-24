@@ -197,9 +197,10 @@ def _check_all_guards(command: str, env_type: str) -> dict:
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
-# Covers alphanumeric, path separators, tilde, dot, hyphen, underscore, space,
-# plus, at, equals, and comma.  Everything else is rejected.
-_WORKDIR_SAFE_RE = re.compile(r'^[A-Za-z0-9/_\-.~ +@=,]+$')
+# Covers alphanumeric, POSIX/Windows path separators, Windows drive colons,
+# tilde, dot, hyphen, underscore, space, plus, at, equals, and comma.
+# Everything else is rejected.
+_WORKDIR_SAFE_RE = re.compile(r'^[A-Za-z0-9/\\:.~ +@=,_-]+$')
 
 
 def _validate_workdir(workdir: str) -> str | None:
@@ -1284,6 +1285,36 @@ def _looks_like_omx_delegation(command: str) -> bool:
     return infer_omx_lane_from_command(command) is not None
 
 
+def _looks_like_forced_tmux_omx_ralph(command: str) -> bool:
+    """Return True for OMX Ralph launches that force detached tmux attach.
+
+    Hermes terminal calls are non-interactive unless the caller explicitly asks
+    for PTY mode. Upstream OMX normally routes non-TTY Ralph to direct mode, but
+    `--tmux` forces the detached tmux path and then tries `tmux attach-session`,
+    which fails in Hermes with `open terminal failed` / `failed to attach`.
+    """
+    try:
+        tokens = shlex.split(str(command or ""))
+    except Exception:
+        return bool(re.search(r"\bomx\b(?=[\s\S]*\bralph\b)(?=[\s\S]*\b--tmux\b)", str(command or "")))
+
+    separators = {"&&", "||", ";", "|"}
+    lanes = {"exec", "plan", "ralplan", "ralph", "team"}
+    for idx, token in enumerate(tokens):
+        if token != "omx":
+            continue
+        segment = []
+        for candidate in tokens[idx + 1:]:
+            if candidate in separators:
+                break
+            segment.append(candidate)
+        if "--tmux" not in segment:
+            continue
+        if any(candidate == "ralph" for candidate in segment if candidate in lanes):
+            return True
+    return False
+
+
 def _maybe_mark_gateway_work_delegated(
     *,
     command: str,
@@ -1403,6 +1434,19 @@ def terminal_tool(
             }, ensure_ascii=False)
 
         command = _apply_default_omx_launch_flags(command)
+        if not pty and _looks_like_forced_tmux_omx_ralph(command):
+            return json.dumps({
+                "output": "",
+                "exit_code": 64,
+                "error": (
+                    "Blocked unsafe OMX Ralph launch: Hermes non-interactive terminal cannot "
+                    "attach detached tmux sessions. Use plain `omx ralph \"<task>\"` for "
+                    "direct mode, use `omx exec` for a bounded slice, or reroute to a real "
+                    "PTY/tmux lane."
+                ),
+                "status": "error",
+                "blocked_reason": "omx_ralph_forced_tmux_noninteractive",
+            }, ensure_ascii=False)
 
         # Get configuration
         config = _get_env_config()

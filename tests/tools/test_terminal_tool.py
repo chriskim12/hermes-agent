@@ -1,5 +1,7 @@
 """Regression tests for sudo detection and sudo password handling."""
 
+import json
+
 import tools.terminal_tool as terminal_tool
 
 
@@ -103,3 +105,52 @@ def test_validate_workdir_blocks_shell_metacharacters_in_windows_paths():
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project; rm -rf /")
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project$(whoami)")
     assert terminal_tool._validate_workdir("C:\\Users\\Alice\\project\nwhoami")
+
+
+def test_omx_ralph_forced_tmux_is_detected_after_default_flags():
+    command = terminal_tool._apply_default_omx_launch_flags('omx ralph --tmux "ship it"')
+
+    assert command == 'omx --madmax --high ralph --tmux "ship it"'
+    assert terminal_tool._looks_like_forced_tmux_omx_ralph(command)
+
+
+def test_omx_ralph_direct_mode_is_not_blocked_shape():
+    command = terminal_tool._apply_default_omx_launch_flags('omx ralph "ship it"')
+
+    assert command == 'omx --madmax --high ralph "ship it"'
+    assert not terminal_tool._looks_like_forced_tmux_omx_ralph(command)
+
+
+def test_terminal_tool_rejects_forced_tmux_ralph_without_pty():
+    result = json.loads(terminal_tool.terminal_tool(command='omx ralph --tmux "ship it"'))
+
+    assert result["status"] == "error"
+    assert result["exit_code"] == 64
+    assert result["blocked_reason"] == "omx_ralph_forced_tmux_noninteractive"
+    assert "non-interactive" in result["error"]
+
+
+def test_terminal_tool_allows_forced_tmux_ralph_when_pty_requested(monkeypatch):
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {
+        "env_type": "local",
+        "env_name": "default",
+        "cwd": ".",
+        "timeout": 180,
+    })
+
+    class _FakeEnv:
+        def execute(self, command, **kwargs):
+            return {
+                "output": f"ran: {command}",
+                "returncode": 0,
+            }
+
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": _FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {"default": 0})
+    monkeypatch.setattr(terminal_tool, "_check_all_guards", lambda *args, **kwargs: {"approved": True})
+
+    result = json.loads(terminal_tool.terminal_tool(command='omx ralph --tmux "ship it"', pty=True))
+
+    assert result["exit_code"] == 0
+    assert "omx --madmax --high ralph --tmux" in result["output"]
