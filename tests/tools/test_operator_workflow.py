@@ -425,3 +425,241 @@ def test_push_authority_blocks_dirty_task_worktree(tmp_path):
     assert result.success is False
     assert "dirty_task_worktree" in result.blockers
     assert task_worktree.exists()
+
+
+
+def _add_develop_migration(repo: Path) -> tuple[str, ...]:
+    _run(["git", "checkout", "develop"], cwd=repo)
+    migrations = repo / "supabase" / "migrations"
+    migrations.mkdir(parents=True, exist_ok=True)
+    migration = migrations / "20260424000200_release_gate.sql"
+    migration.write_text("alter table push_gate add column released_at timestamptz;\n", encoding="utf-8")
+    _run(["git", "add", "supabase/migrations/20260424000200_release_gate.sql"], cwd=repo)
+    _run(["git", "commit", "-m", "add release migration"], cwd=repo)
+    return ("supabase/migrations/20260424000200_release_gate.sql",)
+
+
+def test_release_authority_promotes_develop_to_main_without_migration(tmp_path):
+    from tools.operator_workflow import ReleaseWorkflowRequest, execute_release_authority_workflow
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+    evidence: list[str] = []
+
+    result = execute_release_authority_workflow(
+        ReleaseWorkflowRequest(
+            repo_path=repo,
+            linear_issue_id="CH-196",
+            owner_phrase="release 승인",
+            evidence_callback=evidence.append,
+        )
+    )
+
+    assert result.success is True
+    assert result.release_executed is True
+    assert result.release_commit == _run(["git", "rev-parse", "develop"], cwd=repo).stdout.strip()
+    assert _run(["git", "branch", "--show-current"], cwd=repo).stdout.strip() == "main"
+    assert "main release truth" in "\n".join(evidence)
+
+
+def test_release_authority_applies_prod_migration_gate_before_main_release(tmp_path):
+    from tools.operator_workflow import (
+        ProdMigrationGateResult,
+        ReleaseWorkflowRequest,
+        execute_release_authority_workflow,
+    )
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+    expected = _add_develop_migration(repo)
+    applied: list[tuple[str, ...]] = []
+
+    def apply_prod_migrations(files: tuple[str, ...]) -> ProdMigrationGateResult:
+        applied.append(files)
+        return ProdMigrationGateResult(success=True, evidence=f"prod applied: {','.join(files)}")
+
+    result = execute_release_authority_workflow(
+        ReleaseWorkflowRequest(
+            repo_path=repo,
+            linear_issue_id="CH-196",
+            owner_phrase="release 승인",
+            prod_db_target="dailychingu-production",
+            prod_migration_callback=apply_prod_migrations,
+        )
+    )
+
+    assert result.success is True
+    assert result.release_executed is True
+    assert result.prod_migration_files == expected
+    assert result.prod_migrations_applied is True
+    assert applied == [expected]
+    assert "prod migration gate: prod applied" in "\n".join(result.evidence)
+    assert _run(["git", "rev-parse", "main"], cwd=repo).stdout == _run(["git", "rev-parse", "develop"], cwd=repo).stdout
+
+
+def test_release_authority_blocks_migration_without_prod_apply_callback(tmp_path):
+    from tools.operator_workflow import ReleaseWorkflowRequest, execute_release_authority_workflow
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+    _add_develop_migration(repo)
+
+    result = execute_release_authority_workflow(
+        ReleaseWorkflowRequest(
+            repo_path=repo,
+            linear_issue_id="CH-196",
+            owner_phrase="release 승인",
+            prod_db_target="dailychingu-production",
+        )
+    )
+
+    assert result.success is False
+    assert "prod_migration_apply_missing" in result.blockers
+    assert _run(["git", "rev-parse", "main"], cwd=repo).stdout != _run(["git", "rev-parse", "develop"], cwd=repo).stdout
+
+
+def test_release_authority_blocks_migration_for_non_prod_target_before_callback(tmp_path):
+    from tools.operator_workflow import (
+        ProdMigrationGateResult,
+        ReleaseWorkflowRequest,
+        execute_release_authority_workflow,
+    )
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+    _add_develop_migration(repo)
+    called = False
+
+    def should_not_apply(files: tuple[str, ...]) -> ProdMigrationGateResult:
+        nonlocal called
+        called = True
+        return ProdMigrationGateResult(success=True)
+
+    result = execute_release_authority_workflow(
+        ReleaseWorkflowRequest(
+            repo_path=repo,
+            linear_issue_id="CH-196",
+            owner_phrase="release 승인",
+            prod_db_target="dailychingu-dev",
+            prod_migration_callback=should_not_apply,
+        )
+    )
+
+    assert result.success is False
+    assert "prod_migration_target_not_prod" in result.blockers
+    assert called is False
+
+
+def test_release_authority_blocks_prod_migration_detection_failure(tmp_path):
+    import tools.operator_workflow as operator_workflow
+    from tools.operator_workflow import ReleaseWorkflowRequest, execute_release_authority_workflow
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+    _add_develop_migration(repo)
+    original_run_git = operator_workflow._run_git
+
+    def fail_diff(repo_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ("diff", "--name-only"):
+            return subprocess.CompletedProcess(args=["git", *args], returncode=1, stdout="", stderr="bad ref")
+        return original_run_git(repo_path, *args)
+
+    with patch("tools.operator_workflow._run_git", side_effect=fail_diff):
+        result = execute_release_authority_workflow(
+            ReleaseWorkflowRequest(
+                repo_path=repo,
+                linear_issue_id="CH-196",
+                owner_phrase="release 승인",
+                prod_db_target="dailychingu-production",
+                prod_migration_callback=lambda files: operator_workflow.ProdMigrationGateResult(success=True),
+            )
+        )
+
+    assert result.success is False
+    assert "prod_migration_detection_failed" in result.blockers
+
+
+def test_release_authority_does_not_apply_prod_migration_when_main_not_fast_forwardable(tmp_path):
+    from tools.operator_workflow import (
+        ProdMigrationGateResult,
+        ReleaseWorkflowRequest,
+        execute_release_authority_workflow,
+    )
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+    _add_develop_migration(repo)
+    _run(["git", "checkout", "main"], cwd=repo)
+    (repo / "main-only.txt").write_text("main drift\n", encoding="utf-8")
+    _run(["git", "add", "main-only.txt"], cwd=repo)
+    _run(["git", "commit", "-m", "main drift"], cwd=repo)
+    called = False
+
+    def should_not_apply(files: tuple[str, ...]) -> ProdMigrationGateResult:
+        nonlocal called
+        called = True
+        return ProdMigrationGateResult(success=True)
+
+    result = execute_release_authority_workflow(
+        ReleaseWorkflowRequest(
+            repo_path=repo,
+            linear_issue_id="CH-196",
+            owner_phrase="release 승인",
+            prod_db_target="dailychingu-production",
+            prod_migration_callback=should_not_apply,
+        )
+    )
+
+    assert result.success is False
+    assert "unreleasable_integration_branch" in result.blockers
+    assert called is False
+
+
+def test_release_authority_blocks_dirty_release_checkout_without_checkout_side_effect(tmp_path):
+    from tools.operator_workflow import ReleaseWorkflowRequest, execute_release_authority_workflow
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+    _run(["git", "checkout", "develop"], cwd=repo)
+    (repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+
+    result = execute_release_authority_workflow(
+        ReleaseWorkflowRequest(
+            repo_path=repo,
+            linear_issue_id="CH-196",
+            owner_phrase="release 승인",
+        )
+    )
+
+    assert result.success is False
+    assert "dirty_release_checkout" in result.blockers
+    assert _run(["git", "branch", "--show-current"], cwd=repo).stdout.strip() == "develop"
+
+
+def test_release_authority_blocks_broad_release_inspection_phrase_without_main_side_effect(tmp_path):
+    from tools.operator_workflow import ReleaseWorkflowRequest, execute_release_authority_workflow
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+    before_main = _run(["git", "rev-parse", "main"], cwd=repo).stdout.strip()
+
+    result = execute_release_authority_workflow(
+        ReleaseWorkflowRequest(
+            repo_path=repo,
+            linear_issue_id="CH-196",
+            owner_phrase="release status 확인",
+        )
+    )
+
+    assert result.success is False
+    assert "authority_not_release:release authority" in result.blockers
+    assert _run(["git", "rev-parse", "main"], cwd=repo).stdout.strip() == before_main
+
+
+def test_release_authority_blocks_without_live_card(tmp_path):
+    from tools.operator_workflow import ReleaseWorkflowRequest, execute_release_authority_workflow
+
+    repo = _init_dailychingu_repo(tmp_path / "dailychingu")
+
+    result = execute_release_authority_workflow(
+        ReleaseWorkflowRequest(
+            repo_path=repo,
+            linear_issue_id=None,
+            owner_phrase="release 승인",
+        )
+    )
+
+    assert result.success is False
+    assert "no_live_card" in result.blockers

@@ -97,6 +97,7 @@ def test_dailychingu_profile_resolves_push_and_release_authority(tmp_path):
     assert release_resolution.supported is True
     assert release_resolution.approval_token == "release 승인"
     assert "develop -> main" in release_resolution.workflow_summary
+    assert "production DB apply/verify" in release_resolution.workflow_summary
 
 
 def test_non_profile_repo_does_not_inherit_dailychingu_push_or_release_authority(tmp_path):

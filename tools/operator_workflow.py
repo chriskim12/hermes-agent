@@ -50,6 +50,13 @@ class DevMigrationGateResult:
 
 
 @dataclass(frozen=True)
+class ProdMigrationGateResult:
+    success: bool
+    evidence: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class PushWorkflowRequest:
     repo_path: str | Path
     task_worktree: str | Path
@@ -70,6 +77,31 @@ class PushWorkflowResult:
     integration_commit: str | None = None
     dev_migration_files: tuple[str, ...] = ()
     dev_migrations_applied: bool = False
+
+    @property
+    def status(self) -> str:
+        return "completed" if self.success else "blocked"
+
+
+@dataclass(frozen=True)
+class ReleaseWorkflowRequest:
+    repo_path: str | Path
+    linear_issue_id: str | None
+    owner_phrase: str
+    evidence_callback: Callable[[str], None] | None = None
+    prod_db_target: str | None = None
+    prod_migration_callback: Callable[[tuple[str, ...]], ProdMigrationGateResult] | None = None
+
+
+@dataclass
+class ReleaseWorkflowResult:
+    success: bool
+    blockers: list[str] = field(default_factory=list)
+    evidence: list[str] = field(default_factory=list)
+    release_executed: bool = False
+    release_commit: str | None = None
+    prod_migration_files: tuple[str, ...] = ()
+    prod_migrations_applied: bool = False
 
     @property
     def status(self) -> str:
@@ -105,7 +137,7 @@ def normalize_owner_authority_phrase(phrase: str) -> AuthorityPhraseResolution:
     if normalized in _PUSH_AUTHORITY_PHRASES:
         return AuthorityPhraseResolution(phrase=phrase, decision=PUSH_AUTHORITY, executable=True)
     if normalized in _RELEASE_AUTHORITY_PHRASES:
-        return AuthorityPhraseResolution(phrase=phrase, decision=RELEASE_AUTHORITY, executable=False, reason="release authority is handled by a separate workflow")
+        return AuthorityPhraseResolution(phrase=phrase, decision=RELEASE_AUTHORITY, executable=True)
     if normalized in _REVIEW_ONLY_PHRASES:
         return AuthorityPhraseResolution(phrase=phrase, decision=REVIEW_VERDICT_ONLY, executable=False, reason="review verdict only")
     if normalized in _INSPECTION_PHRASES:
@@ -195,6 +227,16 @@ def _target_is_dev(target: str | None) -> bool:
     return "dev" in normalized or "development" in normalized
 
 
+def _target_is_prod(target: str | None) -> bool:
+    normalized = (target or "").strip().lower()
+    if not normalized:
+        return False
+    dev_markers = ("dev", "development", "staging", "test")
+    if any(marker in normalized for marker in dev_markers):
+        return False
+    return "prod" in normalized or "production" in normalized or "main" in normalized
+
+
 def _apply_dev_migration_gate(
     result: PushWorkflowResult,
     request: PushWorkflowRequest,
@@ -226,6 +268,119 @@ def _apply_dev_migration_gate(
     evidence = gate_result.evidence or f"applied {len(migration_files)} dev migration(s)"
     _evidence(result, request, f"dev migration gate: {evidence}")
     return True
+
+
+def _release_evidence(result: ReleaseWorkflowResult, request: ReleaseWorkflowRequest, line: str) -> None:
+    result.evidence.append(line)
+    if request.evidence_callback:
+        request.evidence_callback(line)
+
+
+def _release_block(result: ReleaseWorkflowResult, *blockers: str) -> ReleaseWorkflowResult:
+    result.success = False
+    result.blockers.extend(blocker for blocker in blockers if blocker)
+    return result
+
+
+def _apply_prod_migration_gate(
+    result: ReleaseWorkflowResult,
+    request: ReleaseWorkflowRequest,
+    migration_files: tuple[str, ...],
+) -> bool:
+    if not migration_files:
+        return True
+    result.prod_migration_files = migration_files
+    if not _target_is_prod(request.prod_db_target):
+        _release_block(result, "prod_migration_target_not_prod")
+        return False
+    if request.prod_migration_callback is None:
+        _release_block(result, "prod_migration_apply_missing")
+        return False
+
+    try:
+        gate_result = request.prod_migration_callback(migration_files)
+    except Exception as exc:  # pragma: no cover - exact callback failure types are external
+        _release_block(result, "prod_migration_apply_failed")
+        _release_evidence(result, request, f"prod migration failed: {exc}")
+        return False
+    if not gate_result.success:
+        _release_block(result, "prod_migration_apply_failed")
+        if gate_result.reason:
+            _release_evidence(result, request, f"prod migration failed: {gate_result.reason}")
+        return False
+
+    result.prod_migrations_applied = True
+    evidence = gate_result.evidence or f"applied {len(migration_files)} prod migration(s)"
+    _release_evidence(result, request, f"prod migration gate: {evidence}")
+    return True
+
+
+def execute_release_authority_workflow(request: ReleaseWorkflowRequest) -> ReleaseWorkflowResult:
+    """Execute DailyChingu RELEASE_AUTHORITY through main promotion.
+
+    Positive path:
+    1. resolve live card / release phrase / repo profile,
+    2. verify the release checkout is clean,
+    3. verify ``develop`` can fast-forward into ``main``,
+    4. detect Supabase migrations and apply/verify them against prod DB only,
+    5. integrate ``develop`` into ``main``,
+    6. verify main contains the release result and record evidence.
+    """
+    result = ReleaseWorkflowResult(success=False)
+    phrase = normalize_owner_authority_phrase(request.owner_phrase)
+    if phrase.decision != RELEASE_AUTHORITY or not phrase.executable:
+        return _release_block(result, f"authority_not_release:{phrase.decision}")
+    if not request.linear_issue_id:
+        return _release_block(result, "no_live_card")
+
+    base_repo = _resolve_base_repo_root(request.repo_path)
+    if base_repo is None:
+        return _release_block(result, "repo_not_git")
+    profile = resolve_repo_workflow_profile(base_repo)
+    if not _ensure_profile(profile):
+        return _release_block(result, "repo_profile_missing_or_not_dailychingu")
+    assert profile is not None
+
+    integration_branch = profile.integration_branch or "develop"
+    production_branch = profile.production_branch or "main"
+    migration_files, migration_detection_error = _changed_migration_files(base_repo, production_branch, integration_branch)
+    if migration_detection_error:
+        return _release_block(result, "prod_migration_detection_failed")
+
+    _release_evidence(result, request, f"release authority: {request.linear_issue_id}")
+
+    if not _status_clean(base_repo):
+        return _release_block(result, "dirty_release_checkout")
+    checkout = _run_git(base_repo, "checkout", production_branch)
+    if checkout.returncode != 0:
+        return _release_block(result, "production_branch_checkout_failed")
+    if not _status_clean(base_repo):
+        return _release_block(result, "dirty_release_checkout")
+
+    mergeable = _run_git(base_repo, "merge-base", "--is-ancestor", production_branch, integration_branch)
+    if mergeable.returncode != 0:
+        return _release_block(result, "unreleasable_integration_branch")
+    integration_commit = _git_output(base_repo, "rev-parse", "--verify", integration_branch)
+    _release_evidence(result, request, f"develop release candidate: {integration_commit[:12]}")
+
+    if migration_files:
+        _release_evidence(result, request, f"production migration files detected: {', '.join(migration_files)}")
+        if not _apply_prod_migration_gate(result, request, migration_files):
+            return result
+
+    merge = _run_git(base_repo, "merge", "--ff-only", integration_branch)
+    if merge.returncode != 0:
+        return _release_block(result, "unreleasable_integration_branch")
+
+    contains = _run_git(base_repo, "merge-base", "--is-ancestor", integration_commit, production_branch)
+    if contains.returncode != 0:
+        return _release_block(result, "main_does_not_contain_develop_result")
+    result.release_commit = _git_output(base_repo, "rev-parse", production_branch)
+    _release_evidence(result, request, f"main release truth: {result.release_commit[:12]}")
+
+    result.success = True
+    result.release_executed = True
+    return result
 
 
 def execute_push_authority_workflow(request: PushWorkflowRequest) -> PushWorkflowResult:

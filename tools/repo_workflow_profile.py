@@ -50,7 +50,7 @@ _DAILYCHINGU_PROFILE = RepoWorkflowProfile(
     push_approval_token="push 승인",
     push_workflow_summary="DailyChingu push authority integrates the task result into develop (merge/ff included), verifies that integration truth, then cleans up task-owned residue.",
     release_approval_token="release 승인",
-    release_workflow_summary="DailyChingu release authority follows the develop -> main release path.",
+    release_workflow_summary="DailyChingu release authority follows the develop -> main release path and gates Supabase migrations on governed production DB apply/verify before main promotion.",
 )
 
 
