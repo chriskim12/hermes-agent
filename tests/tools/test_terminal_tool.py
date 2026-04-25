@@ -114,11 +114,22 @@ def test_omx_ralph_forced_tmux_is_detected_after_default_flags():
     assert terminal_tool._looks_like_forced_tmux_omx_ralph(command)
 
 
-def test_omx_ralph_direct_mode_is_not_blocked_shape():
+def test_omx_ralph_direct_cli_shape_is_noninteractive_blocked():
     command = terminal_tool._apply_default_omx_launch_flags('omx ralph "ship it"')
 
     assert command == 'omx --madmax --high ralph "ship it"'
     assert not terminal_tool._looks_like_forced_tmux_omx_ralph(command)
+    assert terminal_tool._looks_like_noninteractive_omx_ralph(command)
+
+
+def test_terminal_tool_rejects_plain_ralph_without_pty():
+    result = json.loads(terminal_tool.terminal_tool(command='omx ralph "ship it"'))
+
+    assert result["status"] == "error"
+    assert result["exit_code"] == 64
+    assert result["blocked_reason"] == "omx_ralph_cli_noninteractive"
+    assert "valid persistent `$ralph` session surface" in result["error"]
+    assert "omx --madmax --high exec" in result["error"]
 
 
 def test_terminal_tool_rejects_forced_tmux_ralph_without_pty():
@@ -127,7 +138,7 @@ def test_terminal_tool_rejects_forced_tmux_ralph_without_pty():
     assert result["status"] == "error"
     assert result["exit_code"] == 64
     assert result["blocked_reason"] == "omx_ralph_forced_tmux_noninteractive"
-    assert "non-interactive" in result["error"]
+    assert "valid persistent `$ralph` session surface" in result["error"]
 
 
 def test_terminal_tool_allows_forced_tmux_ralph_when_pty_requested(monkeypatch):

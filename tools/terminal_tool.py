@@ -1285,34 +1285,53 @@ def _looks_like_omx_delegation(command: str) -> bool:
     return infer_omx_lane_from_command(command) is not None
 
 
-def _looks_like_forced_tmux_omx_ralph(command: str) -> bool:
-    """Return True for OMX Ralph launches that force detached tmux attach.
+def _omx_command_has_lane(command: str, lane_name: str) -> bool:
+    """Return True when a real ``omx`` command segment selects *lane_name*.
 
-    Hermes terminal calls are non-interactive unless the caller explicitly asks
-    for PTY mode. Upstream OMX normally routes non-TTY Ralph to direct mode, but
-    `--tmux` forces the detached tmux path and then tries `tmux attach-session`,
-    which fails in Hermes with `open terminal failed` / `failed to attach`.
+    This intentionally inspects shell-ish command words instead of broad string
+    containment so prose such as ``echo 'omx ralph'`` does not trigger policy
+    guards. Global OMX flags may appear before the lane subcommand.
     """
     try:
         tokens = shlex.split(str(command or ""))
     except Exception:
-        return bool(re.search(r"\bomx\b(?=[\s\S]*\bralph\b)(?=[\s\S]*\b--tmux\b)", str(command or "")))
+        return bool(re.search(rf"\bomx\b(?=[\s\S]*\b{re.escape(lane_name)}\b)", str(command or "")))
 
     separators = {"&&", "||", ";", "|"}
     lanes = {"exec", "plan", "ralplan", "ralph", "team"}
     for idx, token in enumerate(tokens):
         if token != "omx":
             continue
-        segment = []
         for candidate in tokens[idx + 1:]:
             if candidate in separators:
                 break
-            segment.append(candidate)
-        if "--tmux" not in segment:
-            continue
-        if any(candidate == "ralph" for candidate in segment if candidate in lanes):
-            return True
+            if candidate in lanes:
+                return candidate == lane_name
     return False
+
+
+def _looks_like_forced_tmux_omx_ralph(command: str) -> bool:
+    """Return True for OMX Ralph launches that force detached tmux attach."""
+    if not _omx_command_has_lane(command, "ralph"):
+        return False
+    try:
+        tokens = shlex.split(str(command or ""))
+    except Exception:
+        return bool(re.search(r"\bomx\b(?=[\s\S]*\bralph\b)(?=[\s\S]*\b--tmux\b)", str(command or "")))
+    return "--tmux" in tokens
+
+
+def _looks_like_noninteractive_omx_ralph(command: str) -> bool:
+    """Return True for CLI Ralph launches from Hermes' non-PTY terminal lane.
+
+    Upstream persistent Ralph is an in-session ``$ralph`` surface inside a real
+    OMX/Codex leader session. A Hermes non-interactive terminal command such as
+    ``omx --madmax --high ralph \"task\"`` is not that surface; live smoke on
+    this host currently fails before useful execution with Codex subcommand
+    parsing (``unrecognized subcommand 'task'``). Fail closed so command shape
+    alone cannot be misreported as a valid persistent handoff.
+    """
+    return _omx_command_has_lane(command, "ralph")
 
 
 def _maybe_mark_gateway_work_delegated(
@@ -1434,18 +1453,24 @@ def terminal_tool(
             }, ensure_ascii=False)
 
         command = _apply_default_omx_launch_flags(command)
-        if not pty and _looks_like_forced_tmux_omx_ralph(command):
+        if not pty and _looks_like_noninteractive_omx_ralph(command):
+            blocked_reason = (
+                "omx_ralph_forced_tmux_noninteractive"
+                if _looks_like_forced_tmux_omx_ralph(command)
+                else "omx_ralph_cli_noninteractive"
+            )
             return json.dumps({
                 "output": "",
                 "exit_code": 64,
                 "error": (
-                    "Blocked unsafe OMX Ralph launch: Hermes non-interactive terminal cannot "
-                    "attach detached tmux sessions. Use plain `omx ralph \"<task>\"` for "
-                    "direct mode, use `omx exec` for a bounded slice, or reroute to a real "
-                    "PTY/tmux lane."
+                    "Blocked unsafe OMX Ralph launch: Hermes non-interactive terminal is not "
+                    "a valid persistent `$ralph` session surface. Live non-TTY smoke for "
+                    "`omx --madmax --high ralph \"task\"` fails before useful execution. "
+                    "Use `omx --madmax --high exec` for a bounded noninteractive slice, or "
+                    "launch `$ralph` inside a real OMX/Codex PTY/tmux session."
                 ),
                 "status": "error",
-                "blocked_reason": "omx_ralph_forced_tmux_noninteractive",
+                "blocked_reason": blocked_reason,
             }, ensure_ascii=False)
 
         # Get configuration
