@@ -2001,95 +2001,15 @@ class GatewayRunner:
             close_disposition=closeout["close_disposition"],
         )
 
-    @staticmethod
-    def _ralplan_state_is_terminal(payload: Any) -> bool:
-        if not isinstance(payload, dict):
-            return False
-        if payload.get("approved") is True:
-            return True
-        current_phase = str(payload.get("current_phase", "") or "").strip().lower()
-        status = str(payload.get("status", "") or "").strip().lower()
-        return current_phase in {"complete", "completed"} or status == "completed"
-
     async def _consume_owner_wake_files_once(self) -> int:
-        work_state_store = getattr(self, "work_state_store", None)
-        if work_state_store is None:
-            return 0
+        """Deprecated compatibility shim for the removed Hermes file-polling wake path.
 
-        from gateway.work_state import record_has_closed_usable_outcome
-
-        roots: list[Path] = []
-        seen_roots: set[str] = set()
-        for record in work_state_store.list_records():
-            if record.owner != "hermes" or record.executor != "omx" or record.mode != "delegated":
-                continue
-            if record.state not in {"created", "running", "blocked", "stale", "retry_needed", "handoff_needed", "failed"}:
-                continue
-            if record_has_closed_usable_outcome(record):
-                continue
-            root_text = str(record.worktree_path or record.repo_path or "").strip()
-            if not root_text:
-                continue
-            if root_text in seen_roots:
-                continue
-            seen_roots.add(root_text)
-            roots.append(Path(root_text))
-
-        consumed = 0
-        for root in roots:
-            candidate_files: list[Path] = []
-            direct_state = root / ".omx" / "ralplan-state.json"
-            if direct_state.exists():
-                candidate_files.append(direct_state)
-            sessions_dir = root / ".omx" / "state" / "sessions"
-            if sessions_dir.exists():
-                candidate_files.extend(sorted(sessions_dir.glob("*/ralplan-state.json")))
-
-            for state_path in candidate_files:
-                try:
-                    payload = json.loads(state_path.read_text(encoding="utf-8"))
-                except Exception:
-                    continue
-                if not self._ralplan_state_is_terminal(payload):
-                    continue
-
-                next_action = str(payload.get("next_action", "") or "").strip()
-                if not next_action:
-                    next_action = "Inspect the approved ralplan before continuing execution"
-                proof = str(payload.get("proof", "") or "").strip()
-                if not proof:
-                    proof = f"ralplan_state:{state_path}"
-                executor_session_id = str(payload.get("executor_session_id", "") or "").strip() or None
-
-                result = await self.handle_delegated_ingress_packet(
-                    {
-                        "owner": "hermes",
-                        "executor": "omx",
-                        "executor_session_id": executor_session_id,
-                        "worktree_path": str(root),
-                        "state": "handoff_needed",
-                        "usable_outcome": "handoff_needed",
-                        "close_disposition": "close",
-                        "next_action": next_action,
-                        "proof": proof,
-                    },
-                    route_name="owner-wake-file",
-                    delivery_id=str(state_path),
-                )
-                if result.get("status") == "accepted" and result.get("resolution") == "single_match":
-                    consumed += 1
-                    break
-        return consumed
-
-    async def _owner_wake_file_watcher(self, interval: int = 5) -> None:
-        while self._running:
-            try:
-                await self._consume_owner_wake_files_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.debug("Owner wake file watcher iteration failed", exc_info=True)
-            await asyncio.sleep(interval)
+        Upstream OMX owns Ralph/Ralplan state and session artifacts.  Hermes must
+        not infer completion by scraping ``.omx`` state files; delegated progress
+        has to arrive through an upstream-owned runtime surface such as
+        ``omx tmux-hook``/notify-hook or an explicit delegated ingress packet.
+        """
+        return 0
 
     def _begin_direct_work_record(
         self,
@@ -2680,10 +2600,6 @@ class GatewayRunner:
         _expiry_task = asyncio.create_task(self._session_expiry_watcher())
         self._background_tasks.add(_expiry_task)
         _expiry_task.add_done_callback(self._background_tasks.discard)
-
-        _owner_wake_task = asyncio.create_task(self._owner_wake_file_watcher())
-        self._background_tasks.add(_owner_wake_task)
-        _owner_wake_task.add_done_callback(self._background_tasks.discard)
 
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:

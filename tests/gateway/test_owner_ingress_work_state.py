@@ -1260,7 +1260,7 @@ async def test_handle_delegated_ingress_packet_rejects_ambiguous_match(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_consume_owner_wake_files_once_wakes_owner_for_single_match_ralplan_state(tmp_path):
+async def test_consume_owner_wake_files_once_ignores_ralplan_state_file_completion(tmp_path):
     runner, store, work_state_store = _make_runner(tmp_path)
     source = _make_source()
     session_entry = store.get_or_create_session(source)
@@ -1304,22 +1304,18 @@ async def test_consume_owner_wake_files_once_wakes_owner_for_single_match_ralpla
 
     consumed = await GatewayRunner._consume_owner_wake_files_once(runner)
 
-    assert consumed == 1
+    assert consumed == 0
     capture_adapter = runner.adapters[Platform.TELEGRAM]
-    assert len(capture_adapter.events) == 1
-    event = capture_adapter.events[0]
-    assert event.internal is True
-    assert "wk-ralplan-single-1" in event.text
-    assert "Inspect the approved ralplan before continuing execution" in event.text
-    assert "ralplan-state:approved" in event.text
+    assert capture_adapter.events == []
 
     record = work_state_store.resolve_delegated_signal_candidate(
         work_id="wk-ralplan-single-1",
         live_only=False,
     )["record"]
-    assert record.state == "handoff_needed"
-    assert record.close_disposition == "close"
-    assert record.usable_outcome == "handoff_needed"
+    assert record.state == "running"
+    assert record.close_disposition is None
+    assert record.usable_outcome is None
+    assert record.proof == "delegated_handoff:test"
 
 
 @pytest.mark.asyncio
