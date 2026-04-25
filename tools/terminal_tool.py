@@ -1275,7 +1275,13 @@ def _apply_default_omx_launch_flags(command: str) -> str:
     if not text.strip() or "omx " not in text:
         return text
 
-    pattern = re.compile(r"\bomx\s+(?![^\n]*\b--madmax\b)(?![^\n]*\b--high\b)(exec|plan|ralplan|ralph|team)\b")
+    # Only bounded noninteractive OMX lanes may receive default launch flags.
+    # Upstream persistent skill surfaces such as `$ralph` and `$team` are not
+    # Codex subcommands; rewriting them to `omx --madmax --high ralph/team ...`
+    # bypasses OMX's dispatcher and hands the lane token to Codex, which fails
+    # before useful execution. Keep those surfaces exact and let the dedicated
+    # policy guards decide whether the current Hermes terminal surface is valid.
+    pattern = re.compile(r"\bomx\s+(?![^\n]*\b--madmax\b)(?![^\n]*\b--high\b)(exec|plan|ralplan)\b")
     return pattern.sub(r"omx --madmax --high \1", text)
 
 
@@ -1466,7 +1472,7 @@ def terminal_tool(
                     "Blocked unsafe OMX Ralph launch: Hermes non-interactive terminal is not "
                     "a valid persistent `$ralph` session surface. Live non-TTY smoke for "
                     "`omx --madmax --high ralph \"task\"` fails before useful execution. "
-                    "Use `omx --madmax --high exec` for a bounded noninteractive slice, or "
+                    "Use `omx exec` for a bounded noninteractive slice, or "
                     "launch `$ralph` inside a real OMX/Codex PTY/tmux session."
                 ),
                 "status": "error",

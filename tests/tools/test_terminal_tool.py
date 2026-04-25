@@ -110,16 +110,22 @@ def test_validate_workdir_blocks_shell_metacharacters_in_windows_paths():
 def test_omx_ralph_forced_tmux_is_detected_after_default_flags():
     command = terminal_tool._apply_default_omx_launch_flags('omx ralph --tmux "ship it"')
 
-    assert command == 'omx --madmax --high ralph --tmux "ship it"'
+    assert command == 'omx ralph --tmux "ship it"'
     assert terminal_tool._looks_like_forced_tmux_omx_ralph(command)
 
 
 def test_omx_ralph_direct_cli_shape_is_noninteractive_blocked():
     command = terminal_tool._apply_default_omx_launch_flags('omx ralph "ship it"')
 
-    assert command == 'omx --madmax --high ralph "ship it"'
+    assert command == 'omx ralph "ship it"'
     assert not terminal_tool._looks_like_forced_tmux_omx_ralph(command)
     assert terminal_tool._looks_like_noninteractive_omx_ralph(command)
+
+
+def test_omx_persistent_skill_surfaces_are_not_rewritten_as_codex_subcommands():
+    assert terminal_tool._apply_default_omx_launch_flags('omx team 1:executor "ship it"') == 'omx team 1:executor "ship it"'
+    assert terminal_tool._apply_default_omx_launch_flags('omx ralph "ship it"') == 'omx ralph "ship it"'
+    assert terminal_tool._apply_default_omx_launch_flags('omx exec "ship it"') == 'omx --madmax --high exec "ship it"'
 
 
 def test_terminal_tool_rejects_plain_ralph_without_pty():
@@ -129,7 +135,7 @@ def test_terminal_tool_rejects_plain_ralph_without_pty():
     assert result["exit_code"] == 64
     assert result["blocked_reason"] == "omx_ralph_cli_noninteractive"
     assert "valid persistent `$ralph` session surface" in result["error"]
-    assert "omx --madmax --high exec" in result["error"]
+    assert "omx exec" in result["error"]
 
 
 def test_terminal_tool_rejects_forced_tmux_ralph_without_pty():
@@ -164,4 +170,4 @@ def test_terminal_tool_allows_forced_tmux_ralph_when_pty_requested(monkeypatch):
     result = json.loads(terminal_tool.terminal_tool(command='omx ralph --tmux "ship it"', pty=True))
 
     assert result["exit_code"] == 0
-    assert "omx --madmax --high ralph --tmux" in result["output"]
+    assert "omx ralph --tmux" in result["output"]
