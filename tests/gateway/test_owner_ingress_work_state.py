@@ -1730,3 +1730,106 @@ async def test_delegated_ingress_webhook_route_calls_gateway_runner(tmp_path):
     capture_adapter = runner.adapters[Platform.TELEGRAM]
     assert len(capture_adapter.events) == 1
     assert "wk-delegated-webhook-1" in capture_adapter.events[0].text
+
+
+@pytest.mark.asyncio
+async def test_handle_delegated_ingress_packet_uses_nested_context_normalized_event_aliases(tmp_path):
+    runner, store, work_state_store = _make_runner(tmp_path)
+    source = _make_source()
+    session_entry = store.get_or_create_session(source)
+    now = datetime.now(timezone.utc)
+    worktree_path = tmp_path / "alias-worktree"
+    worktree_path.mkdir()
+    work_state_store.upsert(
+        WorkRecord(
+            work_id="wk-context-alias-1",
+            title="delegated context alias work",
+            objective="resolve upstream context.normalized_event and session/tmux aliases",
+            owner="hermes",
+            executor="omx",
+            mode="delegated",
+            owner_session_id=session_entry.session_key,
+            state="running",
+            started_at=now,
+            last_progress_at=now,
+            next_action="Wait for upstream normalized event",
+            executor_session_id="omx-session-context-1",
+            tmux_session="omx-context-tmux",
+            repo_path=str(tmp_path),
+            worktree_path=str(worktree_path),
+            proof="delegated_handoff:test",
+        )
+    )
+
+    result = await GatewayRunner.handle_delegated_ingress_packet(
+        runner,
+        {
+            "owner": "hermes",
+            "executor": "omx",
+            "usable_outcome": "blocked",
+            "close_disposition": "close",
+            "next_action": "Wake the owner from upstream normalized context",
+            "proof": "omx:normalized-event:block",
+            "context": {
+                "normalized_event": "blocked",
+                "session_id": "omx-session-context-1",
+                "tmuxSession": "omx-context-tmux",
+                "repo_path": str(tmp_path),
+                "worktree_path": str(worktree_path),
+                "branch": "yuuka/ch-233",
+                "command": "$ralph continue",
+            },
+        },
+        route_name="delegated-ingress",
+        delivery_id="context-alias-001",
+    )
+
+    assert result["status"] == "accepted"
+    assert result["resolution"] == "single_match"
+    assert result["work_id"] == "wk-context-alias-1"
+    capture_adapter = runner.adapters[Platform.TELEGRAM]
+    assert len(capture_adapter.events) == 1
+    assert "wk-context-alias-1" in capture_adapter.events[0].text
+    assert "Wake the owner from upstream normalized context" in capture_adapter.events[0].text
+
+
+def test_mark_work_record_delegated_can_record_real_ralph_session_lane_truth(tmp_path):
+    runner, store, work_state_store = _make_runner(tmp_path)
+    source = _make_source()
+    session_entry = store.get_or_create_session(source)
+    work_id = GatewayRunner._begin_direct_work_record(
+        runner,
+        session_id=session_entry.session_id,
+        session_key=session_entry.session_key,
+        message_text="delegate persistent ralph work",
+        platform="telegram",
+        event_message_id="msg-ralph-delegated",
+    )
+
+    updated = GatewayRunner._mark_work_record_delegated(
+        runner,
+        work_id,
+        session_entry.session_key,
+        executor_session_id="proc-real-ralph-1",
+        tmux_session=None,
+        repo_path=str(tmp_path),
+        worktree_path=str(tmp_path),
+        next_action="Resume the in-session $ralph lane",
+        proof="ralph_session_surface:pty_process",
+        current_lane="ralph",
+    )
+
+    assert updated is True
+    record = work_state_store.resolve_delegated_signal_candidate(
+        work_id=work_id,
+        executor_session_id="proc-real-ralph-1",
+        live_only=False,
+    )["record"]
+    assert record.mode == "delegated"
+    assert record.executor == "omx"
+    assert record.proof == "ralph_session_surface:pty_process"
+    assert record.executor_session_id == "proc-real-ralph-1"
+    assert record.current_lane == "ralph"
+    assert record.planning_gate == "closed"
+    assert record.next_execution_branch == "ralph"
+    assert record.close_authority == "hermes"

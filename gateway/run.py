@@ -1576,17 +1576,62 @@ class GatewayRunner:
     ) -> Dict[str, Any]:
         """Resolve an OMX/clawhip delegated signal back to one owner work record."""
         payload = payload or {}
-        owner = str(payload.get("owner", "")).strip()
-        executor = str(payload.get("executor", "")).strip() or "omx"
-        work_id = str(payload.get("work_id", "")).strip() or None
-        owner_session_id = str(payload.get("owner_session_id", "")).strip() or None
-        executor_session_id = str(payload.get("executor_session_id", "")).strip() or None
-        tmux_session = str(payload.get("tmux_session", payload.get("tmuxSession", ""))).strip() or None
-        repo_path = str(payload.get("repo_path", "")).strip() or None
-        worktree_path = str(payload.get("worktree_path", "")).strip() or None
-        state = str(payload.get("state", "")).strip() or str(payload.get("normalized_event", "")).strip().replace("-", "_")
-        next_action = str(payload.get("next_action", "")).strip()
-        proof = str(payload.get("proof", "")).strip()
+        context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+
+        def _first_text(*values: Any) -> Optional[str]:
+            for value in values:
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text:
+                    return text
+            return None
+
+        owner = _first_text(payload.get("owner"), context.get("owner")) or ""
+        executor = _first_text(payload.get("executor"), context.get("executor")) or "omx"
+        work_id = _first_text(payload.get("work_id"), payload.get("workId"), context.get("work_id"), context.get("workId"))
+        owner_session_id = _first_text(
+            payload.get("owner_session_id"),
+            payload.get("ownerSessionId"),
+            context.get("owner_session_id"),
+            context.get("ownerSessionId"),
+        )
+        executor_session_id = _first_text(
+            payload.get("executor_session_id"),
+            payload.get("executorSessionId"),
+            payload.get("session_id"),
+            payload.get("sessionId"),
+            context.get("executor_session_id"),
+            context.get("executorSessionId"),
+            context.get("session_id"),
+            context.get("sessionId"),
+        )
+        tmux_session = _first_text(
+            payload.get("tmux_session"),
+            payload.get("tmuxSession"),
+            payload.get("session_name"),
+            payload.get("sessionName"),
+            context.get("tmux_session"),
+            context.get("tmuxSession"),
+            context.get("session_name"),
+            context.get("sessionName"),
+        )
+        repo_path = _first_text(payload.get("repo_path"), payload.get("repoPath"), context.get("repo_path"), context.get("repoPath"))
+        worktree_path = _first_text(
+            payload.get("worktree_path"),
+            payload.get("worktreePath"),
+            context.get("worktree_path"),
+            context.get("worktreePath"),
+        )
+        normalized_event = _first_text(
+            payload.get("normalized_event"),
+            payload.get("normalizedEvent"),
+            context.get("normalized_event"),
+            context.get("normalizedEvent"),
+        )
+        state = (_first_text(payload.get("state")) or (normalized_event or "").replace("-", "_"))
+        next_action = _first_text(payload.get("next_action"), payload.get("nextAction"), context.get("next_action"), context.get("nextAction")) or ""
+        proof = _first_text(payload.get("proof"), context.get("proof"), payload.get("error"), context.get("error")) or ""
 
         from gateway.work_state import (
             WAKE_STATES,
@@ -1887,6 +1932,10 @@ class GatewayRunner:
         worktree_path: Optional[str] = None,
         next_action: str = "Resume the delegated OMX work",
         proof: str = "delegated_handoff",
+        current_lane: Optional[str] = None,
+        planning_gate: Optional[str] = None,
+        next_execution_branch: Optional[str] = None,
+        close_authority: Optional[str] = None,
     ) -> bool:
         if not work_id:
             return False
@@ -1909,6 +1958,10 @@ class GatewayRunner:
             proof=proof,
             usable_outcome=None,
             close_disposition=None,
+            current_lane=current_lane,
+            planning_gate=planning_gate,
+            next_execution_branch=next_execution_branch,
+            close_authority=close_authority,
         )
 
     def _update_delegated_work_for_process(
