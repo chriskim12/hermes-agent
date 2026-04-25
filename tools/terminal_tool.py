@@ -1608,6 +1608,71 @@ def _foreground_background_guidance(command: str) -> str | None:
     return None
 
 
+def _apply_default_omx_launch_flags(command: str) -> str:
+    text = str(command or "")
+    if not text.strip() or "omx " not in text:
+        return text
+
+    pattern = re.compile(r"\bomx\s+(?![^\n]*\b--madmax\b)(?![^\n]*\b--high\b)(exec|plan|ralplan|ralph|team)\b")
+    return pattern.sub(r"omx --madmax --high \1", text)
+
+
+def _looks_like_omx_delegation(command: str) -> bool:
+    from gateway.work_state import infer_omx_lane_from_command
+
+    return infer_omx_lane_from_command(command) is not None
+
+
+def _omx_command_has_lane(command: str, lane_name: str) -> bool:
+    """Return True when a real ``omx`` command segment selects *lane_name*.
+
+    This intentionally inspects shell-ish command words instead of broad string
+    containment so prose such as ``echo 'omx ralph'`` does not trigger policy
+    guards. Global OMX flags may appear before the lane subcommand.
+    """
+    try:
+        tokens = shlex.split(str(command or ""))
+    except Exception:
+        return bool(re.search(rf"\bomx\b(?=[\s\S]*\b{re.escape(lane_name)}\b)", str(command or "")))
+
+    separators = {"&&", "||", ";", "|"}
+    lanes = {"exec", "plan", "ralplan", "ralph", "team"}
+    for idx, token in enumerate(tokens):
+        if token != "omx":
+            continue
+        for candidate in tokens[idx + 1:]:
+            if candidate in separators:
+                break
+            if candidate in lanes:
+                return candidate == lane_name
+    return False
+
+
+def _looks_like_forced_tmux_omx_ralph(command: str) -> bool:
+    """Return True for OMX Ralph launches that force detached tmux attach."""
+    if not _omx_command_has_lane(command, "ralph"):
+        return False
+    try:
+        tokens = shlex.split(str(command or ""))
+    except Exception:
+        return bool(re.search(r"\bomx\b(?=[\s\S]*\bralph\b)(?=[\s\S]*\b--tmux\b)", str(command or "")))
+    return "--tmux" in tokens
+
+
+def _looks_like_noninteractive_omx_ralph(command: str) -> bool:
+    """Return True for CLI Ralph launches from Hermes' non-PTY terminal lane.
+
+    Upstream persistent Ralph is an in-session ``$ralph`` surface inside a real
+    OMX/Codex leader session. A Hermes non-interactive terminal command such as
+    ``omx --madmax --high ralph \"task\"`` is not that surface; live smoke on
+    this host currently fails before useful execution with Codex subcommand
+    parsing (``unrecognized subcommand 'task'``). Fail closed so command shape
+    alone cannot be misreported as a valid persistent handoff.
+    """
+    return _omx_command_has_lane(command, "ralph")
+
+
+def _maybe_mark_gateway_work_delegated(
 def _resolve_notification_flag_conflict(
     *,
     notify_on_complete: bool,
@@ -1687,6 +1752,27 @@ def terminal_tool(
                 "exit_code": -1,
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
                 "status": "error",
+            }, ensure_ascii=False)
+
+        command = _apply_default_omx_launch_flags(command)
+        if not pty and _looks_like_noninteractive_omx_ralph(command):
+            blocked_reason = (
+                "omx_ralph_forced_tmux_noninteractive"
+                if _looks_like_forced_tmux_omx_ralph(command)
+                else "omx_ralph_cli_noninteractive"
+            )
+            return json.dumps({
+                "output": "",
+                "exit_code": 64,
+                "error": (
+                    "Blocked unsafe OMX Ralph launch: Hermes non-interactive terminal is not "
+                    "a valid persistent `$ralph` session surface. Live non-TTY smoke for "
+                    "`omx --madmax --high ralph \"task\"` fails before useful execution. "
+                    "Use `omx --madmax --high exec` for a bounded noninteractive slice, or "
+                    "launch `$ralph` inside a real OMX/Codex PTY/tmux session."
+                ),
+                "status": "error",
+                "blocked_reason": blocked_reason,
             }, ensure_ascii=False)
 
         # Get configuration
