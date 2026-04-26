@@ -1,16 +1,19 @@
 """Validated persistent `$ralph` session surfaces for Hermes→OMX handoff.
 
 Hermes non-TTY CLI commands such as ``omx ralph "task"`` are deliberately not
-persistent Ralph handoffs.  Persistent Ralph must be injected as the in-session
-``$ralph`` workflow keyword into a real OMX/Codex leader surface (PTY process or
-an existing tmux leader pane).  This module keeps the command/message contract
-small, testable, and reusable by gateway/operator code without pretending that a
-command-shape check is runtime progress.
+persistent Ralph handoffs.  Persistent Ralph must run on a real OMX/Codex PTY or
+tmux surface.  The most reliable upstream-aligned Hermes launch path is the
+official interactive ``omx ralph "task"`` entrypoint under PTY; prompt-side
+``$ralph`` remains valid only when a human/ready TUI can actually submit it.
+This module keeps the command/message contract small, testable, and reusable by
+gateway/operator code without pretending that a command-shape check is runtime
+progress.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import shlex
 from datetime import datetime
 from dataclasses import asdict, dataclass
@@ -45,13 +48,23 @@ def build_omx_leader_command() -> str:
     return "omx --madmax --high"
 
 
-def build_ralph_in_session_message(task: str) -> str:
-    """Build the message sent *inside* the OMX/Codex leader session."""
-
+def _normalize_task(task: str) -> str:
     text = " ".join(str(task or "").split())
     if not text:
         raise ValueError("missing_ralph_task")
-    return f"$ralph {shlex.quote(text)}"
+    return text
+
+
+def build_omx_ralph_command(task: str) -> str:
+    """Return the official upstream Ralph launcher for a real PTY surface."""
+
+    return f"omx ralph {shlex.quote(_normalize_task(task))}"
+
+
+def build_ralph_in_session_message(task: str) -> str:
+    """Build the prompt-side message sent *inside* an already-ready OMX/Codex leader."""
+
+    return f"$ralph {shlex.quote(_normalize_task(task))}"
 
 
 def validate_ralph_session_surface(
@@ -70,8 +83,9 @@ def validate_ralph_session_surface(
         "status": "error",
         "reason": "missing_real_ralph_session_surface",
         "message": (
-            "Persistent Ralph requires in-session `$ralph` inside an OMX/Codex "
-            "PTY/tmux leader surface; non-TTY CLI `omx ralph` is not valid."
+            "Persistent Ralph requires official `omx ralph <task>` or prompt-side "
+            "`$ralph` inside an OMX/Codex PTY/tmux leader surface; non-TTY CLI "
+            "`omx ralph` is not valid."
         ),
     }
 
@@ -105,7 +119,7 @@ def materialize_ralph_session_surface(
         tmux_session=tmux_session,
         repo_path=repo,
         worktree_path=worktree,
-        command=build_omx_leader_command(),
+        command=build_omx_ralph_command(task),
         injected_message=build_ralph_in_session_message(task),
     )
 
@@ -118,11 +132,12 @@ def launch_pty_ralph_session(
     session_key: str = "",
     process_registry: Any = None,
 ) -> RalphSessionSurface:
-    """Launch an OMX leader under PTY and inject `$ralph` into that session.
+    """Launch the official upstream Ralph entrypoint under a real PTY.
 
     The caller still owns runtime verification (poll/log inspection and cleanup).
-    This function only creates the valid surface and performs the in-session
-    injection, returning correlation metadata for work-state tracking.
+    This function only creates the valid interactive surface, returning
+    correlation metadata for work-state tracking.  It intentionally avoids the
+    Hermes non-PTY `omx ralph` path guarded by terminal_tool.
     """
 
     if process_registry is None:
@@ -130,25 +145,31 @@ def launch_pty_ralph_session(
 
     repo = str(Path(repo_path).expanduser().resolve())
     worktree = str(Path(worktree_path or repo).expanduser().resolve())
-    command = build_omx_leader_command()
+    command = build_omx_ralph_command(task)
+    env_vars = {"TERM": os.environ.get("TERM") or "xterm-256color"}
+    if env_vars["TERM"] in {"", "dumb", "unknown"}:
+        env_vars["TERM"] = "xterm-256color"
     session = process_registry.spawn_local(
         command,
         cwd=worktree,
         session_key=session_key,
+        env_vars=env_vars,
         use_pty=True,
     )
-    message = build_ralph_in_session_message(task)
-    result = process_registry.submit_stdin(session.id, message)
-    if result.get("status") != "ok":
-        raise RuntimeError(f"ralph_session_injection_failed:{result.get('error') or result.get('reason') or 'unknown'}")
-
-    return RalphSessionSurface(
-        executor_session_id=session.id,
-        tmux_session=None,
+    surface = materialize_ralph_session_surface(
+        task=task,
         repo_path=repo,
         worktree_path=worktree,
+        executor_session_id=session.id,
+        pty=True,
+    )
+    return RalphSessionSurface(
+        executor_session_id=surface.executor_session_id,
+        tmux_session=surface.tmux_session,
+        repo_path=surface.repo_path,
+        worktree_path=surface.worktree_path,
         command=command,
-        injected_message=message,
+        injected_message=surface.injected_message,
     )
 
 
@@ -165,11 +186,11 @@ def start_omx_ralph_lane(
 ) -> Dict[str, Any]:
     """Start a real upstream-aligned `$ralph` lane and record lane truth.
 
-    This is the Hermes operator path for CH-232/CH-229: launch an interactive
-    OMX/Codex leader under PTY, inject prompt-side ``$ralph`` into that session,
-    and optionally mark the matching Hermes work record as delegated to the
-    Ralph lane. It deliberately does not inspect or mutate ``.omx/state`` as
-    completion evidence; runtime closeout remains a separate verification step.
+    This is the Hermes operator path for CH-232/CH-229: launch the official
+    upstream Ralph CLI inside a real PTY and optionally mark the matching Hermes
+    work record as delegated to the Ralph lane. It deliberately does not inspect
+    or mutate ``.omx/state`` as completion evidence; runtime closeout remains a
+    separate verification step.
     """
 
     surface = launch_pty_ralph_session(
@@ -197,7 +218,11 @@ def start_omx_ralph_lane(
             repo_path=surface.repo_path,
             worktree_path=surface.worktree_path,
             next_action="Resume the in-session $ralph lane",
-            proof="ralph_session_surface:pty_process",
+            proof=(
+                "ralph_session_surface:tmux_session"
+                if surface.tmux_session
+                else "ralph_session_surface:pty_process"
+            ),
             usable_outcome=None,
             close_disposition=None,
             current_lane=surface.current_lane,
@@ -220,9 +245,9 @@ def start_omx_ralph_lane(
 OMX_RALPH_SCHEMA = {
     "name": "omx_ralph",
     "description": (
-        "Start an upstream-aligned persistent Ralph lane by launching a real "
-        "OMX/Codex PTY leader and injecting prompt-side `$ralph`. Use this "
-        "instead of noninteractive `omx ralph ...`."
+        "Start an upstream-aligned persistent Ralph lane by launching the official "
+        "interactive `omx ralph <task>` entrypoint in a real PTY. Use this "
+        "instead of noninteractive `omx ralph ...` or blind prompt-side `$ralph` injection."
     ),
     "parameters": {
         "type": "object",

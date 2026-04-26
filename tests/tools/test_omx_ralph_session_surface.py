@@ -2,6 +2,7 @@ import pytest
 
 from tools.omx_ralph_session_surface import (
     build_omx_leader_command,
+    build_omx_ralph_command,
     build_ralph_in_session_message,
     launch_pty_ralph_session,
     materialize_ralph_session_surface,
@@ -25,6 +26,7 @@ class _FakeRegistry:
                 "command": command,
                 "cwd": cwd,
                 "session_key": session_key,
+                "env_vars": env_vars,
                 "use_pty": use_pty,
             }
         )
@@ -50,8 +52,9 @@ class _FakeWorkStateStore:
         return True
 
 
-def test_builds_upstream_interactive_leader_and_in_session_ralph_message():
+def test_builds_upstream_interactive_leader_and_ralph_commands():
     assert build_omx_leader_command() == "omx --madmax --high"
+    assert build_omx_ralph_command("fix owner ingress") == "omx ralph 'fix owner ingress'"
     assert build_ralph_in_session_message("fix owner ingress") == "$ralph 'fix owner ingress'"
 
 
@@ -82,7 +85,7 @@ def test_materialize_ralph_session_surface_accepts_pty_process_with_lane_truth(t
     assert surface.planning_gate == "closed"
     assert surface.next_execution_branch == "ralph"
     assert surface.close_authority == "hermes"
-    assert surface.command == "omx --madmax --high"
+    assert surface.command == "omx ralph 'continue CH-232'"
     assert surface.injected_message == "$ralph 'continue CH-232'"
 
 
@@ -98,7 +101,7 @@ def test_materialize_ralph_session_surface_accepts_existing_tmux_leader(tmp_path
     assert surface.injected_message == "$ralph 'continue CH-232'"
 
 
-def test_launch_pty_ralph_session_spawns_omx_leader_and_injects_ralph(tmp_path):
+def test_launch_pty_ralph_session_spawns_official_omx_ralph_entrypoint(tmp_path):
     registry = _FakeRegistry()
     surface = launch_pty_ralph_session(
         task="throwaway smoke",
@@ -109,16 +112,16 @@ def test_launch_pty_ralph_session_spawns_omx_leader_and_injects_ralph(tmp_path):
 
     assert registry.spawned == [
         {
-            "command": "omx --madmax --high",
+            "command": "omx ralph 'throwaway smoke'",
             "cwd": str(tmp_path.resolve()),
             "session_key": "agent:main:discord:thread:1",
+            "env_vars": {"TERM": "xterm-256color"},
             "use_pty": True,
         }
     ]
-    assert registry.submitted == [
-        {"session_id": "proc-real-ralph-1", "data": "$ralph 'throwaway smoke'"}
-    ]
+    assert registry.submitted == []
     assert surface.executor_session_id == "proc-real-ralph-1"
+    assert surface.command == "omx ralph 'throwaway smoke'"
     assert surface.injected_message == "$ralph 'throwaway smoke'"
 
 
@@ -138,12 +141,10 @@ def test_start_omx_ralph_lane_is_operator_path_and_records_work_state(tmp_path):
 
     assert result["status"] == "accepted"
     assert result["work_state_updated"] is True
-    assert result["surface"]["command"] == "omx --madmax --high"
+    assert result["surface"]["command"] == "omx ralph 'continue CH-232'"
     assert result["surface"]["injected_message"] == "$ralph 'continue CH-232'"
     assert registry.spawned[0]["use_pty"] is True
-    assert registry.submitted == [
-        {"session_id": "proc-real-ralph-1", "data": "$ralph 'continue CH-232'"}
-    ]
+    assert registry.submitted == []
     assert store.updates[0]["work_id"] == "wk-ch232"
     assert store.updates[0]["owner_session_id"] == "owner-session-1"
     updates = store.updates[0]["updates"]
