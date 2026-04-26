@@ -10,10 +10,14 @@ command-shape check is runtime progress.
 
 from __future__ import annotations
 
+import json
 import shlex
+from datetime import datetime
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+from tools.registry import registry
 
 
 @dataclass(frozen=True)
@@ -146,3 +150,154 @@ def launch_pty_ralph_session(
         command=command,
         injected_message=message,
     )
+
+
+def start_omx_ralph_lane(
+    *,
+    task: str,
+    repo_path: str,
+    worktree_path: Optional[str] = None,
+    session_key: str = "",
+    work_id: Optional[str] = None,
+    owner_session_id: Optional[str] = None,
+    process_registry: Any = None,
+    work_state_store: Any = None,
+) -> Dict[str, Any]:
+    """Start a real upstream-aligned `$ralph` lane and record lane truth.
+
+    This is the Hermes operator path for CH-232/CH-229: launch an interactive
+    OMX/Codex leader under PTY, inject prompt-side ``$ralph`` into that session,
+    and optionally mark the matching Hermes work record as delegated to the
+    Ralph lane. It deliberately does not inspect or mutate ``.omx/state`` as
+    completion evidence; runtime closeout remains a separate verification step.
+    """
+
+    surface = launch_pty_ralph_session(
+        task=task,
+        repo_path=repo_path,
+        worktree_path=worktree_path,
+        session_key=session_key,
+        process_registry=process_registry,
+    )
+    record_updated = None
+    if work_id and owner_session_id:
+        if work_state_store is None:
+            from gateway.work_state import WorkStateStore
+
+            work_state_store = WorkStateStore()
+        record_updated = work_state_store.update_record(
+            work_id,
+            owner_session_id,
+            executor="omx",
+            mode="delegated",
+            state="running",
+            last_progress_at=datetime.now().astimezone(),
+            executor_session_id=surface.executor_session_id,
+            tmux_session=surface.tmux_session,
+            repo_path=surface.repo_path,
+            worktree_path=surface.worktree_path,
+            next_action="Resume the in-session $ralph lane",
+            proof="ralph_session_surface:pty_process",
+            usable_outcome=None,
+            close_disposition=None,
+            current_lane=surface.current_lane,
+            planning_gate=surface.planning_gate,
+            next_execution_branch=surface.next_execution_branch,
+            close_authority=surface.close_authority,
+        )
+
+    return {
+        "status": "accepted",
+        "surface": surface.to_dict(),
+        "work_state_updated": record_updated,
+        "verification_required": (
+            "Poll/log the returned executor_session_id and verify real OMX/Codex "
+            "output plus Ralph completion evidence before closeout."
+        ),
+    }
+
+
+OMX_RALPH_SCHEMA = {
+    "name": "omx_ralph",
+    "description": (
+        "Start an upstream-aligned persistent Ralph lane by launching a real "
+        "OMX/Codex PTY leader and injecting prompt-side `$ralph`. Use this "
+        "instead of noninteractive `omx ralph ...`."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task": {
+                "type": "string",
+                "description": "Specific task text to pass to `$ralph` inside the OMX session.",
+            },
+            "repo_path": {
+                "type": "string",
+                "description": "Repository root for the OMX leader session.",
+            },
+            "worktree_path": {
+                "type": "string",
+                "description": "Optional worktree/current working directory for the session; defaults to repo_path.",
+            },
+            "session_key": {
+                "type": "string",
+                "description": "Optional Hermes owner session key for process correlation.",
+            },
+            "work_id": {
+                "type": "string",
+                "description": "Optional Hermes work-state id to mark as delegated to Ralph.",
+            },
+            "owner_session_id": {
+                "type": "string",
+                "description": "Owner session id required when work_id is provided.",
+            },
+        },
+        "required": ["task", "repo_path"],
+    },
+}
+
+
+def omx_ralph_tool(
+    *,
+    task: str,
+    repo_path: str,
+    worktree_path: Optional[str] = None,
+    session_key: str = "",
+    work_id: Optional[str] = None,
+    owner_session_id: Optional[str] = None,
+) -> str:
+    try:
+        result = start_omx_ralph_lane(
+            task=task,
+            repo_path=repo_path,
+            worktree_path=worktree_path,
+            session_key=session_key,
+            work_id=work_id,
+            owner_session_id=owner_session_id,
+        )
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps(
+            {
+                "status": "error",
+                "error": str(exc),
+                "blocked_reason": "omx_ralph_lane_start_failed",
+            },
+            ensure_ascii=False,
+        )
+
+
+registry.register(
+    name="omx_ralph",
+    toolset="terminal",
+    schema=OMX_RALPH_SCHEMA,
+    handler=lambda args, **kw: omx_ralph_tool(
+        task=args.get("task", ""),
+        repo_path=args.get("repo_path", ""),
+        worktree_path=args.get("worktree_path"),
+        session_key=args.get("session_key", ""),
+        work_id=args.get("work_id"),
+        owner_session_id=args.get("owner_session_id"),
+    ),
+    emoji="🧠",
+)

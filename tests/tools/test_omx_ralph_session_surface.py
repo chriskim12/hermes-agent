@@ -5,6 +5,7 @@ from tools.omx_ralph_session_surface import (
     build_ralph_in_session_message,
     launch_pty_ralph_session,
     materialize_ralph_session_surface,
+    start_omx_ralph_lane,
     validate_ralph_session_surface,
 )
 
@@ -32,6 +33,21 @@ class _FakeRegistry:
     def submit_stdin(self, session_id, data):
         self.submitted.append({"session_id": session_id, "data": data})
         return {"status": "ok"}
+
+
+class _FakeWorkStateStore:
+    def __init__(self):
+        self.updates = []
+
+    def update_record(self, work_id, owner_session_id, **updates):
+        self.updates.append(
+            {
+                "work_id": work_id,
+                "owner_session_id": owner_session_id,
+                "updates": updates,
+            }
+        )
+        return True
 
 
 def test_builds_upstream_interactive_leader_and_in_session_ralph_message():
@@ -104,3 +120,39 @@ def test_launch_pty_ralph_session_spawns_omx_leader_and_injects_ralph(tmp_path):
     ]
     assert surface.executor_session_id == "proc-real-ralph-1"
     assert surface.injected_message == "$ralph 'throwaway smoke'"
+
+
+def test_start_omx_ralph_lane_is_operator_path_and_records_work_state(tmp_path):
+    registry = _FakeRegistry()
+    store = _FakeWorkStateStore()
+
+    result = start_omx_ralph_lane(
+        task="continue CH-232",
+        repo_path=str(tmp_path),
+        session_key="agent:main:discord:thread:1",
+        work_id="wk-ch232",
+        owner_session_id="owner-session-1",
+        process_registry=registry,
+        work_state_store=store,
+    )
+
+    assert result["status"] == "accepted"
+    assert result["work_state_updated"] is True
+    assert result["surface"]["command"] == "omx --madmax --high"
+    assert result["surface"]["injected_message"] == "$ralph 'continue CH-232'"
+    assert registry.spawned[0]["use_pty"] is True
+    assert registry.submitted == [
+        {"session_id": "proc-real-ralph-1", "data": "$ralph 'continue CH-232'"}
+    ]
+    assert store.updates[0]["work_id"] == "wk-ch232"
+    assert store.updates[0]["owner_session_id"] == "owner-session-1"
+    updates = store.updates[0]["updates"]
+    assert updates["executor"] == "omx"
+    assert updates["mode"] == "delegated"
+    assert updates["state"] == "running"
+    assert updates["executor_session_id"] == "proc-real-ralph-1"
+    assert updates["proof"] == "ralph_session_surface:pty_process"
+    assert updates["current_lane"] == "ralph"
+    assert updates["planning_gate"] == "closed"
+    assert updates["next_execution_branch"] == "ralph"
+    assert updates["close_authority"] == "hermes"
