@@ -6593,8 +6593,7 @@ class GatewayRunner:
                     task_id=task_id,
                 )
 
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, run_sync)
+            result = await self._run_in_executor_with_context(run_sync)
 
             response = result.get("final_response", "") if result else ""
             if not response and result and result.get("error"):
@@ -6776,8 +6775,7 @@ class GatewayRunner:
                     task_id=task_id,
                 )
 
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, run_sync)
+            result = await self._run_in_executor_with_context(run_sync)
 
             response = (result.get("final_response") or "") if result else ""
             if not response and result and result.get("error"):
@@ -8209,6 +8207,20 @@ class GatewayRunner:
         """Restore session context variables to their pre-handler values."""
         from gateway.session_context import clear_session_vars
         clear_session_vars(tokens)
+
+    async def _run_in_executor_with_context(self, func, *args):
+        """Run a sync callable in the executor while preserving contextvars.
+
+        asyncio's run_in_executor does not copy contextvars into worker threads
+        automatically. Gateway session metadata (platform/chat/thread) lives in
+        contextvars, and tools need that metadata for platform-specific behavior
+        such as Discord TTS normalization.
+        """
+        from contextvars import copy_context
+
+        loop = asyncio.get_event_loop()
+        ctx = copy_context()
+        return await loop.run_in_executor(None, lambda: ctx.run(func, *args))
     
     async def _enrich_message_with_vision(
         self,
@@ -9866,7 +9878,7 @@ class GatewayRunner:
             _warning_fired = False
             loop = asyncio.get_event_loop()
             _executor_task = asyncio.ensure_future(
-                loop.run_in_executor(None, run_sync)
+                self._run_in_executor_with_context(run_sync)
             )
 
             _inactivity_timeout = False
