@@ -4803,9 +4803,11 @@ class GatewayRunner:
             # Use the filtered history length (history_offset) that was actually
             # passed to the agent, not len(history) which includes session_meta
             # entries that were stripped before the agent saw them.
+            current_turn_messages = []
             if not agent_failed_early:
                 history_len = agent_result.get("history_offset", len(history))
-                new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
+                current_turn_messages = self._current_turn_agent_messages(agent_messages, history_len)
+                new_messages = current_turn_messages
                 
                 # If no new messages found (edge case), fall back to simple user/assistant
                 if not new_messages:
@@ -4852,7 +4854,7 @@ class GatewayRunner:
             # Explicit text_to_speech requests still flow through tool calls; this path
             # only adds a fail-closed automatic generated reply for short, non-technical
             # responses when no clip/audio tool already claimed the turn.
-            await self._maybe_send_generated_tts_reply(event, response, agent_messages)
+            await self._maybe_send_generated_tts_reply(event, response, current_turn_messages)
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -6134,6 +6136,32 @@ class GatewayRunner:
         )
 
         await adapter.handle_message(event)
+
+    @staticmethod
+    def _current_turn_agent_messages(agent_messages: Optional[list], history_len: Any) -> list:
+        """Return the messages produced for the currently handled user turn.
+
+        ``agent_messages`` may contain the full reconstructed conversation,
+        including compacted handoff/reference text from earlier turns.  Generated
+        TTS decisions must not scan that older transcript, because old assistant
+        explanations can mention ``MEDIA:`` or ``[[audio_as_voice]]`` and look
+        like the current turn already claimed audio.
+        """
+        if not isinstance(agent_messages, list):
+            return []
+        try:
+            offset = int(history_len or 0)
+        except (TypeError, ValueError):
+            offset = 0
+        offset = max(0, min(offset, len(agent_messages)))
+        current = agent_messages[offset:]
+
+        # Be defensive when history_offset is stale or unavailable: keep only
+        # the latest user turn and the assistant/tool messages that followed it.
+        for idx in range(len(current) - 1, -1, -1):
+            if current[idx].get("role") == "user":
+                return current[idx:]
+        return current
 
     def _agent_called_tool(self, agent_messages: list, tool_name: str) -> bool:
         tool_name = str(tool_name or "").strip()

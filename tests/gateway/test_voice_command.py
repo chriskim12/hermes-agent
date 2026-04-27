@@ -2701,6 +2701,36 @@ class TestGeneratedDiscordThreadTtsPolicy:
 
         assert runner._should_send_generated_tts_reply(event, response, agent_messages) is True
 
+    def test_current_turn_slice_ignores_prior_assistant_audio_claims(self, runner):
+        event = _make_discord_thread_event()
+        agent_messages = [
+            {"role": "user", "content": "old question"},
+            {
+                "role": "assistant",
+                "content": "Old diagnostic mentioned [[audio_as_voice]] and MEDIA:/tmp/old.ogg.",
+            },
+            {"role": "user", "content": "new question"},
+            {"role": "assistant", "content": "Okay, I'll send the short update soon."},
+        ]
+        current = runner._current_turn_agent_messages(agent_messages, history_len=0)
+
+        assert current == agent_messages[2:]
+        assert runner._should_send_generated_tts_reply(
+            event,
+            "Okay, I'll send the short update soon.",
+            current,
+        ) is True
+
+    def test_current_turn_slice_uses_history_offset_when_available(self, runner):
+        agent_messages = [
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "new question"},
+            {"role": "assistant", "content": "new answer"},
+        ]
+
+        assert runner._current_turn_agent_messages(agent_messages, history_len=2) == agent_messages[2:]
+
     def test_generated_tts_skips_when_text_to_speech_tool_already_called(self, runner):
         event = _make_discord_thread_event()
         agent_messages = [
