@@ -28,6 +28,17 @@ LIVE_STATES = frozenset({
     "failed",
 })
 
+WORK_SESSION_LIFECYCLE_STATES = frozenset({
+    "active",
+    "waiting_user",
+    "stale",
+    "nudged",
+    "resolved",
+    "stopped",
+    "orphaned",
+})
+WORK_SESSION_WATCH_STATUSES = frozenset({"unwatched", "active", "inactive", "failed"})
+
 WAKE_STATES = frozenset({
     "blocked",
     "stale",
@@ -99,6 +110,22 @@ def _normalize_path_value(value: Optional[str]) -> Optional[str]:
             return str(Path(text).expanduser())
         except Exception:
             return text
+
+
+def _parse_event_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    text = str(value or "").strip()
+    if text:
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+    return _utcnow()
+
+
+def _compact_native_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {str(key): value for key, value in payload.items() if isinstance(key, str)}
 
 
 def normalize_usable_outcome(value: Optional[str]) -> Optional[str]:
@@ -414,6 +441,249 @@ class WorkRecord:
             next_execution_branch=data.get("next_execution_branch"),
             close_authority=data.get("close_authority"),
         )
+
+
+@dataclass
+class WorkSessionRecord:
+    provider: str
+    provider_session_id: str
+    linear_card_id: str
+    lane_id: str
+    lifecycle_state: str
+    started_at: datetime
+    last_event_at: datetime
+    last_event: str
+    repo_path: Optional[str] = None
+    worktree_path: Optional[str] = None
+    repo_name: Optional[str] = None
+    project: Optional[str] = None
+    branch: Optional[str] = None
+    directory: Optional[str] = None
+    tmux_session: Optional[str] = None
+    tmux_pane: Optional[str] = None
+    ingress_route: Optional[str] = None
+    first_delivery_id: Optional[str] = None
+    latest_delivery_id: Optional[str] = None
+    watch_status: str = "unwatched"
+    stopped_at: Optional[datetime] = None
+    native_event_metadata: Optional[Dict[str, Any]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "provider_session_id": self.provider_session_id,
+            "linear_card_id": self.linear_card_id,
+            "lane_id": self.lane_id,
+            "lifecycle_state": self.lifecycle_state,
+            "started_at": self.started_at.isoformat(),
+            "last_event_at": self.last_event_at.isoformat(),
+            "last_event": self.last_event,
+            "repo_path": self.repo_path,
+            "worktree_path": self.worktree_path,
+            "repo_name": self.repo_name,
+            "project": self.project,
+            "branch": self.branch,
+            "directory": self.directory,
+            "tmux_session": self.tmux_session,
+            "tmux_pane": self.tmux_pane,
+            "ingress_route": self.ingress_route,
+            "first_delivery_id": self.first_delivery_id,
+            "latest_delivery_id": self.latest_delivery_id,
+            "watch_status": self.watch_status,
+            "stopped_at": self.stopped_at.isoformat() if self.stopped_at else None,
+            "native_event_metadata": self.native_event_metadata or {},
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "WorkSessionRecord":
+        stopped_at = data.get("stopped_at")
+        return cls(
+            provider=str(data["provider"]),
+            provider_session_id=str(data["provider_session_id"]),
+            linear_card_id=str(data["linear_card_id"]),
+            lane_id=str(data["lane_id"]),
+            lifecycle_state=str(data.get("lifecycle_state", "active")),
+            started_at=datetime.fromisoformat(data["started_at"]),
+            last_event_at=datetime.fromisoformat(data["last_event_at"]),
+            last_event=str(data.get("last_event", "")),
+            repo_path=data.get("repo_path"),
+            worktree_path=data.get("worktree_path"),
+            repo_name=data.get("repo_name"),
+            project=data.get("project"),
+            branch=data.get("branch"),
+            directory=data.get("directory"),
+            tmux_session=data.get("tmux_session"),
+            tmux_pane=data.get("tmux_pane"),
+            ingress_route=data.get("ingress_route"),
+            first_delivery_id=data.get("first_delivery_id"),
+            latest_delivery_id=data.get("latest_delivery_id"),
+            watch_status=str(data.get("watch_status") or "unwatched"),
+            stopped_at=datetime.fromisoformat(stopped_at) if stopped_at else None,
+            native_event_metadata=data.get("native_event_metadata") or {},
+        )
+
+
+class WorkSessionRegistry:
+    """Hermes-owned registry for provider-native clawhip work sessions.
+
+    clawhip stays the generic native-event router. This registry stores Hermes
+    work-session linkage and lifecycle state from additive native-event metadata.
+    """
+
+    def __init__(self, path: Optional[Path] = None):
+        self.path = Path(path) if path is not None else get_hermes_home() / "gateway_work_sessions.json"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._records: List[WorkSessionRecord] = []
+        self._loaded = False
+        self._last_mtime_ns: Optional[int] = None
+
+    def _current_mtime_ns(self) -> Optional[int]:
+        try:
+            return self.path.stat().st_mtime_ns
+        except FileNotFoundError:
+            return None
+
+    def _ensure_loaded(self) -> None:
+        current_mtime_ns = self._current_mtime_ns()
+        if self._loaded and current_mtime_ns == self._last_mtime_ns:
+            return
+        if current_mtime_ns is None:
+            self._records = []
+            self._loaded = True
+            self._last_mtime_ns = None
+            return
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = []
+        if isinstance(payload, dict):
+            payload = payload.get("sessions", [])
+        self._records = [
+            WorkSessionRecord.from_dict(item)
+            for item in payload
+            if isinstance(item, dict)
+        ]
+        self._loaded = True
+        self._last_mtime_ns = current_mtime_ns
+
+    def _save_locked(self) -> None:
+        self.path.write_text(
+            json.dumps(
+                [record.to_dict() for record in self._records],
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self._last_mtime_ns = self._current_mtime_ns()
+
+    def list_sessions(self) -> List[WorkSessionRecord]:
+        with self._lock:
+            self._ensure_loaded()
+            return [WorkSessionRecord.from_dict(record.to_dict()) for record in self._records]
+
+    def get_session(self, provider: str, provider_session_id: str) -> Optional[WorkSessionRecord]:
+        provider = str(provider or "").strip()
+        provider_session_id = str(provider_session_id or "").strip()
+        with self._lock:
+            self._ensure_loaded()
+            for record in self._records:
+                if record.provider == provider and record.provider_session_id == provider_session_id:
+                    return WorkSessionRecord.from_dict(record.to_dict())
+        return None
+
+    def ingest_clawhip_native_event(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {"status": "rejected", "reason": "invalid_native_event_payload"}
+
+        provider = str(payload.get("provider") or "").strip()
+        provider_session_id = str(
+            payload.get("session_id") or payload.get("provider_session_id") or ""
+        ).strip()
+        event = str(payload.get("event") or payload.get("native_event") or "").strip()
+        if not provider or not provider_session_id or not event:
+            return {"status": "rejected", "reason": "missing_provider_session_or_event"}
+
+        event_at = _parse_event_datetime(payload.get("timestamp") or payload.get("event_at"))
+        metadata = _compact_native_metadata(payload)
+        normalized_event = event.lower().replace("_", "-")
+
+        with self._lock:
+            self._ensure_loaded()
+            existing_idx = None
+            existing = None
+            for idx, candidate in enumerate(self._records):
+                if candidate.provider == provider and candidate.provider_session_id == provider_session_id:
+                    existing_idx = idx
+                    existing = candidate
+                    break
+
+            linear_card_id = str(payload.get("linear_card_id") or payload.get("card_id") or "").strip()
+            lane_id = str(payload.get("lane_id") or payload.get("current_lane") or "").strip()
+            if existing is None and (not linear_card_id or not lane_id):
+                return {"status": "rejected", "reason": "missing_card_or_lane_linkage"}
+
+            if existing is None:
+                lifecycle_state = "waiting_user" if normalized_event == "userpromptsubmit" else "active"
+                watch_status = str(payload.get("watch_status") or "unwatched").strip() or "unwatched"
+                if watch_status not in WORK_SESSION_WATCH_STATUSES:
+                    watch_status = "unwatched"
+                record = WorkSessionRecord(
+                    provider=provider,
+                    provider_session_id=provider_session_id,
+                    linear_card_id=linear_card_id,
+                    lane_id=lane_id,
+                    lifecycle_state=lifecycle_state,
+                    started_at=event_at,
+                    last_event_at=event_at,
+                    last_event=event,
+                    repo_path=payload.get("repo_path"),
+                    worktree_path=payload.get("worktree_path"),
+                    repo_name=payload.get("repo_name"),
+                    project=payload.get("project"),
+                    branch=payload.get("branch"),
+                    directory=payload.get("directory"),
+                    tmux_session=payload.get("tmux_session"),
+                    tmux_pane=payload.get("tmux_pane"),
+                    ingress_route=payload.get("ingress_route"),
+                    first_delivery_id=payload.get("delivery_id"),
+                    latest_delivery_id=payload.get("delivery_id"),
+                    watch_status=watch_status,
+                    native_event_metadata=metadata,
+                )
+                self._records.append(record)
+            else:
+                if normalized_event in {"userpromptsubmit", "session.prompt-submitted"}:
+                    existing.lifecycle_state = "waiting_user"
+                elif normalized_event in {"stop", "sessionstop", "session-stopped", "session.stopped"}:
+                    existing.lifecycle_state = "stopped"
+                    existing.stopped_at = event_at
+                    existing.watch_status = "inactive"
+                elif existing.lifecycle_state in {"stopped", "resolved"}:
+                    pass
+                else:
+                    existing.lifecycle_state = "active"
+
+                existing.last_event = event
+                existing.last_event_at = event_at
+                existing.latest_delivery_id = payload.get("delivery_id") or existing.latest_delivery_id
+                existing.native_event_metadata = metadata
+
+                # Preserve initial Hermes linkage and route identity. Later upstream events
+                # may carry partial/stale fields, so treat them as evidence metadata rather
+                # than authority to retarget the session.
+                for attr in ("tmux_session", "tmux_pane", "repo_name", "project", "branch", "directory"):
+                    if getattr(existing, attr) is None and payload.get(attr):
+                        setattr(existing, attr, payload.get(attr))
+                record = existing
+                if existing_idx is not None:
+                    self._records[existing_idx] = existing
+
+            if record.lifecycle_state not in WORK_SESSION_LIFECYCLE_STATES:
+                return {"status": "rejected", "reason": "invalid_lifecycle_state"}
+            self._save_locked()
+            return {"status": "accepted", "reason": "registered", "record": WorkSessionRecord.from_dict(record.to_dict())}
 
 
 class WorkStateStore:
