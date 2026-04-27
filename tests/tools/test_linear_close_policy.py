@@ -52,6 +52,18 @@ def _in_review_command(handoff_block: str = "") -> str:
     )
 
 
+
+def _handoff_text(decision: str = "review verdict only") -> str:
+    return "\n".join(
+        [
+            "HANDOFF_CHANGED: Added the CH-262 live Linear lookup.",
+            "HANDOFF_VERIFIED: Focused guard tests passed.",
+            "HANDOFF_RISKS: Runtime reload remains unperformed.",
+            f"HANDOFF_DECISION: {decision}",
+        ]
+    )
+
+
 def test_linear_done_close_blockers_detect_dirty_base_checkout(tmp_path):
     from tools.linear_close_policy import linear_done_close_blockers
 
@@ -125,6 +137,114 @@ def test_terminal_tool_allows_linear_done_transition_when_repo_is_clean(tmp_path
     assert result["output"] == "ok"
     mock_env.execute.assert_called_once()
 
+
+
+def test_in_review_handoff_allows_live_linear_description_without_command_handoff(tmp_path):
+    from tools.linear_close_policy import _linear_in_review_handoff_blockers
+
+    repo = _init_git_repo(tmp_path / "repo")
+    command = _in_review_command()
+
+    blockers, detail = _linear_in_review_handoff_blockers(
+        repo,
+        command,
+        fetch_handoff_texts=lambda issue_id: ["## Current handoff\n" + _handoff_text()],
+    )
+
+    assert blockers == []
+    assert detail is None
+
+
+def test_in_review_handoff_allows_live_linear_recent_comment_without_command_handoff(tmp_path):
+    from tools.linear_close_policy import _linear_in_review_handoff_blockers
+
+    repo = _init_git_repo(tmp_path / "repo")
+    command = _in_review_command()
+
+    blockers, detail = _linear_in_review_handoff_blockers(
+        repo,
+        command,
+        fetch_handoff_texts=lambda issue_id: ["older comment", _handoff_text()],
+    )
+
+    assert blockers == []
+    assert detail is None
+
+
+def test_in_review_handoff_blocks_invalid_live_decision_without_leaking_body(tmp_path):
+    from tools.linear_close_policy import _linear_in_review_handoff_blockers
+
+    repo = _init_git_repo(tmp_path / "repo")
+    command = _in_review_command()
+    sensitive_body = _handoff_text("review verdict only for repo-only commit") + "\nLEAK_SENTINEL=visible-value"
+
+    blockers, detail = _linear_in_review_handoff_blockers(
+        repo,
+        command,
+        fetch_handoff_texts=lambda issue_id: [sensitive_body],
+    )
+
+    assert blockers == ["handoff_decision"]
+    assert "review verdict only" in detail
+    assert "LEAK_SENTINEL" not in detail
+    assert "visible-value" not in detail
+
+
+
+def test_in_review_handoff_does_not_use_command_fallback_when_live_handoff_is_invalid(tmp_path):
+    from tools.linear_close_policy import _linear_in_review_handoff_blockers
+
+    repo = _init_git_repo(tmp_path / "repo")
+    command = _in_review_command(_handoff_text())
+    invalid_live_body = _handoff_text("review verdict only with extra words")
+
+    blockers, detail = _linear_in_review_handoff_blockers(
+        repo,
+        command,
+        fetch_handoff_texts=lambda issue_id: [invalid_live_body],
+    )
+
+    assert blockers == ["handoff_decision"]
+    assert "Pending human decision" in detail
+
+def test_in_review_handoff_fails_closed_when_live_lookup_fails_and_no_command_fallback(tmp_path):
+    from tools.linear_close_policy import LinearHandoffLookupError, _linear_in_review_handoff_blockers
+
+    repo = _init_git_repo(tmp_path / "repo")
+    command = _in_review_command()
+
+    def fail_lookup(issue_id):
+        raise LinearHandoffLookupError("lookup unavailable")
+
+    blockers, detail = _linear_in_review_handoff_blockers(
+        repo,
+        command,
+        fetch_handoff_texts=fail_lookup,
+    )
+
+    assert set(blockers) == {"handoff_changed", "handoff_verified", "handoff_risks", "handoff_decision"}
+    assert "lookup unavailable" in detail
+
+
+def test_terminal_tool_allows_in_review_transition_with_live_linear_handoff(tmp_path):
+    from tools.terminal_tool import terminal_tool
+
+    repo = _init_git_repo(tmp_path / "repo")
+    mock_env = MagicMock()
+    mock_env.execute.return_value = {"output": "ok", "returncode": 0}
+    command = _in_review_command()
+
+    with patch("tools.terminal_tool._get_env_config", return_value={"env_type": "local", "env_name": "default", "cwd": str(repo), "timeout": 180}), \
+         patch("tools.terminal_tool._start_cleanup_thread"), \
+         patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
+         patch("tools.terminal_tool._last_activity", {"default": 0}), \
+         patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}), \
+         patch("tools.linear_close_policy._fetch_linear_handoff_texts", return_value=[_handoff_text()]):
+        result = json.loads(terminal_tool(command=command, workdir=str(repo)))
+
+    assert result["exit_code"] == 0
+    assert result["output"] == "ok"
+    mock_env.execute.assert_called_once()
 
 def test_terminal_tool_blocks_in_review_transition_without_required_handoff_block(tmp_path):
     from tools.terminal_tool import terminal_tool
