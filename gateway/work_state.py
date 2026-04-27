@@ -392,6 +392,9 @@ def _default_clawhip_deliver_executor(deliver_request: Dict[str, Any]) -> Dict[s
         "--prompt",
         str(deliver_request.get("prompt") or ""),
     ]
+    provider = _normalize_text(deliver_request.get("provider"))
+    if provider:
+        command.extend(["--provider", provider])
 
     try:
         completed = subprocess.run(

@@ -966,7 +966,16 @@ def test_default_clawhip_deliver_executor_uses_current_clawhip_cli_contract(monk
     assert result["prompt_submit_marker_before"] != result["prompt_submit_marker_after"]
     assert result["pane_evidence"] == {"event": "pane-output-changed", "target": "%7"}
     assert calls[1] == {
-        "command": ["clawhip", "deliver", "--session", "deliver-tmux", "--prompt", "bounded prompt"],
+        "command": [
+            "clawhip",
+            "deliver",
+            "--session",
+            "deliver-tmux",
+            "--prompt",
+            "bounded prompt",
+            "--provider",
+            "codex",
+        ],
         "kwargs": {
             "capture_output": True,
             "text": True,
