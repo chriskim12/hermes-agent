@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import json
 
 import pytest
 
@@ -12,6 +13,7 @@ from gateway.work_state import (
     WorkSessionRegistry,
     WorkStateStore,
     _default_clawhip_deliver_executor,
+    _default_clawhip_tmux_watch_cleanup,
     classify_work_session_action_required,
 )
 
@@ -825,6 +827,81 @@ def test_clawhip_terminal_events_clean_watch_state(tmp_path, event_name, expecte
     assert cleanup.calls[0]["routing"]["owner"] == "hermes"
     assert cleanup.calls[0]["routing"]["tmux_pane"] == "%42"
     assert cleanup.calls[0]["routing"]["lifecycle_state"] == expected_lifecycle
+
+
+class _FakeHttpResponse:
+    def __init__(self, status, body):
+        self.status = status
+        self._body = body.encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def test_default_clawhip_tmux_cleanup_treats_absent_registered_watch_as_clean(monkeypatch):
+    calls = []
+
+    def fake_urlopen(req, timeout):
+        calls.append((req.get_method(), req.full_url, timeout))
+        if req.get_method() == "DELETE":
+            raise work_state.urlerror.HTTPError(
+                req.full_url,
+                405,
+                "Method Not Allowed",
+                hdrs=None,
+                fp=None,
+            )
+        if req.full_url.endswith("/api/tmux/clear"):
+            raise work_state.urlerror.HTTPError(req.full_url, 404, "Not Found", hdrs=None, fp=None)
+        if req.get_method() == "GET" and req.full_url.endswith("/api/tmux"):
+            return _FakeHttpResponse(200, json.dumps([]))
+        raise AssertionError(f"unexpected request: {req.get_method()} {req.full_url}")
+
+    from gateway import work_state
+
+    monkeypatch.setattr(work_state.urlrequest, "urlopen", fake_urlopen)
+    monkeypatch.setenv("CLAWHIP_DAEMON_URL", "http://clawhip.test")
+
+    result = _default_clawhip_tmux_watch_cleanup({"session": "task-watch"})
+
+    assert result["ok"] is True
+    assert result["method"] == "GET"
+    assert result["status"] == 200
+    assert result["reason"] == "tmux_watch_absent_after_cleanup_attempts"
+    assert calls == [
+        ("DELETE", "http://clawhip.test/api/tmux/register", 2.0),
+        ("POST", "http://clawhip.test/api/tmux/clear", 2.0),
+        ("GET", "http://clawhip.test/api/tmux", 2.0),
+    ]
+
+
+def test_default_clawhip_tmux_cleanup_keeps_error_when_watch_still_registered(monkeypatch):
+    def fake_urlopen(req, timeout):
+        if req.get_method() == "DELETE":
+            raise work_state.urlerror.HTTPError(req.full_url, 405, "Method Not Allowed", hdrs=None, fp=None)
+        if req.full_url.endswith("/api/tmux/clear"):
+            raise work_state.urlerror.HTTPError(req.full_url, 404, "Not Found", hdrs=None, fp=None)
+        if req.get_method() == "GET" and req.full_url.endswith("/api/tmux"):
+            return _FakeHttpResponse(200, json.dumps([{"session": "task-watch"}]))
+        raise AssertionError(f"unexpected request: {req.get_method()} {req.full_url}")
+
+    from gateway import work_state
+
+    monkeypatch.setattr(work_state.urlrequest, "urlopen", fake_urlopen)
+    monkeypatch.setenv("CLAWHIP_DAEMON_URL", "http://clawhip.test")
+
+    result = _default_clawhip_tmux_watch_cleanup({"session": "task-watch"})
+
+    assert result["ok"] is False
+    assert "DELETE" in result["error"]
+    assert "POST" in result["error"]
+    assert "watch still registered" in result["error"]
 
 
 def test_clawhip_cleanup_failure_records_error_and_deactivates_local_watch(tmp_path):

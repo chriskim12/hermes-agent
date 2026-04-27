@@ -329,6 +329,47 @@ def _default_clawhip_tmux_watch_cleanup(cleanup_record: Dict[str, Any]) -> Dict[
                 errors.append(f"{method} {resp.status}: {response_body}")
         except (OSError, urlerror.URLError, urlerror.HTTPError) as exc:
             errors.append(f"{method}: {exc}")
+
+    # clawhip 0.6.x exposes POST /api/tmux/register and GET /api/tmux, but
+    # not a stable unregister endpoint.  If the daemon already no longer lists
+    # the targeted session, treat cleanup as successful instead of persisting
+    # noisy 405/404 audit text for a watch that is actually gone.
+    session = str(cleanup_record.get("session") or "").strip()
+    if session:
+        req = urlrequest.Request(
+            f"{base_url}/api/tmux",
+            headers={"Accept": "application/json"},
+            method="GET",
+        )
+        try:
+            with urlrequest.urlopen(req, timeout=2.0) as resp:
+                response_body = resp.read().decode("utf-8", errors="replace")
+                if 200 <= resp.status < 300:
+                    try:
+                        active_watches = json.loads(response_body or "[]")
+                    except json.JSONDecodeError:
+                        active_watches = None
+                    if isinstance(active_watches, list):
+                        still_registered = any(
+                            isinstance(item, dict) and item.get("session") == session
+                            for item in active_watches
+                        )
+                        if not still_registered:
+                            return {
+                                "ok": True,
+                                "status": resp.status,
+                                "method": "GET",
+                                "body": response_body,
+                                "reason": "tmux_watch_absent_after_cleanup_attempts",
+                                "cleanup_attempt_errors": errors,
+                            }
+                        errors.append("GET: watch still registered")
+                    else:
+                        errors.append("GET: unexpected tmux list response")
+                else:
+                    errors.append(f"GET {resp.status}: {response_body}")
+        except (OSError, urlerror.URLError, urlerror.HTTPError) as exc:
+            errors.append(f"GET: {exc}")
     return {"ok": False, "error": "; ".join(errors) or "clawhip_tmux_watch_cleanup_failed"}
 
 
