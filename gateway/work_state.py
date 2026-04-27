@@ -7,6 +7,7 @@ broad chat/session heuristics.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -327,12 +328,40 @@ def _default_clawhip_tmux_watch_cleanup(cleanup_record: Dict[str, Any]) -> Dict[
     return {"ok": False, "error": "; ".join(errors) or "clawhip_tmux_watch_cleanup_failed"}
 
 
+def _hash_file(path: Path) -> Optional[str]:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _hash_tmux_pane(target: str) -> Optional[str]:
+    if not target:
+        return None
+    try:
+        completed = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", target],
+            capture_output=True,
+            text=False,
+            timeout=3,
+        )
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    return hashlib.sha256(completed.stdout or b"").hexdigest()
+
+
 def _default_clawhip_deliver_executor(deliver_request: Dict[str, Any]) -> Dict[str, Any]:
     """Execute one bounded ``clawhip deliver`` request.
 
     The policy builds a fully bounded request and unit tests inject a fake
     executor. This default is intentionally a thin one-shot CLI adapter, not a
-    monitor or retry loop.
+    monitor or retry loop.  Since the current Clawhip CLI reports success as
+    human text, the adapter captures prompt-submit marker and pane hashes around
+    the call so the registry can still require concrete delivery evidence.
     """
 
     tmux_session = _normalize_text(deliver_request.get("tmux_session"))
@@ -340,6 +369,16 @@ def _default_clawhip_deliver_executor(deliver_request: Dict[str, Any]) -> Dict[s
         tmux_session = _normalize_text(deliver_request.get("provider_session_id"))
     if not tmux_session:
         return {"ok": False, "error": "clawhip_deliver_missing_tmux_session"}
+
+    workdir = Path(
+        deliver_request.get("worktree_path")
+        or deliver_request.get("repo_path")
+        or os.getcwd()
+    )
+    marker_path = workdir / ".clawhip" / "state" / "prompt-submit.json"
+    pane_target = _normalize_text(deliver_request.get("tmux_pane")) or tmux_session
+    marker_before = _hash_file(marker_path)
+    pane_before = _hash_tmux_pane(pane_target)
 
     command = [
         "clawhip",
@@ -356,11 +395,7 @@ def _default_clawhip_deliver_executor(deliver_request: Dict[str, Any]) -> Dict[s
             capture_output=True,
             text=True,
             timeout=10,
-            cwd=(
-                deliver_request.get("worktree_path")
-                or deliver_request.get("repo_path")
-                or None
-            ),
+            cwd=str(workdir),
         )
     except FileNotFoundError:
         return {"ok": False, "error": "clawhip_unavailable"}
@@ -369,6 +404,8 @@ def _default_clawhip_deliver_executor(deliver_request: Dict[str, Any]) -> Dict[s
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
+    marker_after = _hash_file(marker_path)
+    pane_after = _hash_tmux_pane(pane_target)
     stdout = (completed.stdout or "").strip()
     parsed: Dict[str, Any] = {}
     if stdout:
@@ -380,6 +417,13 @@ def _default_clawhip_deliver_executor(deliver_request: Dict[str, Any]) -> Dict[s
             parsed = {"stdout": stdout}
     parsed.setdefault("ok", completed.returncode == 0)
     parsed.setdefault("returncode", completed.returncode)
+    parsed.setdefault("prompt_submit_marker_before", marker_before)
+    parsed.setdefault("prompt_submit_marker_after", marker_after)
+    if pane_before and pane_after and pane_before != pane_after:
+        parsed.setdefault(
+            "pane_evidence",
+            {"event": "pane-output-changed", "target": pane_target},
+        )
     if completed.stderr:
         parsed.setdefault("stderr", completed.stderr.strip())
     return parsed

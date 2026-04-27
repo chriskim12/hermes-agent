@@ -928,17 +928,25 @@ def _trusted_deliver_registry(tmp_path, *, deliver_result=None, tmux_session="de
     return registry, registrar, deliver
 
 
-def test_default_clawhip_deliver_executor_uses_current_clawhip_cli_contract(monkeypatch):
+def test_default_clawhip_deliver_executor_uses_current_clawhip_cli_contract(monkeypatch, tmp_path):
     calls = []
+    worktree = tmp_path / "repo" / ".worktrees" / "ch-243"
+    marker = worktree / ".clawhip" / "state" / "prompt-submit.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text('{"prompt":"before"}')
 
     class _Completed:
-        returncode = 0
-        stdout = "Delivered prompt to codex session 'deliver-tmux' via codex"
-        stderr = ""
+        def __init__(self, *, returncode=0, stdout=b"", stderr=b""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
 
     def fake_run(command, **kwargs):
         calls.append({"command": command, "kwargs": kwargs})
-        return _Completed()
+        if command[:3] == ["tmux", "capture-pane", "-p"]:
+            return _Completed(stdout=f"pane-{len(calls)}".encode())
+        marker.write_text('{"prompt":"after"}')
+        return _Completed(stdout="Delivered prompt to codex session 'deliver-tmux' via codex", stderr="")
 
     monkeypatch.setattr("gateway.work_state.subprocess.run", fake_run)
 
@@ -949,23 +957,23 @@ def test_default_clawhip_deliver_executor_uses_current_clawhip_cli_contract(monk
             "tmux_session": "deliver-tmux",
             "tmux_pane": "%7",
             "prompt": "bounded prompt",
-            "worktree_path": "/repo/.worktrees/ch-243",
+            "worktree_path": str(worktree),
         }
     )
 
     assert result["ok"] is True
     assert result["stdout"] == "Delivered prompt to codex session 'deliver-tmux' via codex"
-    assert calls == [
-        {
-            "command": ["clawhip", "deliver", "--session", "deliver-tmux", "--prompt", "bounded prompt"],
-            "kwargs": {
-                "capture_output": True,
-                "text": True,
-                "timeout": 10,
-                "cwd": "/repo/.worktrees/ch-243",
-            },
-        }
-    ]
+    assert result["prompt_submit_marker_before"] != result["prompt_submit_marker_after"]
+    assert result["pane_evidence"] == {"event": "pane-output-changed", "target": "%7"}
+    assert calls[1] == {
+        "command": ["clawhip", "deliver", "--session", "deliver-tmux", "--prompt", "bounded prompt"],
+        "kwargs": {
+            "capture_output": True,
+            "text": True,
+            "timeout": 10,
+            "cwd": str(worktree),
+        },
+    }
 
 
 def test_default_clawhip_deliver_executor_requires_target_session():
