@@ -7,7 +7,12 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
-from gateway.work_state import WorkRecord, WorkSessionRegistry, WorkStateStore
+from gateway.work_state import (
+    WorkRecord,
+    WorkSessionRegistry,
+    WorkStateStore,
+    classify_work_session_action_required,
+)
 
 
 def _create_app(adapter: WebhookAdapter) -> web.Application:
@@ -19,6 +24,37 @@ def _create_app(adapter: WebhookAdapter) -> web.Application:
 class _RegistryRunner:
     def __init__(self, path):
         self.work_session_registry = WorkSessionRegistry(path)
+
+
+class _AlertingRegistryRunner:
+    def __init__(self, tmp_path):
+        self.work_state_store = _seed_verified_delegated_work_record(
+            tmp_path,
+            tmux_session="ch242-webhook",
+            repo_path="/repo",
+            worktree_path="/repo/.worktrees/ch-242",
+        )
+        self.work_session_registry = WorkSessionRegistry(
+            tmp_path / "work_sessions.json",
+            work_state_store=self.work_state_store,
+        )
+        self.delegated_packets = []
+
+    async def handle_delegated_ingress_packet(
+        self,
+        payload,
+        *,
+        route_name="",
+        delivery_id=None,
+    ):
+        self.delegated_packets.append(
+            {
+                "payload": dict(payload),
+                "route_name": route_name,
+                "delivery_id": delivery_id,
+            }
+        )
+        return {"status": "accepted", "resolution": "single_match"}
 
 
 class _FakeTmuxWatchRegistrar:
@@ -72,6 +108,85 @@ def _seed_verified_delegated_work_record(
         )
     )
     return store
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_state", "should_alert"),
+    [
+        (
+            {
+                "event": "ActionRequired",
+                "pane_snapshot": {"visible_text": "No output for 12 minutes"},
+                "idle_seconds": 720,
+                "stale_minutes": 10,
+            },
+            "stale",
+            True,
+        ),
+        (
+            {
+                "event": "ActionRequired",
+                "pane_snapshot": {"visible_text": "Waiting for user input: should I proceed?"},
+            },
+            "blocked_on_user",
+            True,
+        ),
+        (
+            {
+                "event": "ActionRequired",
+                "pane_snapshot": {"visible_text": "Approval required. Reply /approve or /deny."},
+            },
+            "permission_prompt",
+            True,
+        ),
+        (
+            {
+                "event": "ActionRequired",
+                "pane_snapshot": {"visible_text": "Running tests with pytest -q ..."},
+                "command_running": True,
+            },
+            "tool_running",
+            False,
+        ),
+        (
+            {
+                "event": "ActionRequired",
+                "pane_snapshot": {"visible_text": "All tests passed. Process exited with code 0."},
+                "completed": True,
+            },
+            "completed_idle",
+            False,
+        ),
+        (
+            {
+                "event": "ActionRequired",
+                "pane_snapshot": {"visible_text": "can't find pane %42"},
+                "pane_alive": False,
+            },
+            "orphaned",
+            False,
+        ),
+        (
+            {
+                "event": "ActionRequired",
+                "pane_snapshot": {"visible_text": "Hermes is thinking quietly."},
+            },
+            "unknown",
+            False,
+        ),
+    ],
+)
+def test_clawhip_action_required_classifier_bounds_fixture_states(
+    payload,
+    expected_state,
+    should_alert,
+):
+    classification = classify_work_session_action_required(payload)
+
+    assert classification.state == expected_state
+    assert classification.reason
+    assert classification.required_owner_action
+    assert classification.should_alert is should_alert
 
 
 def test_clawhip_session_start_requires_explicit_card_and_lane(tmp_path):
@@ -322,6 +437,181 @@ def test_clawhip_native_events_update_registry_without_overwriting_upstream_keys
     assert record.watch_cleanup_condition == "stop_or_resolved_or_owner_close"
 
 
+def test_clawhip_action_required_alert_requires_registry_match_and_classifier_reason(tmp_path):
+    registrar = _FakeTmuxWatchRegistrar()
+    work_state_store = _seed_verified_delegated_work_record(tmp_path)
+    registry = WorkSessionRegistry(
+        tmp_path / "work_sessions.json",
+        tmux_watch_registrar=registrar,
+        work_state_store=work_state_store,
+    )
+    registry.ingest_clawhip_native_event(
+        {
+            "provider": "codex",
+            "event": "SessionStart",
+            "session_id": "sess-semantic-alert",
+            "repo_path": "/home/ubuntu/repos/dailychingu",
+            "worktree_path": "/home/ubuntu/repos/dailychingu/.worktrees/ch-239",
+            "linear_card_id": "CH-239",
+            "lane_id": "yuuka/ch-239-clawhip-work-session-registry",
+            "tmux_session": "ch239-smoke",
+            "tmux_pane": "%42",
+            "owner": "hermes",
+            "trusted_auto_watch": True,
+            "work_id": "wk-delegated-ch-239",
+        }
+    )
+
+    action_required = registry.ingest_clawhip_native_event(
+        {
+            "provider": "codex",
+            "event": "ActionRequired",
+            "session_id": "sess-semantic-alert",
+            "repo_path": "/home/ubuntu/repos/dailychingu",
+            "worktree_path": "/home/ubuntu/repos/dailychingu/.worktrees/ch-239",
+            "tmux_session": "ch239-smoke",
+            "tmux_pane": "%42",
+            "pane_snapshot": {
+                "visible_text": "Waiting for user input: should I proceed with the migration?"
+            },
+            "work_id": "wk-delegated-ch-239",
+            "timestamp": "2026-04-27T20:05:00+00:00",
+        }
+    )
+
+    assert action_required["status"] == "accepted"
+    assert action_required["classification"]["state"] == "blocked_on_user"
+    assert action_required["classification"]["reason"]
+    alert = action_required["semantic_alert"]
+    assert alert["work_id"] == "wk-delegated-ch-239"
+    assert alert["state"] == "blocked"
+    assert alert["usable_outcome"] == "blocked"
+    assert alert["classifier_state"] == "blocked_on_user"
+    assert alert["classifier_reason"]
+    assert alert["required_owner_action"]
+    assert "Classifier blocked_on_user" in alert["next_action"]
+    assert alert["proof"].startswith("clawhip:blocked_on_user:")
+
+
+def test_clawhip_action_required_without_verified_work_record_does_not_alert(tmp_path):
+    registry = WorkSessionRegistry(tmp_path / "work_sessions.json")
+    registry.ingest_clawhip_native_event(
+        {
+            "provider": "codex",
+            "event": "SessionStart",
+            "session_id": "sess-no-work-record",
+            "repo_path": "/repo",
+            "worktree_path": "/repo/.worktrees/ch-242",
+            "linear_card_id": "CH-242",
+            "lane_id": "yuuka/ch-242-semantic-classifier",
+            "tmux_session": "ch242",
+            "tmux_pane": "%42",
+        }
+    )
+
+    action_required = registry.ingest_clawhip_native_event(
+        {
+            "provider": "codex",
+            "event": "ActionRequired",
+            "session_id": "sess-no-work-record",
+            "pane_snapshot": {"visible_text": "Approval required. Reply /approve or /deny."},
+        }
+    )
+
+    assert action_required["status"] == "accepted"
+    assert action_required["classification"]["state"] == "permission_prompt"
+    assert "semantic_alert" not in action_required
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_lifecycle"),
+    [
+        (
+            {
+                "pane_snapshot": {
+                    "visible_text": "All tests passed. Process exited with code 0."
+                },
+                "completed": True,
+            },
+            "resolved",
+        ),
+        (
+            {
+                "pane_snapshot": {"visible_text": "can't find pane %42"},
+                "pane_alive": False,
+            },
+            "orphaned",
+        ),
+    ],
+)
+def test_clawhip_completed_idle_and_orphaned_panes_suppress_repeated_wakes(
+    tmp_path,
+    payload,
+    expected_lifecycle,
+):
+    registrar = _FakeTmuxWatchRegistrar()
+    cleanup = _FakeTmuxWatchCleanup()
+    work_state_store = _seed_verified_delegated_work_record(
+        tmp_path,
+        tmux_session="ch242",
+        repo_path="/repo",
+        worktree_path="/repo/.worktrees/ch-242",
+    )
+    registry = WorkSessionRegistry(
+        tmp_path / "work_sessions.json",
+        tmux_watch_registrar=registrar,
+        tmux_watch_cleanup=cleanup,
+        work_state_store=work_state_store,
+    )
+    registry.ingest_clawhip_native_event(
+        {
+            "provider": "codex",
+            "event": "SessionStart",
+            "session_id": "sess-terminal-semantic",
+            "repo_path": "/repo",
+            "worktree_path": "/repo/.worktrees/ch-242",
+            "linear_card_id": "CH-242",
+            "lane_id": "yuuka/ch-242-semantic-classifier",
+            "tmux_session": "ch242",
+            "tmux_pane": "%42",
+            "owner": "hermes",
+            "trusted_auto_watch": True,
+            "timestamp": "2026-04-27T20:00:00+00:00",
+        }
+    )
+    assert len(registrar.calls) == 1
+
+    terminal = registry.ingest_clawhip_native_event(
+        {
+            "provider": "codex",
+            "event": "ActionRequired",
+            "session_id": "sess-terminal-semantic",
+            "timestamp": "2026-04-27T20:04:00+00:00",
+            **payload,
+        }
+    )
+    repeated = registry.ingest_clawhip_native_event(
+        {
+            "provider": "codex",
+            "event": "ActionRequired",
+            "session_id": "sess-terminal-semantic",
+            "pane_snapshot": {"visible_text": "No output for 12 minutes"},
+            "idle_seconds": 720,
+            "stale_minutes": 10,
+            "timestamp": "2026-04-27T20:06:00+00:00",
+        }
+    )
+
+    assert terminal["status"] == "accepted"
+    assert "semantic_alert" not in terminal
+    assert repeated["status"] == "accepted"
+    assert "semantic_alert" not in repeated
+    record = registry.get_session("codex", "sess-terminal-semantic")
+    assert record.lifecycle_state == expected_lifecycle
+    assert record.watch_status == "inactive"
+    assert len(cleanup.calls) == 1
+
+
 @pytest.mark.asyncio
 async def test_webhook_clawhip_native_ingress_writes_work_session_registry(tmp_path):
     adapter = WebhookAdapter(
@@ -370,6 +660,73 @@ async def test_webhook_clawhip_native_ingress_writes_work_session_registry(tmp_p
     assert record.first_delivery_id == "clawhip-native-001"
     assert record.latest_delivery_id == "clawhip-native-001"
     assert record.lifecycle_state == "active"
+
+
+@pytest.mark.asyncio
+async def test_webhook_clawhip_native_ingress_emits_semantic_alert_with_reason(tmp_path):
+    adapter = WebhookAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "routes": {
+                    "clawhip-native": {
+                        "secret": _INSECURE_NO_AUTH,
+                        "clawhip_native_ingress": True,
+                    }
+                }
+            },
+        )
+    )
+    runner = _AlertingRegistryRunner(tmp_path)
+    adapter.gateway_runner = runner
+    runner.work_session_registry.ingest_clawhip_native_event(
+        {
+            "provider": "codex",
+            "event": "SessionStart",
+            "session_id": "sess-webhook-alert",
+            "repo_path": "/repo",
+            "worktree_path": "/repo/.worktrees/ch-242",
+            "linear_card_id": "CH-242",
+            "lane_id": "yuuka/ch-242-semantic-classifier",
+            "tmux_session": "ch242-webhook",
+            "tmux_pane": "%42",
+            "owner": "hermes",
+            "trusted_auto_watch": True,
+            "work_id": "wk-delegated-ch-239",
+        }
+    )
+
+    async with TestClient(TestServer(_create_app(adapter))) as cli:
+        resp = await cli.post(
+            "/webhooks/clawhip-native",
+            json={
+                "provider": "codex",
+                "event": "ActionRequired",
+                "session_id": "sess-webhook-alert",
+                "repo_path": "/repo",
+                "worktree_path": "/repo/.worktrees/ch-242",
+                "tmux_session": "ch242-webhook",
+                "tmux_pane": "%42",
+                "pane_snapshot": {
+                    "visible_text": "Approval required. Reply /approve or /deny."
+                },
+                "work_id": "wk-delegated-ch-239",
+            },
+            headers={"X-Request-ID": "clawhip-alert-001"},
+        )
+        assert resp.status == 202
+        data = await resp.json()
+
+    assert data["classification"]["state"] == "permission_prompt"
+    assert data["semantic_alert"]["reason"]
+    assert data["semantic_alert"]["required_owner_action"]
+    assert data["delegated_alert"]["status"] == "accepted"
+    assert len(runner.delegated_packets) == 1
+    packet = runner.delegated_packets[0]["payload"]
+    assert packet["classifier_state"] == "permission_prompt"
+    assert packet["classifier_reason"]
+    assert packet["required_owner_action"]
+    assert "Classifier permission_prompt" in packet["next_action"]
 
 
 @pytest.mark.asyncio

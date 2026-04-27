@@ -49,6 +49,20 @@ TRUSTED_WORK_SESSION_AUTO_WATCH_MARKERS = frozenset({
     "hermes_auto_watch",
     "auto_watch_trusted",
 })
+WORK_SESSION_SEMANTIC_STATES = frozenset({
+    "stale",
+    "blocked_on_user",
+    "permission_prompt",
+    "tool_running",
+    "completed_idle",
+    "orphaned",
+    "unknown",
+})
+WORK_SESSION_ACTIONABLE_SEMANTIC_STATES = frozenset({
+    "stale",
+    "blocked_on_user",
+    "permission_prompt",
+})
 
 WAKE_STATES = frozenset({
     "blocked",
@@ -159,6 +173,13 @@ def _is_truthy_marker(value: Any) -> bool:
     return text in {"1", "true", "yes", "y", "on", "trusted", "hermes"}
 
 
+def _is_falsy_marker(value: Any) -> bool:
+    if isinstance(value, bool):
+        return not value
+    text = str(value or "").strip().lower()
+    return text in {"0", "false", "no", "n", "off", "dead", "missing", "none"}
+
+
 def _normalize_work_session_event_name(event: str) -> str:
     return str(event or "").strip().lower().replace("_", "-")
 
@@ -188,6 +209,44 @@ def _is_work_session_resolved_event(normalized_event: str, payload: Dict[str, An
         }
         or lifecycle_state == "resolved"
         or close_disposition == "close"
+    )
+
+
+def _is_work_session_action_required_event(
+    normalized_event: str,
+    payload: Dict[str, Any],
+) -> bool:
+    event_text = " ".join(
+        str(payload.get(key) or "")
+        for key in (
+            "event",
+            "native_event",
+            "event_name",
+            "hook_event_name",
+            "alert_type",
+            "notification_type",
+            "reason",
+        )
+    ).strip().lower()
+    return (
+        normalized_event
+        in {
+            "actionrequired",
+            "action-required",
+            "action.required",
+            "pane-stale",
+            "pane.stale",
+            "tmux-stale",
+            "tmux.stale",
+            "watch-stale",
+            "watch.stale",
+            "stale",
+        }
+        or _is_truthy_marker(payload.get("action_required"))
+        or _is_truthy_marker(payload.get("requires_action"))
+        or "action required" in event_text
+        or "action-required" in event_text
+        or "stale" in event_text
     )
 
 
@@ -517,6 +576,385 @@ def _apply_omx_lane_truth(record: "WorkRecord") -> None:
     record.close_authority = lane_truth["close_authority"]
 
 
+@dataclass(frozen=True)
+class WorkSessionSemanticClassification:
+    state: str
+    reason: str
+    required_owner_action: str
+    should_alert: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "state": self.state,
+            "reason": self.reason,
+            "required_owner_action": self.required_owner_action,
+            "should_alert": self.should_alert,
+        }
+
+
+def _iter_snapshot_text_values(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        values: List[str] = []
+        for item in value:
+            values.extend(_iter_snapshot_text_values(item))
+        return values
+    if isinstance(value, dict):
+        values = []
+        for key in (
+            "text",
+            "content",
+            "screen",
+            "visible_text",
+            "visibleText",
+            "output",
+            "tail",
+            "last_output",
+            "lastOutput",
+            "last_lines",
+            "lastLines",
+            "line",
+            "message",
+        ):
+            if key in value:
+                values.extend(_iter_snapshot_text_values(value.get(key)))
+        return values
+    return [str(value)]
+
+
+def _work_session_snapshot_text(payload: Dict[str, Any]) -> str:
+    values: List[str] = []
+    for key in (
+        "pane_snapshot",
+        "paneSnapshot",
+        "snapshot",
+        "tmux_snapshot",
+        "tmuxSnapshot",
+        "pane",
+        "screen",
+        "visible_text",
+        "visibleText",
+        "output",
+        "tail",
+        "last_output",
+        "lastOutput",
+        "matched_output",
+        "matchedOutput",
+        "message",
+        "reason",
+    ):
+        if key in payload:
+            values.extend(_iter_snapshot_text_values(payload.get(key)))
+    return "\n".join(text for text in values if str(text).strip())
+
+
+def _payload_float(payload: Dict[str, Any], *keys: str) -> Optional[float]:
+    for key in keys:
+        if key not in payload:
+            continue
+        try:
+            return float(payload.get(key))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _payload_snapshot_bool(payload: Dict[str, Any], *keys: str) -> Optional[bool]:
+    for key in keys:
+        if key not in payload:
+            continue
+        value = payload.get(key)
+        if _is_truthy_marker(value):
+            return True
+        if _is_falsy_marker(value):
+            return False
+    return None
+
+
+def _bounded_reason(reason: str) -> str:
+    text = re.sub(r"\s+", " ", str(reason or "").strip())
+    return text[:180] or "unknown"
+
+
+def _classification_from_explicit_state(
+    payload: Dict[str, Any],
+) -> Optional[WorkSessionSemanticClassification]:
+    explicit = _normalize_text(
+        payload.get("classifier_state")
+        or payload.get("semantic_state")
+        or payload.get("semanticState")
+    )
+    if not explicit:
+        return None
+    state = explicit.strip().lower().replace("-", "_")
+    if state not in WORK_SESSION_SEMANTIC_STATES:
+        return None
+    reason = _bounded_reason(
+        payload.get("classifier_reason")
+        or payload.get("semantic_reason")
+        or payload.get("reason")
+        or f"explicit classifier state {state}"
+    )
+    action = _bounded_reason(
+        payload.get("required_owner_action")
+        or payload.get("owner_action")
+        or _default_required_owner_action(state, reason)
+    )
+    return WorkSessionSemanticClassification(
+        state=state,
+        reason=reason,
+        required_owner_action=action,
+        should_alert=state in WORK_SESSION_ACTIONABLE_SEMANTIC_STATES,
+    )
+
+
+def _default_required_owner_action(state: str, reason: str) -> str:
+    if state == "permission_prompt":
+        return "Approve, deny, or provide the requested permission in the owning work session"
+    if state == "blocked_on_user":
+        return "Answer the user-facing prompt or provide the missing decision"
+    if state == "stale":
+        return "Inspect the work session and decide whether to resume, redirect, or close it"
+    if state == "tool_running":
+        return "Wait for the active tool or command to finish before waking the owner"
+    if state == "completed_idle":
+        return "Close the completed idle work session without retrying the pane"
+    if state == "orphaned":
+        return "Clean up the orphaned work-session watch without waking the owner"
+    return f"Inspect the work session manually; classifier reason: {reason}"
+
+
+def classify_work_session_action_required(
+    payload: Dict[str, Any],
+    *,
+    record: Optional["WorkSessionRecord"] = None,
+    normalized_event: Optional[str] = None,
+) -> WorkSessionSemanticClassification:
+    """Classify a clawhip pane snapshot before deciding whether to wake Hermes.
+
+    The classifier is deliberately generic-input/fixed-output: clawhip can send
+    arbitrary pane snapshot metadata, but Hermes must reduce it to bounded
+    states and a concrete owner action before any action-required alert is
+    emitted.
+    """
+
+    if not isinstance(payload, dict):
+        return WorkSessionSemanticClassification(
+            state="unknown",
+            reason="invalid action-required payload",
+            required_owner_action=_default_required_owner_action(
+                "unknown",
+                "invalid action-required payload",
+            ),
+            should_alert=False,
+        )
+
+    explicit = _classification_from_explicit_state(payload)
+    if explicit is not None:
+        return explicit
+
+    normalized_event = normalized_event or _normalize_work_session_event_name(
+        str(
+            payload.get("event")
+            or payload.get("native_event")
+            or payload.get("event_name")
+            or payload.get("hook_event_name")
+            or ""
+        )
+    )
+    snapshot_text = _work_session_snapshot_text(payload)
+    lowered = snapshot_text.lower()
+
+    pane_alive = _payload_snapshot_bool(
+        payload,
+        "pane_alive",
+        "paneAlive",
+        "process_alive",
+        "processAlive",
+        "has_process",
+        "hasProcess",
+    )
+    pane_missing = (
+        _is_truthy_marker(payload.get("pane_missing"))
+        or _is_truthy_marker(payload.get("paneMissing"))
+        or _is_truthy_marker(payload.get("orphaned"))
+        or "can't find pane" in lowered
+        or "cant find pane" in lowered
+        or "no such pane" in lowered
+        or "pane not found" in lowered
+        or "session not found" in lowered
+    )
+    if pane_missing or pane_alive is False or (record is not None and not record.tmux_pane):
+        reason = _bounded_reason(payload.get("reason") or "tmux pane is missing or no longer alive")
+        return WorkSessionSemanticClassification(
+            state="orphaned",
+            reason=reason,
+            required_owner_action=_default_required_owner_action("orphaned", reason),
+            should_alert=False,
+        )
+
+    if any(
+        marker in lowered
+        for marker in (
+            "requires approval",
+            "waiting for approval",
+            "approval required",
+            "permission required",
+            "requires permission",
+            "allow this command",
+            "approve or deny",
+            "/approve",
+            "/deny",
+            "sudo password",
+            "password for",
+        )
+    ):
+        reason = _bounded_reason(
+            payload.get("reason")
+            or "pane is waiting on a permission or approval prompt"
+        )
+        return WorkSessionSemanticClassification(
+            state="permission_prompt",
+            reason=reason,
+            required_owner_action=_default_required_owner_action("permission_prompt", reason),
+            should_alert=True,
+        )
+
+    if any(
+        marker in lowered
+        for marker in (
+            "waiting for user",
+            "needs user input",
+            "need your input",
+            "please respond",
+            "please choose",
+            "select an option",
+            "press enter",
+            "confirm to continue",
+            "should i proceed",
+            "do you want me to proceed",
+            "reply with",
+        )
+    ):
+        reason = _bounded_reason(payload.get("reason") or "pane is blocked on a user decision")
+        return WorkSessionSemanticClassification(
+            state="blocked_on_user",
+            reason=reason,
+            required_owner_action=_default_required_owner_action("blocked_on_user", reason),
+            should_alert=True,
+        )
+
+    command_running = _payload_snapshot_bool(
+        payload,
+        "command_running",
+        "commandRunning",
+        "tool_running",
+        "toolRunning",
+        "process_running",
+        "processRunning",
+        "active_process",
+        "activeProcess",
+    )
+    if command_running is True or any(
+        marker in lowered
+        for marker in (
+            "tool running",
+            "command still running",
+            "tests are running",
+            "running tests",
+            "npm run",
+            "pytest",
+            "building",
+            "compiling",
+            "installing",
+            "downloading",
+            "waiting for command to finish",
+        )
+    ):
+        reason = _bounded_reason(payload.get("reason") or "pane has an active tool or command")
+        return WorkSessionSemanticClassification(
+            state="tool_running",
+            reason=reason,
+            required_owner_action=_default_required_owner_action("tool_running", reason),
+            should_alert=False,
+        )
+
+    completed_marker = (
+        _is_truthy_marker(payload.get("completed"))
+        or _is_truthy_marker(payload.get("completed_idle"))
+        or _is_truthy_marker(payload.get("completedIdle"))
+        or any(
+            marker in lowered
+            for marker in (
+                "process exited with code 0",
+                "exit code 0",
+                "exited 0",
+                "tests passed",
+                "all tests passed",
+                "done.",
+                "task complete",
+                "completed successfully",
+                "nothing to do",
+                "working tree clean",
+            )
+        )
+    )
+    if completed_marker and command_running is not True:
+        reason = _bounded_reason(payload.get("reason") or "pane appears completed and idle")
+        return WorkSessionSemanticClassification(
+            state="completed_idle",
+            reason=reason,
+            required_owner_action=_default_required_owner_action("completed_idle", reason),
+            should_alert=False,
+        )
+
+    idle_seconds = _payload_float(payload, "idle_seconds", "idleSeconds", "idle_secs", "idleSecs")
+    stale_seconds = _payload_float(payload, "stale_seconds", "staleSeconds")
+    stale_minutes = _payload_float(
+        payload,
+        "stale_minutes",
+        "staleMinutes",
+        "watch_stale_minutes",
+        "watchStaleMinutes",
+    )
+    threshold_seconds = stale_seconds or ((stale_minutes or DEFAULT_WORK_SESSION_STALE_MINUTES) * 60)
+    stale_event = _is_work_session_action_required_event(normalized_event, payload)
+    if (
+        _is_truthy_marker(payload.get("stale"))
+        or (idle_seconds is not None and idle_seconds >= threshold_seconds)
+        or ("no output" in lowered and stale_event)
+        or (stale_event and not snapshot_text.strip())
+    ):
+        reason = _bounded_reason(
+            payload.get("reason")
+            or (
+                f"pane idle for {int(idle_seconds)}s past {int(threshold_seconds)}s threshold"
+                if idle_seconds is not None
+                else "action-required stale event did not include a more specific prompt"
+            )
+        )
+        return WorkSessionSemanticClassification(
+            state="stale",
+            reason=reason,
+            required_owner_action=_default_required_owner_action("stale", reason),
+            should_alert=True,
+        )
+
+    reason = _bounded_reason(
+        payload.get("reason")
+        or "pane snapshot did not match a bounded actionable state"
+    )
+    return WorkSessionSemanticClassification(
+        state="unknown",
+        reason=reason,
+        required_owner_action=_default_required_owner_action("unknown", reason),
+        should_alert=False,
+    )
+
+
 @dataclass
 class WorkRecord:
     work_id: str
@@ -612,6 +1050,10 @@ class WorkSessionRecord:
     watch_error: Optional[str] = None
     watch_cleanup_error: Optional[str] = None
     stopped_at: Optional[datetime] = None
+    semantic_state: Optional[str] = None
+    semantic_reason: Optional[str] = None
+    semantic_required_owner_action: Optional[str] = None
+    semantic_alerted_at: Optional[datetime] = None
     native_event_metadata: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -648,6 +1090,10 @@ class WorkSessionRecord:
             "watch_error": self.watch_error,
             "watch_cleanup_error": self.watch_cleanup_error,
             "stopped_at": self.stopped_at.isoformat() if self.stopped_at else None,
+            "semantic_state": self.semantic_state,
+            "semantic_reason": self.semantic_reason,
+            "semantic_required_owner_action": self.semantic_required_owner_action,
+            "semantic_alerted_at": self.semantic_alerted_at.isoformat() if self.semantic_alerted_at else None,
             "native_event_metadata": self.native_event_metadata or {},
         }
 
@@ -655,6 +1101,7 @@ class WorkSessionRecord:
     def from_dict(cls, data: Dict[str, Any]) -> "WorkSessionRecord":
         stopped_at = data.get("stopped_at")
         watch_registered_at = data.get("watch_registered_at")
+        semantic_alerted_at = data.get("semantic_alerted_at")
         return cls(
             provider=str(data["provider"]),
             provider_session_id=str(data["provider_session_id"]),
@@ -697,6 +1144,12 @@ class WorkSessionRecord:
             watch_error=data.get("watch_error"),
             watch_cleanup_error=data.get("watch_cleanup_error"),
             stopped_at=datetime.fromisoformat(stopped_at) if stopped_at else None,
+            semantic_state=data.get("semantic_state"),
+            semantic_reason=data.get("semantic_reason"),
+            semantic_required_owner_action=data.get("semantic_required_owner_action"),
+            semantic_alerted_at=(
+                datetime.fromisoformat(semantic_alerted_at) if semantic_alerted_at else None
+            ),
             native_event_metadata=data.get("native_event_metadata") or {},
         )
 
@@ -976,6 +1429,96 @@ class WorkSessionRegistry:
             )
             record.watch_status = "inactive"
 
+    @staticmethod
+    def _semantic_reason_slug(reason: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "-", str(reason or "").lower()).strip("-")
+        return slug[:60] or "unspecified"
+
+    def _build_semantic_alert_payload(
+        self,
+        record: WorkSessionRecord,
+        work_record: WorkRecord,
+        classification: WorkSessionSemanticClassification,
+    ) -> Dict[str, Any]:
+        if classification.state == "stale":
+            owner_state = "stale"
+            usable_outcome = "stale"
+        else:
+            owner_state = "blocked"
+            usable_outcome = "blocked"
+
+        reason = _bounded_reason(classification.reason)
+        owner_action = _bounded_reason(classification.required_owner_action)
+        return {
+            "work_id": work_record.work_id,
+            "owner": "hermes",
+            "owner_session_id": work_record.owner_session_id,
+            "executor": "omx",
+            "executor_session_id": work_record.executor_session_id,
+            "tmux_session": record.tmux_session or work_record.tmux_session,
+            "repo_path": record.repo_path or work_record.repo_path,
+            "worktree_path": record.worktree_path or work_record.worktree_path,
+            "state": owner_state,
+            "usable_outcome": usable_outcome,
+            "close_disposition": "close",
+            "next_action": (
+                f"Classifier {classification.state}: {owner_action}. "
+                f"Reason: {reason}"
+            ),
+            "proof": (
+                f"clawhip:{classification.state}:"
+                f"{self._semantic_reason_slug(reason)}"
+            ),
+            "classifier_state": classification.state,
+            "classifier_reason": reason,
+            "required_owner_action": owner_action,
+            "provider": record.provider,
+            "provider_session_id": record.provider_session_id,
+            "linear_card_id": record.linear_card_id,
+            "lane_id": record.lane_id,
+        }
+
+    def _apply_semantic_classification_locked(
+        self,
+        record: WorkSessionRecord,
+        payload: Dict[str, Any],
+        event_at: datetime,
+        classification: WorkSessionSemanticClassification,
+    ) -> Optional[Dict[str, Any]]:
+        prior_state = record.semantic_state
+        prior_reason = record.semantic_reason
+        record.semantic_state = classification.state
+        record.semantic_reason = _bounded_reason(classification.reason)
+        record.semantic_required_owner_action = _bounded_reason(
+            classification.required_owner_action
+        )
+
+        if classification.state == "completed_idle":
+            self._cleanup_tmux_watch_locked(record, event_at, lifecycle_state="resolved")
+            return None
+        if classification.state == "orphaned":
+            self._cleanup_tmux_watch_locked(record, event_at, lifecycle_state="orphaned")
+            return None
+        if not classification.should_alert:
+            return None
+        if record.lifecycle_state in {"stopped", "resolved", "orphaned"}:
+            return None
+        if not record.semantic_reason:
+            return None
+        if (
+            record.semantic_alerted_at
+            and prior_state == classification.state
+            and prior_reason == record.semantic_reason
+        ):
+            return None
+
+        work_record = self._verified_hermes_work_record_for_watch(record, payload)
+        if work_record is None:
+            return None
+
+        record.semantic_alerted_at = event_at
+        return self._build_semantic_alert_payload(record, work_record, classification)
+
     def ingest_clawhip_native_event(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(payload, dict):
             return {"status": "rejected", "reason": "invalid_native_event_payload"}
@@ -997,6 +1540,7 @@ class WorkSessionRegistry:
         event_at = _parse_event_datetime(payload.get("timestamp") or payload.get("event_at"))
         metadata = _compact_native_metadata(payload)
         normalized_event = _normalize_work_session_event_name(event)
+        should_classify = _is_work_session_action_required_event(normalized_event, payload)
 
         with self._lock:
             self._ensure_loaded()
@@ -1046,7 +1590,7 @@ class WorkSessionRegistry:
                     self._cleanup_tmux_watch_locked(existing, event_at, lifecycle_state="stopped")
                 elif _is_work_session_resolved_event(normalized_event, payload):
                     self._cleanup_tmux_watch_locked(existing, event_at, lifecycle_state="resolved")
-                elif existing.lifecycle_state in {"stopped", "resolved"}:
+                elif existing.lifecycle_state in {"stopped", "resolved", "orphaned"}:
                     pass
                 else:
                     existing.lifecycle_state = "active"
@@ -1067,12 +1611,35 @@ class WorkSessionRegistry:
                     self._records[existing_idx] = existing
 
             self._maybe_auto_register_tmux_watch_locked(record, payload, event_at)
+            classification = None
+            semantic_alert = None
+            if should_classify:
+                classification = classify_work_session_action_required(
+                    payload,
+                    record=record,
+                    normalized_event=normalized_event,
+                )
+                semantic_alert = self._apply_semantic_classification_locked(
+                    record,
+                    payload,
+                    event_at,
+                    classification,
+                )
             if record.lifecycle_state not in WORK_SESSION_LIFECYCLE_STATES:
                 return {"status": "rejected", "reason": "invalid_lifecycle_state"}
             if record.watch_status not in WORK_SESSION_WATCH_STATUSES:
                 return {"status": "rejected", "reason": "invalid_watch_status"}
             self._save_locked()
-            return {"status": "accepted", "reason": "registered", "record": WorkSessionRecord.from_dict(record.to_dict())}
+            result = {
+                "status": "accepted",
+                "reason": "registered",
+                "record": WorkSessionRecord.from_dict(record.to_dict()),
+            }
+            if classification is not None:
+                result["classification"] = classification.to_dict()
+            if semantic_alert is not None:
+                result["semantic_alert"] = semantic_alert
+            return result
 
 
 class WorkStateStore:

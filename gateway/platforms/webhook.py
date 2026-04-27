@@ -419,6 +419,19 @@ class WebhookAdapter(BasePlatformAdapter):
                     status=422,
                 )
             record = result.get("record")
+            delegated_alert_result = None
+            semantic_alert = result.get("semantic_alert")
+            if (
+                isinstance(semantic_alert, dict)
+                and semantic_alert.get("classifier_reason")
+                and self.gateway_runner
+                and hasattr(self.gateway_runner, "handle_delegated_ingress_packet")
+            ):
+                delegated_alert_result = await self.gateway_runner.handle_delegated_ingress_packet(
+                    semantic_alert,
+                    route_name=route_name,
+                    delivery_id=delivery_id,
+                )
             return web.json_response(
                 {
                     "status": "accepted",
@@ -431,6 +444,13 @@ class WebhookAdapter(BasePlatformAdapter):
                     "linear_card_id": getattr(record, "linear_card_id", None),
                     "lane_id": getattr(record, "lane_id", None),
                     "lifecycle_state": getattr(record, "lifecycle_state", None),
+                    "classification": result.get("classification"),
+                    "semantic_alert": {
+                        "state": semantic_alert.get("classifier_state"),
+                        "reason": semantic_alert.get("classifier_reason"),
+                        "required_owner_action": semantic_alert.get("required_owner_action"),
+                    } if isinstance(semantic_alert, dict) else None,
+                    "delegated_alert": delegated_alert_result,
                 },
                 status=202,
             )
