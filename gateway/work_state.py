@@ -8,12 +8,15 @@ broad chat/session heuristics.
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 from hermes_constants import get_hermes_home
 
@@ -38,6 +41,14 @@ WORK_SESSION_LIFECYCLE_STATES = frozenset({
     "orphaned",
 })
 WORK_SESSION_WATCH_STATUSES = frozenset({"unwatched", "active", "inactive", "failed"})
+WORK_SESSION_AUTO_WATCH_SOURCE = "hermes-work-session-registry"
+WORK_SESSION_AUTO_WATCH_CLEANUP_CONDITION = "stop_or_resolved_or_owner_close"
+DEFAULT_WORK_SESSION_STALE_MINUTES = 10
+TRUSTED_WORK_SESSION_AUTO_WATCH_MARKERS = frozenset({
+    "trusted_auto_watch",
+    "hermes_auto_watch",
+    "auto_watch_trusted",
+})
 
 WAKE_STATES = frozenset({
     "blocked",
@@ -126,6 +137,130 @@ def _parse_event_datetime(value: Any) -> datetime:
 
 def _compact_native_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {str(key): value for key, value in payload.items() if isinstance(key, str)}
+
+
+def _normalize_text(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _normalize_positive_int(value: Any, *, fallback: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback
+
+
+def _is_truthy_marker(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "y", "on", "trusted", "hermes"}
+
+
+def _normalize_work_session_event_name(event: str) -> str:
+    return str(event or "").strip().lower().replace("_", "-")
+
+
+def _is_work_session_stop_event(normalized_event: str) -> bool:
+    return normalized_event in {"stop", "sessionstop", "session-stopped", "session.stopped"}
+
+
+def _is_work_session_resolved_event(normalized_event: str, payload: Dict[str, Any]) -> bool:
+    lifecycle_state = (
+        str(payload.get("lifecycle_state") or "").strip().lower().replace("_", "-")
+    )
+    close_disposition = (
+        str(payload.get("close_disposition") or "").strip().lower().replace("_", "-")
+    )
+    return (
+        normalized_event
+        in {
+            "resolved",
+            "sessionresolved",
+            "session-resolved",
+            "session.resolved",
+            "ownerclose",
+            "owner-close",
+            "owner.closed",
+            "owner-closed",
+        }
+        or lifecycle_state == "resolved"
+        or close_disposition == "close"
+    )
+
+
+def _default_clawhip_tmux_watch_registrar(watch_record: Dict[str, Any]) -> Dict[str, Any]:
+    """Register an exact tmux-session watch with the clawhip daemon.
+
+    This intentionally posts the same record shape that ``clawhip tmux list``
+    renders instead of launching ``clawhip tmux watch`` as a long-lived wrapper
+    process. That keeps Hermes from adding broad prefix monitors or orphaning a
+    wrapper-owned monitor.
+    """
+
+    base_url = (
+        os.environ.get("CLAWHIP_DAEMON_URL")
+        or os.environ.get("CLAWHIP_BASE_URL")
+        or "http://127.0.0.1:25294"
+    ).rstrip("/")
+    req = urlrequest.Request(
+        f"{base_url}/api/tmux/register",
+        data=json.dumps(watch_record).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=2.0) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            if 200 <= resp.status < 300:
+                return {"ok": True, "status": resp.status, "body": body}
+            return {"ok": False, "status": resp.status, "body": body}
+    except (OSError, urlerror.URLError, urlerror.HTTPError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _default_clawhip_tmux_watch_cleanup(cleanup_record: Dict[str, Any]) -> Dict[str, Any]:
+    """Best-effort deactivation boundary for Hermes-owned clawhip watches.
+
+    clawhip may not expose a stable unregister API in every deployment. Treat
+    cleanup as a daemon deactivation boundary: try a targeted DELETE first, then
+    a clear/deactivate POST shape, and persist any failure for audit.
+    """
+
+    base_url = (
+        os.environ.get("CLAWHIP_DAEMON_URL")
+        or os.environ.get("CLAWHIP_BASE_URL")
+        or "http://127.0.0.1:25294"
+    ).rstrip("/")
+    attempts = [
+        ("DELETE", f"{base_url}/api/tmux/register"),
+        ("POST", f"{base_url}/api/tmux/clear"),
+    ]
+    errors: List[str] = []
+    body = json.dumps(cleanup_record).encode("utf-8")
+    for method, url in attempts:
+        req = urlrequest.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method=method,
+        )
+        try:
+            with urlrequest.urlopen(req, timeout=2.0) as resp:
+                response_body = resp.read().decode("utf-8", errors="replace")
+                if 200 <= resp.status < 300:
+                    return {
+                        "ok": True,
+                        "status": resp.status,
+                        "method": method,
+                        "body": response_body,
+                    }
+                errors.append(f"{method} {resp.status}: {response_body}")
+        except (OSError, urlerror.URLError, urlerror.HTTPError) as exc:
+            errors.append(f"{method}: {exc}")
+    return {"ok": False, "error": "; ".join(errors) or "clawhip_tmux_watch_cleanup_failed"}
 
 
 def normalize_usable_outcome(value: Optional[str]) -> Optional[str]:
@@ -465,6 +600,17 @@ class WorkSessionRecord:
     first_delivery_id: Optional[str] = None
     latest_delivery_id: Optional[str] = None
     watch_status: str = "unwatched"
+    watch_registration_source: Optional[str] = None
+    watch_owner: Optional[str] = None
+    watch_repo_path: Optional[str] = None
+    watch_worktree_path: Optional[str] = None
+    watch_linear_card_id: Optional[str] = None
+    watch_stale_minutes: Optional[int] = None
+    watch_cleanup_condition: Optional[str] = None
+    watch_registered_at: Optional[datetime] = None
+    watch_record: Optional[Dict[str, Any]] = None
+    watch_error: Optional[str] = None
+    watch_cleanup_error: Optional[str] = None
     stopped_at: Optional[datetime] = None
     native_event_metadata: Optional[Dict[str, Any]] = None
 
@@ -490,6 +636,17 @@ class WorkSessionRecord:
             "first_delivery_id": self.first_delivery_id,
             "latest_delivery_id": self.latest_delivery_id,
             "watch_status": self.watch_status,
+            "watch_registration_source": self.watch_registration_source,
+            "watch_owner": self.watch_owner,
+            "watch_repo_path": self.watch_repo_path,
+            "watch_worktree_path": self.watch_worktree_path,
+            "watch_linear_card_id": self.watch_linear_card_id,
+            "watch_stale_minutes": self.watch_stale_minutes,
+            "watch_cleanup_condition": self.watch_cleanup_condition,
+            "watch_registered_at": self.watch_registered_at.isoformat() if self.watch_registered_at else None,
+            "watch_record": self.watch_record or {},
+            "watch_error": self.watch_error,
+            "watch_cleanup_error": self.watch_cleanup_error,
             "stopped_at": self.stopped_at.isoformat() if self.stopped_at else None,
             "native_event_metadata": self.native_event_metadata or {},
         }
@@ -497,6 +654,7 @@ class WorkSessionRecord:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "WorkSessionRecord":
         stopped_at = data.get("stopped_at")
+        watch_registered_at = data.get("watch_registered_at")
         return cls(
             provider=str(data["provider"]),
             provider_session_id=str(data["provider_session_id"]),
@@ -518,6 +676,26 @@ class WorkSessionRecord:
             first_delivery_id=data.get("first_delivery_id"),
             latest_delivery_id=data.get("latest_delivery_id"),
             watch_status=str(data.get("watch_status") or "unwatched"),
+            watch_registration_source=data.get("watch_registration_source"),
+            watch_owner=data.get("watch_owner"),
+            watch_repo_path=data.get("watch_repo_path"),
+            watch_worktree_path=data.get("watch_worktree_path"),
+            watch_linear_card_id=data.get("watch_linear_card_id"),
+            watch_stale_minutes=(
+                _normalize_positive_int(
+                    data.get("watch_stale_minutes"),
+                    fallback=DEFAULT_WORK_SESSION_STALE_MINUTES,
+                )
+                if data.get("watch_stale_minutes") is not None
+                else None
+            ),
+            watch_cleanup_condition=data.get("watch_cleanup_condition"),
+            watch_registered_at=(
+                datetime.fromisoformat(watch_registered_at) if watch_registered_at else None
+            ),
+            watch_record=data.get("watch_record") or {},
+            watch_error=data.get("watch_error"),
+            watch_cleanup_error=data.get("watch_cleanup_error"),
             stopped_at=datetime.fromisoformat(stopped_at) if stopped_at else None,
             native_event_metadata=data.get("native_event_metadata") or {},
         )
@@ -530,9 +708,19 @@ class WorkSessionRegistry:
     work-session linkage and lifecycle state from additive native-event metadata.
     """
 
-    def __init__(self, path: Optional[Path] = None):
+    def __init__(
+        self,
+        path: Optional[Path] = None,
+        *,
+        tmux_watch_registrar: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        tmux_watch_cleanup: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        work_state_store: Optional[Any] = None,
+    ):
         self.path = Path(path) if path is not None else get_hermes_home() / "gateway_work_sessions.json"
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._tmux_watch_registrar = tmux_watch_registrar or _default_clawhip_tmux_watch_registrar
+        self._tmux_watch_cleanup = tmux_watch_cleanup or _default_clawhip_tmux_watch_cleanup
+        self._work_state_store = work_state_store
         self._lock = threading.RLock()
         self._records: List[WorkSessionRecord] = []
         self._loaded = False
@@ -593,6 +781,201 @@ class WorkSessionRegistry:
                     return WorkSessionRecord.from_dict(record.to_dict())
         return None
 
+    def _build_watch_record(
+        self,
+        record: WorkSessionRecord,
+        payload: Dict[str, Any],
+        now: datetime,
+    ) -> Dict[str, Any]:
+        stale_minutes = _normalize_positive_int(
+            payload.get("watch_stale_minutes") or payload.get("stale_minutes"),
+            fallback=DEFAULT_WORK_SESSION_STALE_MINUTES,
+        )
+        keywords = [record.linear_card_id, record.lane_id]
+        audit_metadata = {
+            "source": WORK_SESSION_AUTO_WATCH_SOURCE,
+            "owner": "hermes",
+            "repo_path": record.repo_path,
+            "worktree_path": record.worktree_path,
+            "linear_card_id": record.linear_card_id,
+            "lane_id": record.lane_id,
+            "cleanup_condition": WORK_SESSION_AUTO_WATCH_CLEANUP_CONDITION,
+            "tmux_pane": record.tmux_pane,
+        }
+        return {
+            "session": record.tmux_session,
+            "channel": _normalize_text(
+                payload.get("watch_channel") or payload.get("channel")
+            ),
+            "mention": _normalize_text(
+                payload.get("watch_mention") or payload.get("mention")
+            ),
+            "routing": dict(audit_metadata),
+            "metadata": dict(audit_metadata),
+            "keywords": keywords,
+            "keyword_window_secs": 120,
+            "stale_minutes": stale_minutes,
+            "format": payload.get("watch_format") or "inline",
+            "registered_at": now.isoformat(),
+            "source": WORK_SESSION_AUTO_WATCH_SOURCE,
+            "owner": "hermes",
+            "registration_source": WORK_SESSION_AUTO_WATCH_SOURCE,
+            "parent_process": None,
+            "active_wrapper_monitor": False,
+        }
+
+    def _payload_requests_trusted_auto_watch(self, payload: Dict[str, Any]) -> bool:
+        if _normalize_text(payload.get("owner")) != "hermes":
+            return False
+        return any(
+            _is_truthy_marker(payload.get(marker))
+            for marker in TRUSTED_WORK_SESSION_AUTO_WATCH_MARKERS
+        )
+
+    def _verified_hermes_work_record_for_watch(
+        self,
+        record: WorkSessionRecord,
+        payload: Dict[str, Any],
+    ) -> Optional[WorkRecord]:
+        work_state_store = self._work_state_store
+        if work_state_store is None:
+            return None
+
+        work_id = _normalize_text(payload.get("work_id") or payload.get("workId"))
+        owner_session_id = _normalize_text(
+            payload.get("owner_session_id") or payload.get("ownerSessionId")
+        )
+        executor_session_id = _normalize_text(
+            payload.get("executor_session_id")
+            or payload.get("executorSessionId")
+            or payload.get("executor_session")
+        )
+        try:
+            resolution = work_state_store.resolve_delegated_signal_candidate(
+                work_id=work_id,
+                owner_session_id=owner_session_id,
+                executor_session_id=executor_session_id,
+                tmux_session=record.tmux_session,
+                repo_path=record.repo_path,
+                worktree_path=record.worktree_path,
+                live_only=True,
+            )
+        except Exception:
+            return None
+        if resolution.get("status") != "single_match":
+            return None
+        matched = resolution.get("record")
+        if not isinstance(matched, WorkRecord):
+            return None
+        if not (
+            matched.owner == "hermes"
+            and matched.executor == "omx"
+            and matched.mode == "delegated"
+        ):
+            return None
+        return matched
+
+    def _maybe_auto_register_tmux_watch_locked(
+        self,
+        record: WorkSessionRecord,
+        payload: Dict[str, Any],
+        now: datetime,
+    ) -> None:
+        if record.watch_status == "active":
+            return
+        if record.lifecycle_state in {"stopped", "resolved", "orphaned"}:
+            return
+
+        if not self._payload_requests_trusted_auto_watch(payload):
+            return
+        if not (
+            _normalize_text(record.linear_card_id)
+            and _normalize_text(record.lane_id)
+            and _normalize_text(record.tmux_session)
+            and _normalize_text(record.tmux_pane)
+            and _normalize_text(record.repo_path)
+            and _normalize_text(record.worktree_path)
+        ):
+            return
+        if self._verified_hermes_work_record_for_watch(record, payload) is None:
+            return
+
+        watch_record = self._build_watch_record(record, payload, now)
+        try:
+            result = self._tmux_watch_registrar(watch_record)
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+        ok = bool(result.get("ok")) if isinstance(result, dict) else False
+        record.watch_status = "active" if ok else "failed"
+        record.watch_registration_source = WORK_SESSION_AUTO_WATCH_SOURCE
+        record.watch_owner = "hermes"
+        record.watch_repo_path = record.repo_path
+        record.watch_worktree_path = record.worktree_path
+        record.watch_linear_card_id = record.linear_card_id
+        record.watch_stale_minutes = int(watch_record["stale_minutes"])
+        record.watch_cleanup_condition = WORK_SESSION_AUTO_WATCH_CLEANUP_CONDITION
+        record.watch_registered_at = now
+        record.watch_record = watch_record
+        record.watch_error = None if ok else (
+            str(result.get("error") or result.get("body") or result)
+            if isinstance(result, dict)
+            else "clawhip_tmux_watch_registration_failed"
+        )
+
+    def _cleanup_tmux_watch_locked(
+        self,
+        record: WorkSessionRecord,
+        event_at: datetime,
+        *,
+        lifecycle_state: str,
+    ) -> None:
+        record.lifecycle_state = lifecycle_state
+        record.stopped_at = event_at
+        if record.watch_status == "active":
+            cleanup_record = {
+                "session": record.tmux_session,
+                "routing": {
+                    "source": WORK_SESSION_AUTO_WATCH_SOURCE,
+                    "owner": record.watch_owner or "hermes",
+                    "repo_path": record.watch_repo_path or record.repo_path,
+                    "worktree_path": record.watch_worktree_path or record.worktree_path,
+                    "linear_card_id": record.watch_linear_card_id or record.linear_card_id,
+                    "lane_id": record.lane_id,
+                    "cleanup_condition": record.watch_cleanup_condition
+                    or WORK_SESSION_AUTO_WATCH_CLEANUP_CONDITION,
+                    "tmux_pane": record.tmux_pane,
+                    "lifecycle_state": lifecycle_state,
+                },
+                "metadata": {
+                    "source": WORK_SESSION_AUTO_WATCH_SOURCE,
+                    "owner": record.watch_owner or "hermes",
+                    "repo_path": record.watch_repo_path or record.repo_path,
+                    "worktree_path": record.watch_worktree_path or record.worktree_path,
+                    "linear_card_id": record.watch_linear_card_id or record.linear_card_id,
+                    "lane_id": record.lane_id,
+                    "cleanup_condition": record.watch_cleanup_condition
+                    or WORK_SESSION_AUTO_WATCH_CLEANUP_CONDITION,
+                    "tmux_pane": record.tmux_pane,
+                    "lifecycle_state": lifecycle_state,
+                },
+                "registration_source": record.watch_registration_source
+                or WORK_SESSION_AUTO_WATCH_SOURCE,
+                "cleanup_condition": record.watch_cleanup_condition
+                or WORK_SESSION_AUTO_WATCH_CLEANUP_CONDITION,
+                "deactivated_at": event_at.isoformat(),
+            }
+            try:
+                result = self._tmux_watch_cleanup(cleanup_record)
+            except Exception as exc:
+                result = {"ok": False, "error": str(exc)}
+            ok = bool(result.get("ok")) if isinstance(result, dict) else False
+            record.watch_cleanup_error = None if ok else (
+                str(result.get("error") or result.get("body") or result)
+                if isinstance(result, dict)
+                else "clawhip_tmux_watch_cleanup_failed"
+            )
+            record.watch_status = "inactive"
+
     def ingest_clawhip_native_event(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(payload, dict):
             return {"status": "rejected", "reason": "invalid_native_event_payload"}
@@ -601,13 +984,19 @@ class WorkSessionRegistry:
         provider_session_id = str(
             payload.get("session_id") or payload.get("provider_session_id") or ""
         ).strip()
-        event = str(payload.get("event") or payload.get("native_event") or "").strip()
+        event = str(
+            payload.get("event")
+            or payload.get("native_event")
+            or payload.get("event_name")
+            or payload.get("hook_event_name")
+            or ""
+        ).strip()
         if not provider or not provider_session_id or not event:
             return {"status": "rejected", "reason": "missing_provider_session_or_event"}
 
         event_at = _parse_event_datetime(payload.get("timestamp") or payload.get("event_at"))
         metadata = _compact_native_metadata(payload)
-        normalized_event = event.lower().replace("_", "-")
+        normalized_event = _normalize_work_session_event_name(event)
 
         with self._lock:
             self._ensure_loaded()
@@ -626,9 +1015,6 @@ class WorkSessionRegistry:
 
             if existing is None:
                 lifecycle_state = "waiting_user" if normalized_event == "userpromptsubmit" else "active"
-                watch_status = str(payload.get("watch_status") or "unwatched").strip() or "unwatched"
-                if watch_status not in WORK_SESSION_WATCH_STATUSES:
-                    watch_status = "unwatched"
                 record = WorkSessionRecord(
                     provider=provider,
                     provider_session_id=provider_session_id,
@@ -649,17 +1035,17 @@ class WorkSessionRegistry:
                     ingress_route=payload.get("ingress_route"),
                     first_delivery_id=payload.get("delivery_id"),
                     latest_delivery_id=payload.get("delivery_id"),
-                    watch_status=watch_status,
+                    watch_status="unwatched",
                     native_event_metadata=metadata,
                 )
                 self._records.append(record)
             else:
                 if normalized_event in {"userpromptsubmit", "session.prompt-submitted"}:
                     existing.lifecycle_state = "waiting_user"
-                elif normalized_event in {"stop", "sessionstop", "session-stopped", "session.stopped"}:
-                    existing.lifecycle_state = "stopped"
-                    existing.stopped_at = event_at
-                    existing.watch_status = "inactive"
+                elif _is_work_session_stop_event(normalized_event):
+                    self._cleanup_tmux_watch_locked(existing, event_at, lifecycle_state="stopped")
+                elif _is_work_session_resolved_event(normalized_event, payload):
+                    self._cleanup_tmux_watch_locked(existing, event_at, lifecycle_state="resolved")
                 elif existing.lifecycle_state in {"stopped", "resolved"}:
                     pass
                 else:
@@ -680,8 +1066,11 @@ class WorkSessionRegistry:
                 if existing_idx is not None:
                     self._records[existing_idx] = existing
 
+            self._maybe_auto_register_tmux_watch_locked(record, payload, event_at)
             if record.lifecycle_state not in WORK_SESSION_LIFECYCLE_STATES:
                 return {"status": "rejected", "reason": "invalid_lifecycle_state"}
+            if record.watch_status not in WORK_SESSION_WATCH_STATUSES:
+                return {"status": "rejected", "reason": "invalid_watch_status"}
             self._save_locked()
             return {"status": "accepted", "reason": "registered", "record": WorkSessionRecord.from_dict(record.to_dict())}
 

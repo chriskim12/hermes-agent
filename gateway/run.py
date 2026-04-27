@@ -556,7 +556,7 @@ class GatewayRunner:
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(key),
         )
         self.work_state_store = WorkStateStore()
-        self.work_session_registry = WorkSessionRegistry()
+        self.work_session_registry = WorkSessionRegistry(work_state_store=self.work_state_store)
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
         self._shutdown_event = asyncio.Event()
