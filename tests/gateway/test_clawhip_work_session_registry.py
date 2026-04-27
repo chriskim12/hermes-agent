@@ -11,6 +11,7 @@ from gateway.work_state import (
     WorkRecord,
     WorkSessionRegistry,
     WorkStateStore,
+    _default_clawhip_deliver_executor,
     classify_work_session_action_required,
 )
 
@@ -925,6 +926,52 @@ def _trusted_deliver_registry(tmp_path, *, deliver_result=None, tmux_session="de
     assert start["status"] == "accepted"
     assert start["record"].watch_status == "active"
     return registry, registrar, deliver
+
+
+def test_default_clawhip_deliver_executor_uses_current_clawhip_cli_contract(monkeypatch):
+    calls = []
+
+    class _Completed:
+        returncode = 0
+        stdout = "Delivered prompt to codex session 'deliver-tmux' via codex"
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        calls.append({"command": command, "kwargs": kwargs})
+        return _Completed()
+
+    monkeypatch.setattr("gateway.work_state.subprocess.run", fake_run)
+
+    result = _default_clawhip_deliver_executor(
+        {
+            "provider": "codex",
+            "provider_session_id": "sess-deliver",
+            "tmux_session": "deliver-tmux",
+            "tmux_pane": "%7",
+            "prompt": "bounded prompt",
+            "worktree_path": "/repo/.worktrees/ch-243",
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["stdout"] == "Delivered prompt to codex session 'deliver-tmux' via codex"
+    assert calls == [
+        {
+            "command": ["clawhip", "deliver", "--session", "deliver-tmux", "--prompt", "bounded prompt"],
+            "kwargs": {
+                "capture_output": True,
+                "text": True,
+                "timeout": 10,
+                "cwd": "/repo/.worktrees/ch-243",
+            },
+        }
+    ]
+
+
+def test_default_clawhip_deliver_executor_requires_target_session():
+    result = _default_clawhip_deliver_executor({"prompt": "bounded prompt"})
+
+    assert result == {"ok": False, "error": "clawhip_deliver_missing_tmux_session"}
 
 
 def test_clawhip_deliver_policy_allows_active_trusted_session_and_bounds_prompt(tmp_path):

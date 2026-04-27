@@ -335,23 +335,20 @@ def _default_clawhip_deliver_executor(deliver_request: Dict[str, Any]) -> Dict[s
     monitor or retry loop.
     """
 
+    tmux_session = _normalize_text(deliver_request.get("tmux_session"))
+    if not tmux_session:
+        tmux_session = _normalize_text(deliver_request.get("provider_session_id"))
+    if not tmux_session:
+        return {"ok": False, "error": "clawhip_deliver_missing_tmux_session"}
+
     command = [
         "clawhip",
         "deliver",
-        "--provider",
-        str(deliver_request.get("provider") or ""),
-        "--session-id",
-        str(deliver_request.get("provider_session_id") or ""),
+        "--session",
+        tmux_session,
         "--prompt",
         str(deliver_request.get("prompt") or ""),
-        "--json",
     ]
-    tmux_pane = _normalize_text(deliver_request.get("tmux_pane"))
-    if tmux_pane:
-        command.extend(["--tmux-pane", tmux_pane])
-    tmux_session = _normalize_text(deliver_request.get("tmux_session"))
-    if tmux_session:
-        command.extend(["--tmux-session", tmux_session])
 
     try:
         completed = subprocess.run(
