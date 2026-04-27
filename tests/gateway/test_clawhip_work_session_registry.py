@@ -390,7 +390,7 @@ def test_clawhip_native_events_update_registry_without_overwriting_upstream_keys
     assert registrar.calls[0]["stale_minutes"] == 10
     assert registrar.calls[0]["source"] == "hermes-work-session-registry"
     assert registrar.calls[0]["owner"] == "hermes"
-    assert registrar.calls[0]["registration_source"] == "hermes-work-session-registry"
+    assert registrar.calls[0]["registration_source"] == "config-monitor"
     assert registrar.calls[0]["active_wrapper_monitor"] is False
     assert registrar.calls[0]["routing"]["source"] == "hermes-work-session-registry"
     assert registrar.calls[0]["routing"]["owner"] == "hermes"

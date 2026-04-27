@@ -45,6 +45,7 @@ WORK_SESSION_LIFECYCLE_STATES = frozenset({
 })
 WORK_SESSION_WATCH_STATUSES = frozenset({"unwatched", "active", "inactive", "failed"})
 WORK_SESSION_AUTO_WATCH_SOURCE = "hermes-work-session-registry"
+CLAWHIP_DAEMON_REGISTRATION_SOURCE = "config-monitor"
 WORK_SESSION_AUTO_WATCH_CLEANUP_CONDITION = "stop_or_resolved_or_owner_close"
 DEFAULT_WORK_SESSION_STALE_MINUTES = 10
 TRUSTED_WORK_SESSION_AUTO_WATCH_MARKERS = frozenset({
@@ -282,7 +283,10 @@ def _default_clawhip_tmux_watch_registrar(watch_record: Dict[str, Any]) -> Dict[
             if 200 <= resp.status < 300:
                 return {"ok": True, "status": resp.status, "body": body}
             return {"ok": False, "status": resp.status, "body": body}
-    except (OSError, urlerror.URLError, urlerror.HTTPError) as exc:
+    except urlerror.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        return {"ok": False, "status": exc.code, "body": body, "error": str(exc)}
+    except (OSError, urlerror.URLError) as exc:
         return {"ok": False, "error": str(exc)}
 
 
@@ -1412,7 +1416,7 @@ class WorkSessionRegistry:
             "registered_at": now.isoformat(),
             "source": WORK_SESSION_AUTO_WATCH_SOURCE,
             "owner": "hermes",
-            "registration_source": WORK_SESSION_AUTO_WATCH_SOURCE,
+            "registration_source": CLAWHIP_DAEMON_REGISTRATION_SOURCE,
             "parent_process": None,
             "active_wrapper_monitor": False,
         }
