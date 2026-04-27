@@ -445,6 +445,7 @@ class WebhookAdapter(BasePlatformAdapter):
                     "lane_id": getattr(record, "lane_id", None),
                     "lifecycle_state": getattr(record, "lifecycle_state", None),
                     "classification": result.get("classification"),
+                    "deliver_policy": result.get("deliver_policy"),
                     "semantic_alert": {
                         "state": semantic_alert.get("classifier_state"),
                         "reason": semantic_alert.get("classifier_reason"),

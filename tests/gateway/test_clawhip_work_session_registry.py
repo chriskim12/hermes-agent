@@ -872,3 +872,259 @@ def test_clawhip_cleanup_failure_records_error_and_deactivates_local_watch(tmp_p
     assert record.watch_status == "inactive"
     assert record.watch_cleanup_error == "{'ok': False}"
     assert len(cleanup.calls) == 1
+
+
+class _FakeClawhipDeliver:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def __call__(self, deliver_request):
+        self.calls.append(dict(deliver_request))
+        return dict(self.result)
+
+
+def _trusted_deliver_registry(tmp_path, *, deliver_result=None, tmux_session="deliver-tmux"):
+    registrar = _FakeTmuxWatchRegistrar()
+    deliver = _FakeClawhipDeliver(deliver_result or {
+        "ok": True,
+        "prompt_submit_marker_before": "marker-1",
+        "prompt_submit_marker_after": "marker-2",
+        "pane_evidence": {"event": "pane-output-changed"},
+    })
+    work_state_store = _seed_verified_delegated_work_record(
+        tmp_path,
+        tmux_session=tmux_session,
+        repo_path="/repo",
+        worktree_path="/repo/.worktrees/ch-243",
+    )
+    registry = WorkSessionRegistry(
+        tmp_path / "work_sessions.json",
+        tmux_watch_registrar=registrar,
+        deliver_executor=deliver,
+        work_state_store=work_state_store,
+    )
+    start = registry.ingest_clawhip_native_event(
+        {
+            "provider": "codex",
+            "event": "SessionStart",
+            "session_id": "sess-deliver",
+            "repo_path": "/repo",
+            "worktree_path": "/repo/.worktrees/ch-243",
+            "repo_name": "hermes-agent",
+            "linear_card_id": "CH-243",
+            "lane_id": "yuuka/ch-243-deliver-policy",
+            "tmux_session": tmux_session,
+            "tmux_pane": "%7",
+            "owner": "hermes",
+            "trusted_auto_watch": True,
+            "work_id": "wk-delegated-ch-239",
+            "timestamp": "2026-04-27T20:00:00+00:00",
+        }
+    )
+    assert start["status"] == "accepted"
+    assert start["record"].watch_status == "active"
+    return registry, registrar, deliver
+
+
+def test_clawhip_deliver_policy_allows_active_trusted_session_and_bounds_prompt(tmp_path):
+    registry, registrar, deliver = _trusted_deliver_registry(tmp_path)
+
+    result = registry.ingest_clawhip_native_event(
+        {
+            "provider": "codex",
+            "event": "ActionRequired",
+            "session_id": "sess-deliver",
+            "repo_path": "/repo",
+            "worktree_path": "/repo/.worktrees/ch-243",
+            "tmux_session": "deliver-tmux",
+            "tmux_pane": "%7",
+            "pane_snapshot": {"visible_text": "No output for 12 minutes"},
+            "idle_seconds": 720,
+            "stale_minutes": 10,
+            "work_id": "wk-delegated-ch-239",
+            "timestamp": "2026-04-27T20:03:00+00:00",
+        }
+    )
+
+    assert result["status"] == "accepted"
+    assert result["deliver_policy"]["status"] == "succeeded"
+    assert result["deliver_policy"]["reason"] == "prompt_submit_marker_and_followup_evidence"
+    assert "semantic_alert" not in result
+    assert len(deliver.calls) == 1
+    request = deliver.calls[0]
+    assert request["provider"] == "codex"
+    assert request["provider_session_id"] == "sess-deliver"
+    assert request["linear_card_id"] == "CH-243"
+    assert request["lane_id"] == "yuuka/ch-243-deliver-policy"
+    assert request["repo_path"] == "/repo"
+    assert request["worktree_path"] == "/repo/.worktrees/ch-243"
+    assert request["tmux_session"] == "deliver-tmux"
+    assert request["tmux_pane"] == "%7"
+    prompt = request["prompt"]
+    assert "Card: CH-243" in prompt
+    assert "Lane: yuuka/ch-243-deliver-policy" in prompt
+    assert "Repo: hermes-agent" in prompt
+    assert "Do not" in prompt and "unrelated session" in prompt
+    assert len(prompt) <= 1200
+    record = registry.get_session("codex", "sess-deliver")
+    assert record.lifecycle_state == "active"
+    assert record.deliver_status == "succeeded"
+    assert record.deliver_attempts == 1
+    assert record.deliver_evidence["marker_changed"] is True
+    assert record.deliver_evidence["followup_evidence"] is True
+    assert len(registrar.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("event_payload", "expected_reason"),
+    [
+        ({"event": "Resolved"}, "work_session_not_active"),
+        ({"event": "Stop"}, "work_session_not_active"),
+        (
+            {
+                "event": "ActionRequired",
+                "pane_snapshot": {"visible_text": "All tests passed. Process exited with code 0."},
+                "completed": True,
+            },
+            "classification_not_actionable",
+        ),
+    ],
+)
+def test_clawhip_deliver_policy_refuses_completed_resolved_and_stopped_sessions(
+    tmp_path,
+    event_payload,
+    expected_reason,
+):
+    registry, _registrar, deliver = _trusted_deliver_registry(tmp_path)
+    if event_payload["event"] in {"Resolved", "Stop"}:
+        registry.ingest_clawhip_native_event(
+            {
+                "provider": "codex",
+                "session_id": "sess-deliver",
+                "timestamp": "2026-04-27T20:01:00+00:00",
+                **event_payload,
+            }
+        )
+        action_payload = {
+            "event": "ActionRequired",
+            "pane_snapshot": {"visible_text": "No output for 12 minutes"},
+            "idle_seconds": 720,
+            "stale_minutes": 10,
+        }
+    else:
+        action_payload = event_payload
+
+    result = registry.ingest_clawhip_native_event(
+        {
+            "provider": "codex",
+            "session_id": "sess-deliver",
+            "timestamp": "2026-04-27T20:02:00+00:00",
+            **action_payload,
+        }
+    )
+
+    assert result["status"] == "accepted"
+    assert result["deliver_policy"]["status"] == "refused"
+    assert result["deliver_policy"]["reason"] == expected_reason
+    assert deliver.calls == []
+
+
+def test_clawhip_deliver_policy_refuses_unknown_and_non_hooked_sessions(tmp_path):
+    deliver = _FakeClawhipDeliver({"ok": True})
+    registry = WorkSessionRegistry(
+        tmp_path / "work_sessions.json",
+        deliver_executor=deliver,
+        work_state_store=WorkStateStore(tmp_path / "work_state.json"),
+    )
+    registry.ingest_clawhip_native_event(
+        {
+            "provider": "codex",
+            "event": "SessionStart",
+            "session_id": "sess-unhooked",
+            "repo_path": "/repo",
+            "worktree_path": "/repo/.worktrees/ch-243",
+            "linear_card_id": "CH-243",
+            "lane_id": "yuuka/ch-243-deliver-policy",
+            "tmux_session": "plain-shell",
+            "tmux_pane": "%3",
+        }
+    )
+
+    result = registry.ingest_clawhip_native_event(
+        {
+            "provider": "codex",
+            "event": "ActionRequired",
+            "session_id": "sess-unhooked",
+            "pane_snapshot": {"visible_text": "No output for 12 minutes"},
+            "idle_seconds": 720,
+            "stale_minutes": 10,
+        }
+    )
+    missing = registry.ingest_clawhip_native_event(
+        {
+            "provider": "codex",
+            "event": "ActionRequired",
+            "session_id": "unknown-session",
+            "pane_snapshot": {"visible_text": "No output for 12 minutes"},
+            "idle_seconds": 720,
+            "stale_minutes": 10,
+        }
+    )
+
+    assert result["deliver_policy"]["status"] == "refused"
+    assert result["deliver_policy"]["reason"] == "work_session_not_trusted_hooked"
+    assert missing["status"] == "rejected"
+    assert missing["reason"] == "missing_card_or_lane_linkage"
+    assert deliver.calls == []
+
+
+@pytest.mark.parametrize(
+    "deliver_result",
+    [
+        {"ok": True, "prompt_submit_marker_before": "same", "prompt_submit_marker_after": "same", "pane_evidence": {"event": "changed"}},
+        {"ok": True, "prompt_submit_marker_before": "before", "prompt_submit_marker_after": "after"},
+        {"ok": True, "prompt_submit_marker_before": "before", "prompt_submit_marker_after": "after", "event_name": "ActionRequired"},
+    ],
+)
+def test_clawhip_deliver_success_requires_marker_change_and_followup_evidence(tmp_path, deliver_result):
+    registry, _registrar, deliver = _trusted_deliver_registry(
+        tmp_path,
+        deliver_result=deliver_result,
+    )
+
+    first = registry.ingest_clawhip_native_event(
+        {
+            "provider": "codex",
+            "event": "ActionRequired",
+            "session_id": "sess-deliver",
+            "pane_snapshot": {"visible_text": "No output for 12 minutes"},
+            "idle_seconds": 720,
+            "stale_minutes": 10,
+            "work_id": "wk-delegated-ch-239",
+            "timestamp": "2026-04-27T20:03:00+00:00",
+        }
+    )
+    repeated = registry.ingest_clawhip_native_event(
+        {
+            "provider": "codex",
+            "event": "ActionRequired",
+            "session_id": "sess-deliver",
+            "pane_snapshot": {"visible_text": "No output for 14 minutes"},
+            "idle_seconds": 840,
+            "stale_minutes": 10,
+            "work_id": "wk-delegated-ch-239",
+            "timestamp": "2026-04-27T20:05:00+00:00",
+        }
+    )
+
+    assert first["deliver_policy"]["status"] == "failed"
+    assert "semantic_alert" in first
+    record = registry.get_session("codex", "sess-deliver")
+    assert record.lifecycle_state == "failed"
+    assert record.deliver_status == "failed"
+    assert record.deliver_attempts == 1
+    assert len(deliver.calls) == 1
+    assert repeated["deliver_policy"]["status"] == "refused"
+    assert repeated["deliver_policy"]["reason"] == "work_session_not_active"
+    assert len(deliver.calls) == 1

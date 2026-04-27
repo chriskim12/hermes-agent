@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -39,6 +40,7 @@ WORK_SESSION_LIFECYCLE_STATES = frozenset({
     "resolved",
     "stopped",
     "orphaned",
+    "failed",
 })
 WORK_SESSION_WATCH_STATUSES = frozenset({"unwatched", "active", "inactive", "failed"})
 WORK_SESSION_AUTO_WATCH_SOURCE = "hermes-work-session-registry"
@@ -63,6 +65,9 @@ WORK_SESSION_ACTIONABLE_SEMANTIC_STATES = frozenset({
     "blocked_on_user",
     "permission_prompt",
 })
+
+WORK_SESSION_DELIVER_TERMINAL_STATUSES = frozenset({"succeeded", "failed", "refused"})
+WORK_SESSION_DELIVER_PROMPT_MAX_CHARS = 1200
 
 WAKE_STATES = frozenset({
     "blocked",
@@ -320,6 +325,67 @@ def _default_clawhip_tmux_watch_cleanup(cleanup_record: Dict[str, Any]) -> Dict[
         except (OSError, urlerror.URLError, urlerror.HTTPError) as exc:
             errors.append(f"{method}: {exc}")
     return {"ok": False, "error": "; ".join(errors) or "clawhip_tmux_watch_cleanup_failed"}
+
+
+def _default_clawhip_deliver_executor(deliver_request: Dict[str, Any]) -> Dict[str, Any]:
+    """Execute one bounded ``clawhip deliver`` request.
+
+    The policy builds a fully bounded request and unit tests inject a fake
+    executor. This default is intentionally a thin one-shot CLI adapter, not a
+    monitor or retry loop.
+    """
+
+    command = [
+        "clawhip",
+        "deliver",
+        "--provider",
+        str(deliver_request.get("provider") or ""),
+        "--session-id",
+        str(deliver_request.get("provider_session_id") or ""),
+        "--prompt",
+        str(deliver_request.get("prompt") or ""),
+        "--json",
+    ]
+    tmux_pane = _normalize_text(deliver_request.get("tmux_pane"))
+    if tmux_pane:
+        command.extend(["--tmux-pane", tmux_pane])
+    tmux_session = _normalize_text(deliver_request.get("tmux_session"))
+    if tmux_session:
+        command.extend(["--tmux-session", tmux_session])
+
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=(
+                deliver_request.get("worktree_path")
+                or deliver_request.get("repo_path")
+                or None
+            ),
+        )
+    except FileNotFoundError:
+        return {"ok": False, "error": "clawhip_unavailable"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "clawhip_deliver_timeout"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    stdout = (completed.stdout or "").strip()
+    parsed: Dict[str, Any] = {}
+    if stdout:
+        try:
+            value = json.loads(stdout)
+            if isinstance(value, dict):
+                parsed = value
+        except Exception:
+            parsed = {"stdout": stdout}
+    parsed.setdefault("ok", completed.returncode == 0)
+    parsed.setdefault("returncode", completed.returncode)
+    if completed.stderr:
+        parsed.setdefault("stderr", completed.stderr.strip())
+    return parsed
 
 
 def normalize_usable_outcome(value: Optional[str]) -> Optional[str]:
@@ -1054,6 +1120,13 @@ class WorkSessionRecord:
     semantic_reason: Optional[str] = None
     semantic_required_owner_action: Optional[str] = None
     semantic_alerted_at: Optional[datetime] = None
+    deliver_status: Optional[str] = None
+    deliver_attempts: int = 0
+    deliver_started_at: Optional[datetime] = None
+    deliver_completed_at: Optional[datetime] = None
+    deliver_prompt: Optional[str] = None
+    deliver_evidence: Optional[Dict[str, Any]] = None
+    deliver_error: Optional[str] = None
     native_event_metadata: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1094,6 +1167,13 @@ class WorkSessionRecord:
             "semantic_reason": self.semantic_reason,
             "semantic_required_owner_action": self.semantic_required_owner_action,
             "semantic_alerted_at": self.semantic_alerted_at.isoformat() if self.semantic_alerted_at else None,
+            "deliver_status": self.deliver_status,
+            "deliver_attempts": int(self.deliver_attempts or 0),
+            "deliver_started_at": self.deliver_started_at.isoformat() if self.deliver_started_at else None,
+            "deliver_completed_at": self.deliver_completed_at.isoformat() if self.deliver_completed_at else None,
+            "deliver_prompt": self.deliver_prompt,
+            "deliver_evidence": self.deliver_evidence or {},
+            "deliver_error": self.deliver_error,
             "native_event_metadata": self.native_event_metadata or {},
         }
 
@@ -1102,6 +1182,8 @@ class WorkSessionRecord:
         stopped_at = data.get("stopped_at")
         watch_registered_at = data.get("watch_registered_at")
         semantic_alerted_at = data.get("semantic_alerted_at")
+        deliver_started_at = data.get("deliver_started_at")
+        deliver_completed_at = data.get("deliver_completed_at")
         return cls(
             provider=str(data["provider"]),
             provider_session_id=str(data["provider_session_id"]),
@@ -1150,6 +1232,21 @@ class WorkSessionRecord:
             semantic_alerted_at=(
                 datetime.fromisoformat(semantic_alerted_at) if semantic_alerted_at else None
             ),
+            deliver_status=data.get("deliver_status"),
+            deliver_attempts=(
+                _normalize_positive_int(data.get("deliver_attempts"), fallback=0)
+                if data.get("deliver_attempts") is not None
+                else 0
+            ),
+            deliver_started_at=(
+                datetime.fromisoformat(deliver_started_at) if deliver_started_at else None
+            ),
+            deliver_completed_at=(
+                datetime.fromisoformat(deliver_completed_at) if deliver_completed_at else None
+            ),
+            deliver_prompt=data.get("deliver_prompt"),
+            deliver_evidence=data.get("deliver_evidence") or {},
+            deliver_error=data.get("deliver_error"),
             native_event_metadata=data.get("native_event_metadata") or {},
         )
 
@@ -1167,12 +1264,14 @@ class WorkSessionRegistry:
         *,
         tmux_watch_registrar: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
         tmux_watch_cleanup: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        deliver_executor: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
         work_state_store: Optional[Any] = None,
     ):
         self.path = Path(path) if path is not None else get_hermes_home() / "gateway_work_sessions.json"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._tmux_watch_registrar = tmux_watch_registrar or _default_clawhip_tmux_watch_registrar
         self._tmux_watch_cleanup = tmux_watch_cleanup or _default_clawhip_tmux_watch_cleanup
+        self._deliver_executor = deliver_executor or _default_clawhip_deliver_executor
         self._work_state_store = work_state_store
         self._lock = threading.RLock()
         self._records: List[WorkSessionRecord] = []
@@ -1336,7 +1435,7 @@ class WorkSessionRegistry:
     ) -> None:
         if record.watch_status == "active":
             return
-        if record.lifecycle_state in {"stopped", "resolved", "orphaned"}:
+        if record.lifecycle_state in {"stopped", "resolved", "orphaned", "failed"}:
             return
 
         if not self._payload_requests_trusted_auto_watch(payload):
@@ -1478,6 +1577,279 @@ class WorkSessionRegistry:
             "lane_id": record.lane_id,
         }
 
+    @staticmethod
+    def _bounded_deliver_prompt(prompt: str) -> str:
+        text = re.sub(r"[ \t]+", " ", str(prompt or "").strip())
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        if len(text) <= WORK_SESSION_DELIVER_PROMPT_MAX_CHARS:
+            return text
+        return text[: WORK_SESSION_DELIVER_PROMPT_MAX_CHARS - 3].rstrip() + "..."
+
+    def _build_deliver_prompt(
+        self,
+        record: WorkSessionRecord,
+        work_record: WorkRecord,
+        classification: WorkSessionSemanticClassification,
+    ) -> str:
+        reason = _bounded_reason(classification.reason)
+        owner_action = _bounded_reason(classification.required_owner_action)
+        prompt = f"""
+[Hermes bounded clawhip deliver]
+Repo: {record.repo_name or record.repo_path or work_record.repo_path or 'unknown'}
+Worktree: {record.worktree_path or work_record.worktree_path or 'unknown'}
+Card: {record.linear_card_id}
+Lane: {record.lane_id}
+Provider session: {record.provider}:{record.provider_session_id}
+Tmux target: {record.tmux_session or work_record.tmux_session or 'unknown'} {record.tmux_pane or ''}
+Classifier: {classification.state} — {reason}
+Owner action: {owner_action}
+
+Submit exactly one bounded follow-up to this existing hooked pane only. Do not
+open, retarget, approve, deny, or mutate any unrelated session. If already
+safe to proceed, continue only the current repo/card/lane work; otherwise emit
+a concise native event describing the blocker and required owner action.
+""".strip()
+        return self._bounded_deliver_prompt(prompt)
+
+    def _deliver_refusal_reason(
+        self,
+        record: WorkSessionRecord,
+        work_record: Optional[WorkRecord],
+        classification: WorkSessionSemanticClassification,
+    ) -> Optional[str]:
+        if classification.state not in WORK_SESSION_ACTIONABLE_SEMANTIC_STATES:
+            return "classification_not_actionable"
+        if record.lifecycle_state != "active":
+            return "work_session_not_active"
+        if (
+            record.deliver_attempts
+            or record.deliver_status in WORK_SESSION_DELIVER_TERMINAL_STATUSES
+            or record.deliver_status == "nudged"
+        ):
+            return "deliver_already_attempted"
+        if not (record.tmux_session and record.tmux_pane):
+            return "missing_hooked_tmux_pane"
+        if not (
+            record.watch_status == "active"
+            and record.watch_owner == "hermes"
+            and record.watch_registration_source == WORK_SESSION_AUTO_WATCH_SOURCE
+        ):
+            return "work_session_not_trusted_hooked"
+        if work_record is None:
+            return "missing_verified_delegated_work_record"
+        if record.linear_card_id != (record.watch_linear_card_id or record.linear_card_id):
+            return "card_watch_mismatch"
+        return None
+
+    def evaluate_clawhip_deliver_policy(
+        self,
+        record: WorkSessionRecord,
+        work_record: Optional[WorkRecord],
+        classification: WorkSessionSemanticClassification,
+    ) -> Dict[str, Any]:
+        """Pure-ish policy decision for whether Hermes may call clawhip deliver."""
+
+        reason = self._deliver_refusal_reason(record, work_record, classification)
+        if reason is not None:
+            return {"allowed": False, "reason": reason}
+        assert work_record is not None
+        prompt = self._build_deliver_prompt(record, work_record, classification)
+        return {
+            "allowed": True,
+            "reason": "eligible",
+            "prompt": prompt,
+            "provider": record.provider,
+            "provider_session_id": record.provider_session_id,
+            "linear_card_id": record.linear_card_id,
+            "lane_id": record.lane_id,
+            "repo_path": record.repo_path or work_record.repo_path,
+            "worktree_path": record.worktree_path or work_record.worktree_path,
+            "tmux_session": record.tmux_session or work_record.tmux_session,
+            "tmux_pane": record.tmux_pane,
+            "work_id": work_record.work_id,
+            "owner_session_id": work_record.owner_session_id,
+            "classification_state": classification.state,
+            "classification_reason": _bounded_reason(classification.reason),
+        }
+
+    @staticmethod
+    def _deliver_result_marker_changed(result: Dict[str, Any]) -> bool:
+        if any(
+            _is_truthy_marker(result.get(key))
+            for key in (
+                "prompt_submit_marker_changed",
+                "promptSubmitMarkerChanged",
+                "marker_changed",
+                "markerChanged",
+            )
+        ):
+            return True
+        before = _normalize_text(
+            result.get("prompt_submit_marker_before")
+            or result.get("promptSubmitMarkerBefore")
+            or result.get("marker_before")
+            or result.get("markerBefore")
+        )
+        after = _normalize_text(
+            result.get("prompt_submit_marker_after")
+            or result.get("promptSubmitMarkerAfter")
+            or result.get("marker_after")
+            or result.get("markerAfter")
+        )
+        return bool(before and after and before != after)
+
+    @staticmethod
+    def _deliver_result_has_followup_evidence(result: Dict[str, Any]) -> bool:
+        for key in (
+            "pane_evidence",
+            "paneEvidence",
+            "pane_event",
+            "paneEvent",
+            "follow_up_native_event",
+            "followUpNativeEvent",
+            "followup_native_event",
+            "native_event",
+            "nativeEvent",
+            "event_after",
+            "eventAfter",
+        ):
+            value = result.get(key)
+            if isinstance(value, (dict, list, tuple)) and value:
+                return True
+            if _normalize_text(value):
+                return True
+
+        event_name = _normalize_text(result.get("event_name") or result.get("eventName"))
+        event_delivery = _normalize_text(
+            result.get("delivery_id")
+            or result.get("deliveryId")
+            or result.get("event_id")
+            or result.get("eventId")
+            or result.get("request_id")
+            or result.get("requestId")
+        )
+        if event_name and event_delivery:
+            return True
+
+        return any(
+            _is_truthy_marker(result.get(key))
+            for key in ("follow_up_event", "followUpEvent", "pane_changed", "paneChanged")
+        )
+
+    def _deliver_result_success(self, result: Dict[str, Any]) -> bool:
+        status = str(result.get("status") or result.get("verdict") or "").strip().lower()
+        ok = bool(result.get("ok")) or status in {"accepted", "succeeded", "success", "ok"}
+        return (
+            ok
+            and self._deliver_result_marker_changed(result)
+            and self._deliver_result_has_followup_evidence(result)
+        )
+
+    def _compact_deliver_evidence(self, result: Dict[str, Any], *, success: bool) -> Dict[str, Any]:
+        keys = (
+            "ok",
+            "status",
+            "verdict",
+            "returncode",
+            "prompt_submit_marker_changed",
+            "prompt_submit_marker_before",
+            "prompt_submit_marker_after",
+            "marker_before",
+            "marker_after",
+            "pane_evidence",
+            "pane_event",
+            "follow_up_native_event",
+            "native_event",
+            "event_name",
+            "resolved",
+            "lifecycle_state",
+            "error",
+        )
+        evidence = {key: result.get(key) for key in keys if key in result}
+        evidence["success"] = success
+        evidence["marker_changed"] = self._deliver_result_marker_changed(result)
+        evidence["followup_evidence"] = self._deliver_result_has_followup_evidence(result)
+        return evidence
+
+    def _maybe_deliver_locked(
+        self,
+        record: WorkSessionRecord,
+        payload: Dict[str, Any],
+        event_at: datetime,
+        classification: WorkSessionSemanticClassification,
+    ) -> Optional[Dict[str, Any]]:
+        work_record = self._verified_hermes_work_record_for_watch(record, payload)
+        decision = self.evaluate_clawhip_deliver_policy(record, work_record, classification)
+        if not decision.get("allowed"):
+            return {"status": "refused", "reason": decision.get("reason")}
+
+        deliver_request = dict(decision)
+        deliver_request.pop("allowed", None)
+        deliver_request["source"] = "hermes-work-session-deliver-policy"
+        deliver_request["attempt"] = int(record.deliver_attempts or 0) + 1
+        record.lifecycle_state = "nudged"
+        record.deliver_status = "nudged"
+        record.deliver_attempts = int(record.deliver_attempts or 0) + 1
+        record.deliver_started_at = event_at
+        record.deliver_completed_at = None
+        record.deliver_prompt = str(deliver_request.get("prompt") or "")
+        record.deliver_error = None
+        record.deliver_evidence = {
+            "request": {k: v for k, v in deliver_request.items() if k != "prompt"},
+            "transition_from": "active",
+            "transition_to": "nudged",
+            "nudged_at": event_at.isoformat(),
+        }
+
+        try:
+            result = self._deliver_executor(deliver_request)
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+        if not isinstance(result, dict):
+            result = {
+                "ok": False,
+                "error": "invalid_clawhip_deliver_result",
+                "raw": str(result),
+            }
+
+        success = self._deliver_result_success(result)
+        record.deliver_completed_at = _utcnow()
+        record.deliver_evidence = self._compact_deliver_evidence(result, success=success)
+        if success:
+            resolved = (
+                _is_truthy_marker(result.get("resolved"))
+                or str(result.get("lifecycle_state") or "").strip().lower() == "resolved"
+            )
+            record.lifecycle_state = "resolved" if resolved else "active"
+            record.deliver_status = "succeeded"
+            record.deliver_error = None
+            record.deliver_evidence["transition"] = f"nudged->{record.lifecycle_state}"
+            record.deliver_evidence["completed_at"] = record.deliver_completed_at.isoformat()
+            return {
+                "status": "succeeded",
+                "reason": "prompt_submit_marker_and_followup_evidence",
+                "lifecycle_state": record.lifecycle_state,
+                "evidence": dict(record.deliver_evidence or {}),
+                "prompt": record.deliver_prompt,
+            }
+
+        record.lifecycle_state = "failed"
+        record.deliver_status = "failed"
+        record.deliver_evidence["transition"] = "nudged->failed"
+        record.deliver_evidence["completed_at"] = record.deliver_completed_at.isoformat()
+        record.deliver_error = _bounded_reason(
+            result.get("error")
+            or result.get("stderr")
+            or "clawhip deliver did not return marker-change plus follow-up evidence"
+        )
+        return {
+            "status": "failed",
+            "reason": record.deliver_error,
+            "lifecycle_state": record.lifecycle_state,
+            "evidence": dict(record.deliver_evidence or {}),
+            "prompt": record.deliver_prompt,
+        }
+
     def _apply_semantic_classification_locked(
         self,
         record: WorkSessionRecord,
@@ -1590,7 +1962,7 @@ class WorkSessionRegistry:
                     self._cleanup_tmux_watch_locked(existing, event_at, lifecycle_state="stopped")
                 elif _is_work_session_resolved_event(normalized_event, payload):
                     self._cleanup_tmux_watch_locked(existing, event_at, lifecycle_state="resolved")
-                elif existing.lifecycle_state in {"stopped", "resolved", "orphaned"}:
+                elif existing.lifecycle_state in {"stopped", "resolved", "orphaned", "failed"}:
                     pass
                 else:
                     existing.lifecycle_state = "active"
@@ -1613,18 +1985,29 @@ class WorkSessionRegistry:
             self._maybe_auto_register_tmux_watch_locked(record, payload, event_at)
             classification = None
             semantic_alert = None
+            deliver_policy = None
             if should_classify:
                 classification = classify_work_session_action_required(
                     payload,
                     record=record,
                     normalized_event=normalized_event,
                 )
-                semantic_alert = self._apply_semantic_classification_locked(
+                deliver_policy = self._maybe_deliver_locked(
                     record,
                     payload,
                     event_at,
                     classification,
                 )
+                if not (
+                    isinstance(deliver_policy, dict)
+                    and deliver_policy.get("status") == "succeeded"
+                ):
+                    semantic_alert = self._apply_semantic_classification_locked(
+                        record,
+                        payload,
+                        event_at,
+                        classification,
+                    )
             if record.lifecycle_state not in WORK_SESSION_LIFECYCLE_STATES:
                 return {"status": "rejected", "reason": "invalid_lifecycle_state"}
             if record.watch_status not in WORK_SESSION_WATCH_STATUSES:
@@ -1637,6 +2020,8 @@ class WorkSessionRegistry:
             }
             if classification is not None:
                 result["classification"] = classification.to_dict()
+            if deliver_policy is not None:
+                result["deliver_policy"] = deliver_policy
             if semantic_alert is not None:
                 result["semantic_alert"] = semantic_alert
             return result
