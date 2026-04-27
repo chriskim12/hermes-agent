@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import subprocess
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from tools.repo_workflow_profile import (
     PUSH_AUTHORITY,
@@ -33,6 +37,13 @@ _HANDOFF_FIELD_LABELS = {
     "handoff_risks": "HANDOFF_RISKS",
     "handoff_decision": "HANDOFF_DECISION",
 }
+_REQUIRED_HANDOFF_FIELDS = tuple(_HANDOFF_FIELD_LABELS.keys())
+_HANDOFF_QUERY = """query($id:String!){ issue(id:$id){ description comments(first:10){nodes{body}} } }"""
+
+
+class LinearHandoffLookupError(RuntimeError):
+    """Raised when live Linear handoff lookup cannot be completed safely."""
+
 
 
 def _run_git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -99,40 +110,143 @@ def _extract_linear_description(command: str) -> str:
     return ""
 
 
-def _extract_handoff_fields(command: str) -> dict[str, str]:
-    description = _extract_linear_description(command)
-    if not description:
+def _extract_handoff_fields_from_text(text: str) -> dict[str, str]:
+    if not text:
         return {}
 
     fields: dict[str, str] = {}
     for key, label in _HANDOFF_FIELD_LABELS.items():
-        match = re.search(rf"{label}:\s*(.+)", description, re.IGNORECASE)
+        match = re.search(rf"{label}:\s*(.+)", text, re.IGNORECASE)
         if match:
             fields[key] = match.group(1).strip()
     return fields
 
 
-def _linear_in_review_handoff_blockers(repo_path: str | Path, command: str) -> tuple[list[str], str | None]:
-    fields = _extract_handoff_fields(command)
-    blockers = [
-        key
-        for key in ("handoff_changed", "handoff_verified", "handoff_risks", "handoff_decision")
-        if not fields.get(key, "").strip()
-    ]
-    if blockers:
-        return blockers, None
+def _extract_handoff_fields(command: str) -> dict[str, str]:
+    return _extract_handoff_fields_from_text(_extract_linear_description(command))
 
-    decision = fields["handoff_decision"].strip().lower()
-    if decision not in _ALLOWED_HANDOFF_DECISIONS:
-        return ["handoff_decision"], (
-            "Pending human decision must be one of: "
-            "review verdict only, push authority, release authority."
-        )
 
-    authority_resolution = resolve_workflow_handoff_authority(repo_path, decision)
-    if authority_resolution.supported:
+def _extract_linear_issue_id(command: str) -> str:
+    if not command:
+        return ""
+
+    normalized = command.replace('\\"', '"').replace("\\'", "'")
+    patterns = (
+        r"issueUpdate\s*\(\s*id\s*:\s*[\"']([^\"']+)[\"']",
+        r"[\"']id[\"']\s*:\s*[\"'](CH-\d+|[0-9a-fA-F-]{20,})[\"']",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, normalized)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def _fetch_linear_handoff_texts(issue_id: str) -> list[str]:
+    token = os.environ.get("LINEAR_API_KEY")
+    if not token:
+        raise LinearHandoffLookupError("LINEAR_API_KEY is not available for live Linear handoff lookup.")
+
+    payload = json.dumps({"query": _HANDOFF_QUERY, "variables": {"id": issue_id}}).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.linear.app/graphql",
+        data=payload,
+        headers={"Content-Type": "application/json", "Authorization": token},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            data = json.load(response)
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        raise LinearHandoffLookupError("live Linear handoff lookup failed.") from exc
+
+    if data.get("errors"):
+        raise LinearHandoffLookupError("live Linear handoff lookup returned GraphQL errors.")
+
+    issue = data.get("data", {}).get("issue")
+    if not issue:
+        raise LinearHandoffLookupError("target Linear issue was not found during handoff lookup.")
+
+    texts = []
+    description = issue.get("description")
+    if isinstance(description, str) and description.strip():
+        texts.append(description)
+    comments = issue.get("comments", {}).get("nodes", [])
+    for comment in comments:
+        body = comment.get("body") if isinstance(comment, dict) else None
+        if isinstance(body, str) and body.strip():
+            texts.append(body)
+    return texts
+
+
+def _find_valid_handoff_fields(
+    repo_path: str | Path,
+    candidates: list[dict[str, str]],
+) -> tuple[dict[str, str] | None, list[str], str | None]:
+    last_blockers: list[str] = list(_REQUIRED_HANDOFF_FIELDS)
+    last_detail: str | None = None
+    for fields in candidates:
+        blockers = [key for key in _REQUIRED_HANDOFF_FIELDS if not fields.get(key, "").strip()]
+        if blockers:
+            last_blockers = blockers
+            last_detail = None
+            continue
+
+        decision = fields["handoff_decision"].strip().lower()
+        if decision not in _ALLOWED_HANDOFF_DECISIONS:
+            last_blockers = ["handoff_decision"]
+            last_detail = (
+                "Pending human decision must be one of: "
+                "review verdict only, push authority, release authority."
+            )
+            continue
+
+        authority_resolution = resolve_workflow_handoff_authority(repo_path, decision)
+        if authority_resolution.supported:
+            return fields, [], None
+        last_blockers = ["handoff_decision"]
+        last_detail = authority_resolution.reason
+
+    return None, last_blockers, last_detail
+
+
+def _linear_in_review_handoff_blockers(
+    repo_path: str | Path,
+    command: str,
+    fetch_handoff_texts: Callable[[str], list[str]] | None = None,
+) -> tuple[list[str], str | None]:
+    if fetch_handoff_texts is None:
+        fetch_handoff_texts = _fetch_linear_handoff_texts
+    command_fields = _extract_handoff_fields(command)
+    command_candidates = [command_fields] if command_fields else []
+
+    issue_id = _extract_linear_issue_id(command)
+    lookup_error: str | None = None
+    live_candidates: list[dict[str, str]] = []
+    if issue_id:
+        try:
+            live_candidates = [
+                fields
+                for fields in (_extract_handoff_fields_from_text(text) for text in fetch_handoff_texts(issue_id))
+                if fields
+            ]
+        except LinearHandoffLookupError as exc:
+            lookup_error = str(exc)
+    else:
+        lookup_error = "target Linear issue id could not be extracted for live handoff lookup."
+
+    # Linear issue content is the SSOT whenever it yields a handoff candidate. The
+    # command-string handoff remains a backwards-compatible fallback for older
+    # scripts/tests that have not recorded a live handoff yet.
+    candidates = live_candidates if live_candidates else command_candidates
+    _, blockers, detail = _find_valid_handoff_fields(repo_path, candidates)
+    if not blockers:
         return [], None
-    return ["handoff_decision"], authority_resolution.reason
+
+    if lookup_error and not command_candidates:
+        return list(_REQUIRED_HANDOFF_FIELDS), lookup_error
+    if lookup_error and command_candidates:
+        detail = f"{detail + ' ' if detail else ''}{lookup_error}"
+    return blockers, detail
 
 
 def _status_has_relevant_changes(status_output: str) -> bool:
@@ -240,7 +354,8 @@ def build_linear_in_review_block_error(repo_path: str | Path, command: str) -> O
         return None
 
     error = (
-        "Linear In Review handoff is blocked until a valid handoff block is present. "
+        "Linear In Review handoff is blocked until a valid HANDOFF_* block is present "
+        "in the Linear issue description or recent comments. "
         f"Missing/invalid fields: {', '.join(blockers)}."
     )
     if detail:
