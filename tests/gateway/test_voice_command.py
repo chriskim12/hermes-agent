@@ -2677,17 +2677,29 @@ class TestGeneratedDiscordThreadTtsPolicy:
         assert runner._generated_tts_in_cooldown(event, now=1119.0) is True
         assert runner._generated_tts_in_cooldown(event, now=1120.0) is False
 
-    def test_generated_tts_skips_when_audio_media_already_claimed_turn(self, runner):
+    def test_generated_tts_skips_when_assistant_media_already_claimed_turn(self, runner):
         event = _make_discord_thread_event()
         agent_messages = [
             {
-                "role": "tool",
-                "content": '{"success": true, "media_tag": "[[audio_as_voice]]\nMEDIA:/tmp/already-claimed.ogg"}',
+                "role": "assistant",
+                "content": "[[audio_as_voice]]\nMEDIA:/tmp/already-claimed.ogg",
             }
         ]
         response = "Okay, I'll send the short update soon."
 
         assert runner._should_send_generated_tts_reply(event, response, agent_messages) is False
+
+    def test_generated_tts_ignores_tool_output_media_literals(self, runner):
+        event = _make_discord_thread_event()
+        agent_messages = [
+            {
+                "role": "tool",
+                "content": '{"content": "code sample mentions [[audio_as_voice]] and MEDIA:/tmp/example.ogg"}',
+            }
+        ]
+        response = "Okay, I'll send the short update soon."
+
+        assert runner._should_send_generated_tts_reply(event, response, agent_messages) is True
 
     def test_generated_tts_skips_when_text_to_speech_tool_already_called(self, runner):
         event = _make_discord_thread_event()

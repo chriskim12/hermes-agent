@@ -6228,6 +6228,12 @@ class GatewayRunner:
 
     def _agent_messages_claim_audio_turn(self, agent_messages: Optional[list]) -> bool:
         for msg in agent_messages or []:
+            # Tool results can contain literal examples or serialized return values
+            # from file reads/searches (for example code mentioning ``MEDIA:``).
+            # Only assistant-authored response content should count as the agent
+            # intentionally claiming the user-visible audio turn.
+            if msg.get("role") != "assistant":
+                continue
             content = str(msg.get("content") or "")
             if "MEDIA:" in content or "[[audio_as_voice]]" in content:
                 return True
