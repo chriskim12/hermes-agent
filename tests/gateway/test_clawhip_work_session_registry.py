@@ -979,7 +979,7 @@ def test_default_clawhip_deliver_executor_uses_current_clawhip_cli_contract(monk
         "kwargs": {
             "capture_output": True,
             "text": True,
-            "timeout": 10,
+            "timeout": 75,
             "cwd": str(worktree),
         },
     }

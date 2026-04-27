@@ -401,7 +401,7 @@ def _default_clawhip_deliver_executor(deliver_request: Dict[str, Any]) -> Dict[s
             command,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=75,
             cwd=str(workdir),
         )
     except FileNotFoundError:
