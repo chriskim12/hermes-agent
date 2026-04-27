@@ -22,6 +22,19 @@ _PLAN_SLUG_RE = re.compile(r"[^a-z0-9]+")
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
+_LINEAR_ISSUE_ID_RE = re.compile(r"(?<![A-Z0-9])([A-Z][A-Z0-9]{1,9}-\d+)(?![A-Z0-9])")
+_LINEAR_EXECUTION_CUE_RE = re.compile(
+    r"("
+    r"\b(?:execute|implement|start|proceed|run|continue|work\s+on|pick\s+up|take\s+on|do\s+it)\b"
+    r"|(?<![가-힣])(?:진행|처리|작업|구현|시작|실행)\s*(?:해주세요|해줘|하자|부탁|해)?(?![가-힣])"
+    r"|(?<![가-힣])(?:계속|이어가)\s*(?:해주세요|해줘|하자|부탁|해)?(?![가-힣])"
+    r")",
+    re.IGNORECASE,
+)
+_LINEAR_CARD_EXECUTION_SKILL_CANDIDATES = (
+    "/linear-card-execution-router",
+    "/linear-task-operator",
+)
 
 # Matches ${HERMES_SKILL_DIR} / ${HERMES_SESSION_ID} tokens in SKILL.md.
 # Tokens that don't resolve (e.g. ${HERMES_SESSION_ID} with no session) are
@@ -147,6 +160,125 @@ def build_plan_path(
     slug = slug or "conversation-plan"
     timestamp = (now or datetime.now()).strftime("%Y-%m-%d_%H%M%S")
     return Path(".hermes") / "plans" / f"{timestamp}-{slug}.md"
+
+
+def _is_discord_thread_ingress(
+    *,
+    platform: str | None,
+    chat_type: str | None,
+    thread_id: str | None,
+) -> bool:
+    """Return True only for approved Discord thread ingress contexts."""
+    return (
+        (platform or "").lower() == "discord"
+        and (chat_type or "").lower() == "thread"
+        and bool(thread_id)
+    )
+
+
+def _extract_linear_execution_issue_id(message_text: str) -> str | None:
+    """Extract a Linear issue id only when the text also has an execution cue.
+
+    Mentions such as ``CH-123은 incident anchor였어`` intentionally do not match:
+    they contain an issue id but no imperative execution cue.
+    """
+    text = (message_text or "").strip()
+    if not text:
+        return None
+    issue_match = _LINEAR_ISSUE_ID_RE.search(text)
+    if not issue_match:
+        return None
+    if not _LINEAR_EXECUTION_CUE_RE.search(text):
+        return None
+    return issue_match.group(1)
+
+
+def _resolve_linear_card_execution_skill_key() -> str | None:
+    """Choose the thinnest installed skill that can handle card execution."""
+    commands = get_skill_commands()
+    for candidate in _LINEAR_CARD_EXECUTION_SKILL_CANDIDATES:
+        if candidate in commands:
+            return candidate
+    return None
+
+
+def _linear_card_execution_runtime_note(issue_id: str) -> str:
+    return (
+        "Discord thread Linear card execution ingress event. "
+        f"Extracted Linear issue id: {issue_id}. "
+        "Fail closed: before broad repository reads, edits, tests, command execution, "
+        "or any mutation, perform a live Linear card preflight for this exact issue id. "
+        "If the card lookup fails, is ambiguous, stale, inaccessible, or does not authorize "
+        "execution, stop and report the blocker instead of continuing from thread context. "
+        "If the live card says Executor: OMX or hermes->omx, load and enforce the "
+        "omx-card-execution-routing contract and require an explicit routing verdict before "
+        "any mutation. Do not infer authority from Discord shared-thread history or sender "
+        "decoration; treat the original message as the execution ingress payload."
+    )
+
+
+def resolve_natural_skill_invocation(
+    message_text: str,
+    *,
+    platform: str | None = None,
+    chat_type: str | None = None,
+    thread_id: str | None = None,
+) -> tuple[str | None, str, str] | None:
+    """Resolve high-confidence natural-language skill invocations.
+
+    This is intentionally narrow for gateway ingress.  CH-246 only routes
+    Discord thread messages that combine a Linear issue id with an execution
+    cue, keeping simple issue mentions in the normal conversation path.
+
+    Returns:
+        ``(cmd_key, user_instruction, runtime_note)`` for
+        :func:`build_skill_invocation_message`.  ``cmd_key`` is ``None`` when
+        the execution cue matched but no router skill is installed; callers must
+        inject a fail-closed message instead of falling back to normal text.
+        Returns ``None`` only when this is not a card-execution request.
+    """
+    if not _is_discord_thread_ingress(
+        platform=platform,
+        chat_type=chat_type,
+        thread_id=thread_id,
+    ):
+        return None
+
+    issue_id = _extract_linear_execution_issue_id(message_text)
+    if not issue_id:
+        return None
+
+    user_instruction = (
+        f"Linear card execution ingress for {issue_id}: {message_text.strip()}"
+    )
+    cmd_key = _resolve_linear_card_execution_skill_key()
+    if not cmd_key:
+        return (
+            None,
+            user_instruction,
+            _linear_card_execution_runtime_note(issue_id)
+            + " Router skill unavailable: fail closed and report blocked; do not execute this card from ordinary conversation context.",
+        )
+
+    return cmd_key, user_instruction, _linear_card_execution_runtime_note(issue_id)
+
+
+def get_discord_thread_boundary_runtime_note(
+    message_text: str,
+    *,
+    platform: str | None = None,
+    chat_type: str | None = None,
+    thread_id: str | None = None,
+) -> str:
+    """Return a non-routing Discord thread boundary note, if one is needed.
+
+    Natural skill routing is handled by :func:`resolve_natural_skill_invocation`.
+    This hook remains as a stable extension point for existing gateway
+    checkpoint/follow-up preprocessing; by default it is deliberately silent so
+    ordinary Discord thread follow-ups keep their established sender-prefix
+    behavior.
+    """
+    return ""
 
 
 def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:

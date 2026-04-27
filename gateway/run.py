@@ -3940,6 +3940,14 @@ class GatewayRunner:
                 )
                 if natural_skill is not None:
                     cmd_key, user_instruction, runtime_note = natural_skill
+                    if cmd_key is None:
+                        return (
+                            "[Runtime note: "
+                            f"{runtime_note}]\n"
+                            f"{user_instruction}\n\n"
+                            "Fail-closed result: blocked — the Linear card execution router skill "
+                            "is unavailable, so this message must not be handled as ordinary conversation."
+                        )
                     injected = build_skill_invocation_message(
                         cmd_key,
                         user_instruction,
@@ -3947,6 +3955,12 @@ class GatewayRunner:
                     )
                     if injected:
                         return injected
+                    return (
+                        "[Runtime note: "
+                        f"{runtime_note} Skill payload construction failed for {cmd_key}; "
+                        "fail closed and report blocked.]\n"
+                        f"{user_instruction}"
+                    )
 
                 discord_thread_boundary_note = get_discord_thread_boundary_runtime_note(
                     message_text,
@@ -3967,7 +3981,12 @@ class GatewayRunner:
             and source.thread_id
             and not getattr(self.config, "thread_sessions_per_user", False)
         )
-        if _is_shared_thread and source.user_name:
+        _is_shared_group = (
+            source.chat_type in ("group", "channel")
+            and not source.thread_id
+            and not getattr(self.config, "group_sessions_per_user", True)
+        )
+        if (_is_shared_thread or _is_shared_group) and source.user_name:
             message_text = f"[{source.user_name}] {message_text}"
 
         if discord_thread_boundary_note:
