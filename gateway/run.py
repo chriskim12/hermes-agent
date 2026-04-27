@@ -252,7 +252,7 @@ from gateway.session import (
     build_session_key,
 )
 from gateway.delivery import DeliveryRouter
-from gateway.work_state import WorkRecord, WorkStateStore
+from gateway.work_state import WorkRecord, WorkSessionRegistry, WorkStateStore
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -556,6 +556,7 @@ class GatewayRunner:
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(key),
         )
         self.work_state_store = WorkStateStore()
+        self.work_session_registry = WorkSessionRegistry()
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
         self._shutdown_event = asyncio.Event()

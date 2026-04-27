@@ -340,10 +340,11 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
 
         # Check event type filter
+        payload_event_type = payload.get("event_type", "") if isinstance(payload, dict) else ""
         event_type = (
             request.headers.get("X-GitHub-Event", "")
             or request.headers.get("X-GitLab-Event", "")
-            or payload.get("event_type", "")
+            or payload_event_type
             or "unknown"
         )
         allowed_events = route_config.get("events", [])
@@ -393,6 +394,45 @@ class WebhookAdapter(BasePlatformAdapter):
             return web.json_response(
                 {k: v for k, v in verdict.items() if k != "http_status"},
                 status=int(verdict.get("http_status", 202)),
+            )
+
+        if route_config.get("clawhip_native_ingress"):
+            registry = getattr(self.gateway_runner, "work_session_registry", None)
+            if registry is None:
+                return web.json_response(
+                    {"status": "reject", "verdict": "reject", "reason": "work_session_registry_unavailable"},
+                    status=503,
+                )
+            event_payload = payload if isinstance(payload, dict) else {}
+            event_payload = dict(event_payload)
+            event_payload["ingress_route"] = route_name
+            event_payload["delivery_id"] = delivery_id
+            result = registry.ingest_clawhip_native_event(event_payload)
+            if result.get("status") != "accepted":
+                return web.json_response(
+                    {
+                        "status": "reject",
+                        "verdict": "reject",
+                        "registry_status": result.get("status"),
+                        "reason": result.get("reason", "clawhip_native_ingress_rejected"),
+                    },
+                    status=422,
+                )
+            record = result.get("record")
+            return web.json_response(
+                {
+                    "status": "accepted",
+                    "verdict": "accepted",
+                    "registry_status": result.get("status"),
+                    "route": route_name,
+                    "delivery_id": delivery_id,
+                    "provider": getattr(record, "provider", None),
+                    "provider_session_id": getattr(record, "provider_session_id", None),
+                    "linear_card_id": getattr(record, "linear_card_id", None),
+                    "lane_id": getattr(record, "lane_id", None),
+                    "lifecycle_state": getattr(record, "lifecycle_state", None),
+                },
+                status=202,
             )
 
         # Format prompt from template
