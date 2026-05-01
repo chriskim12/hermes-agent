@@ -38,7 +38,9 @@ _HANDOFF_FIELD_LABELS = {
     "handoff_decision": "HANDOFF_DECISION",
 }
 _REQUIRED_HANDOFF_FIELDS = tuple(_HANDOFF_FIELD_LABELS.keys())
-_HANDOFF_QUERY = """query($id:String!){ issue(id:$id){ description comments(first:10){nodes{body}} } }"""
+_HANDOFF_QUERY = """query($id:String!){ issue(id:$id){ description comments(last:10){nodes{body}} } }"""
+_HANDOFF_LOOKUP_FAILED_BLOCKER = "live_handoff_lookup_failed"
+_HANDOFF_ISSUE_ID_MISSING_BLOCKER = "linear_issue_id_missing"
 
 
 class LinearHandoffLookupError(RuntimeError):
@@ -116,7 +118,7 @@ def _extract_handoff_fields_from_text(text: str) -> dict[str, str]:
 
     fields: dict[str, str] = {}
     for key, label in _HANDOFF_FIELD_LABELS.items():
-        match = re.search(rf"{label}:\s*(.+)", text, re.IGNORECASE)
+        match = re.search(rf"^\s*{label}:\s*(.+)\s*$", text, re.MULTILINE)
         if match:
             fields[key] = match.group(1).strip()
     return fields
@@ -170,7 +172,7 @@ def _fetch_linear_handoff_texts(issue_id: str) -> list[str]:
     description = issue.get("description")
     if isinstance(description, str) and description.strip():
         texts.append(description)
-    comments = issue.get("comments", {}).get("nodes", [])
+    comments = (issue.get("comments") or {}).get("nodes", [])
     for comment in comments:
         body = comment.get("body") if isinstance(comment, dict) else None
         if isinstance(body, str) and body.strip():
@@ -243,7 +245,9 @@ def _linear_in_review_handoff_blockers(
         return [], None
 
     if lookup_error and not command_candidates:
-        return list(_REQUIRED_HANDOFF_FIELDS), lookup_error
+        if issue_id:
+            return [_HANDOFF_LOOKUP_FAILED_BLOCKER], lookup_error
+        return [_HANDOFF_ISSUE_ID_MISSING_BLOCKER], lookup_error
     if lookup_error and command_candidates:
         detail = f"{detail + ' ' if detail else ''}{lookup_error}"
     return blockers, detail

@@ -1,4 +1,5 @@
 import json
+import io
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -171,6 +172,58 @@ def test_in_review_handoff_allows_live_linear_recent_comment_without_command_han
     assert detail is None
 
 
+def test_in_review_handoff_ignores_lowercase_non_contract_comments_when_uppercase_exists(tmp_path):
+    from tools.linear_close_policy import _linear_in_review_handoff_blockers
+
+    repo = _init_git_repo(tmp_path / "repo")
+    command = _in_review_command()
+    lowercase_non_contract = "\n".join(
+        [
+            "handoff_changed: lower-case fields are not the HANDOFF contract.",
+            "handoff_verified: should not satisfy the guard.",
+            "handoff_risks: should not mask the uppercase comment.",
+            "handoff_decision: review verdict only",
+        ]
+    )
+
+    blockers, detail = _linear_in_review_handoff_blockers(
+        repo,
+        command,
+        fetch_handoff_texts=lambda issue_id: [
+            "status note without handoff fields",
+            lowercase_non_contract,
+            _handoff_text(),
+        ],
+    )
+
+    assert blockers == []
+    assert detail is None
+
+
+def test_in_review_handoff_rejects_lowercase_only_non_contract_comment(tmp_path):
+    from tools.linear_close_policy import _linear_in_review_handoff_blockers
+
+    repo = _init_git_repo(tmp_path / "repo")
+    command = _in_review_command()
+    lowercase_non_contract = "\n".join(
+        [
+            "handoff_changed: lower-case fields are not the HANDOFF contract.",
+            "handoff_verified: should not satisfy the guard.",
+            "handoff_risks: should not satisfy the guard.",
+            "handoff_decision: review verdict only",
+        ]
+    )
+
+    blockers, detail = _linear_in_review_handoff_blockers(
+        repo,
+        command,
+        fetch_handoff_texts=lambda issue_id: [lowercase_non_contract],
+    )
+
+    assert set(blockers) == {"handoff_changed", "handoff_verified", "handoff_risks", "handoff_decision"}
+    assert detail is None
+
+
 def test_in_review_handoff_blocks_invalid_live_decision_without_leaking_body(tmp_path):
     from tools.linear_close_policy import _linear_in_review_handoff_blockers
 
@@ -222,8 +275,64 @@ def test_in_review_handoff_fails_closed_when_live_lookup_fails_and_no_command_fa
         fetch_handoff_texts=fail_lookup,
     )
 
-    assert set(blockers) == {"handoff_changed", "handoff_verified", "handoff_risks", "handoff_decision"}
+    assert blockers == ["live_handoff_lookup_failed"]
     assert "lookup unavailable" in detail
+
+
+def test_in_review_handoff_reports_missing_issue_id_extraction_without_fake_missing_fields(tmp_path):
+    from tools.linear_close_policy import _linear_in_review_handoff_blockers
+
+    repo = _init_git_repo(tmp_path / "repo")
+    command = (
+        "python3 - <<'PY'\n"
+        'print("https://api.linear.app/graphql")\n'
+        'print("mutation { issueUpdate(input: { stateId: \\\"'
+        + _CHRIS_IN_REVIEW_STATE_ID
+        + '\\\" }) { success } }")\n'
+        "PY"
+    )
+
+    blockers, detail = _linear_in_review_handoff_blockers(repo, command)
+
+    assert blockers == ["linear_issue_id_missing"]
+    assert "issue id could not be extracted" in detail
+
+
+def test_fetch_linear_handoff_texts_queries_latest_comments_page(monkeypatch):
+    from tools.linear_close_policy import _fetch_linear_handoff_texts
+
+    captured = {}
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        return Response(
+            json.dumps(
+                {
+                    "data": {
+                        "issue": {
+                            "description": "",
+                            "comments": {"nodes": [{"body": _handoff_text()}]},
+                        }
+                    }
+                }
+            ).encode("utf-8")
+        )
+
+    monkeypatch.setenv("LINEAR_API_KEY", "lin_api_test")
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        texts = _fetch_linear_handoff_texts("CH-181")
+
+    assert texts == [_handoff_text()]
+    assert "comments(last:10)" in captured["payload"]["query"]
+    assert "comments(first:10)" not in captured["payload"]["query"]
 
 
 def test_terminal_tool_allows_in_review_transition_with_live_linear_handoff(tmp_path):
@@ -264,7 +373,8 @@ def test_terminal_tool_blocks_in_review_transition_without_required_handoff_bloc
     assert result["exit_code"] == -1
     assert result["status"] == "blocked"
     assert "in review handoff" in result["error"].lower()
-    assert "handoff_changed" in result["error"].lower()
+    assert "live_handoff_lookup_failed" in result["error"].lower()
+    assert "linear_api_key" in result["error"].lower()
     mock_env.execute.assert_not_called()
 
 
