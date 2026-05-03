@@ -1614,7 +1614,7 @@ def _apply_default_omx_launch_flags(command: str) -> str:
     if not text.strip() or "omx " not in text:
         return text
 
-    pattern = re.compile(r"\bomx\s+(?![^\n]*\b--madmax\b)(?![^\n]*\b--high\b)(exec|plan|ralplan|ralph|team)\b")
+    pattern = re.compile(r"\bomx\s+(?![^\n]*\b--madmax\b)(?![^\n]*\b--high\b)(exec|plan|ralplan)\b")
     return pattern.sub(r"omx --madmax --high \1", text)
 
 
