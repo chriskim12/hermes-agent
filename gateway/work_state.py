@@ -70,6 +70,77 @@ def _normalize_path_value(value: Optional[str]) -> Optional[str]:
             return text
 
 
+def _coalesce_text(*values: Any) -> Optional[str]:
+    for value in values:
+        if value is None or isinstance(value, (dict, list, tuple, set)):
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _nested_get(payload: Dict[str, Any], *path: str) -> Optional[Any]:
+    current: Any = payload
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _normalize_event_value(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    return text.replace("-", "_").replace(" ", "_")
+
+
+def normalize_native_owner_ingress_packet(packet: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """Normalize the clawhip/OMX native signal contract for owner ingress.
+
+    clawhip may carry the same identifiers at top level or in nested
+    ``work``/``executor``/``context`` objects. Hermes resolves the normalized
+    packet against work-state; a webhook route/session is never treated as the
+    owner conversation.
+    """
+    if not isinstance(packet, dict):
+        packet = {}
+    context = packet.get("context") if isinstance(packet.get("context"), dict) else {}
+    return {
+        "work_id": _coalesce_text(packet.get("work_id"), _nested_get(packet, "work", "id")),
+        "owner": (_coalesce_text(packet.get("owner"), _nested_get(packet, "owner", "name")) or "hermes").lower(),
+        "executor": (_coalesce_text(packet.get("executor"), _nested_get(packet, "executor", "name")) or "omx").lower(),
+        "state": _coalesce_text(packet.get("state"), packet.get("status")),
+        "normalized_event": _normalize_event_value(
+            _coalesce_text(
+                packet.get("normalized_event"),
+                packet.get("event_type"),
+                packet.get("event"),
+                context.get("normalized_event"),
+            )
+        ),
+        "next_action": _coalesce_text(packet.get("next_action"), context.get("next_action")),
+        "proof": _coalesce_text(packet.get("proof"), context.get("proof")),
+        "repo_path": _normalize_path_value(_coalesce_text(packet.get("repo_path"), context.get("repo_path"))),
+        "worktree_path": _normalize_path_value(_coalesce_text(packet.get("worktree_path"), context.get("worktree_path"))),
+        "repo_name": _coalesce_text(packet.get("repo_name"), context.get("repo_name")),
+        "executor_session_id": _coalesce_text(
+            packet.get("executor_session_id"),
+            packet.get("session_id"),
+            _nested_get(packet, "executor", "session_id"),
+        ),
+        "tmux_session": _coalesce_text(
+            packet.get("tmux_session"),
+            packet.get("tmuxSession"),
+            packet.get("session_name"),
+            _nested_get(packet, "executor", "tmux_session"),
+        ),
+    }
+
+
 def _normalize_lane_value(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
@@ -546,6 +617,132 @@ class WorkStateStore:
             "reason": "eligible",
             "matches": [matches[0].to_dict()],
             "record": matches[0],
+        }
+
+    def resolve_native_owner_ingress_packet(
+        self,
+        packet: Dict[str, Any],
+        *,
+        live_only: bool = True,
+    ) -> Dict[str, Any]:
+        """Resolve one clawhip/OMX native signal to one Hermes owner work record.
+
+        Resolution is deliberately priority-based, not broad wake:
+        ``work_id`` first, then executor/tmux session identity, then
+        ``worktree_path``, then ``repo_path``. ``repo_name`` is normalized only
+        for logging/convenience and is never a standalone selector.
+        """
+        normalized = normalize_native_owner_ingress_packet(packet)
+        if normalized["owner"] != "hermes":
+            return {
+                "status": "missing",
+                "reason": "invalid_owner",
+                "selected_by": None,
+                "packet": normalized,
+                "matches": [],
+                "no_broadcast": True,
+            }
+        if normalized["executor"] not in {"omx", "clawhip"}:
+            return {
+                "status": "missing",
+                "reason": "invalid_executor",
+                "selected_by": None,
+                "packet": normalized,
+                "matches": [],
+                "no_broadcast": True,
+            }
+
+        with self._lock:
+            self._ensure_loaded()
+            candidates = [
+                record
+                for record in self._records
+                if record.owner == "hermes"
+                and record.executor == "omx"
+                and record.mode == "delegated"
+            ]
+            if live_only:
+                candidates = [record for record in candidates if record.state in LIVE_STATES]
+
+            selected_by: Optional[str] = None
+            matches: List[WorkRecord] = []
+
+            if normalized["work_id"]:
+                selected_by = "work_id"
+                matches = [record for record in candidates if record.work_id == normalized["work_id"]]
+            elif normalized["executor_session_id"] or normalized["tmux_session"]:
+                selected_by = "executor_session"
+                matches = [
+                    record
+                    for record in candidates
+                    if (
+                        normalized["executor_session_id"]
+                        and record.executor_session_id == normalized["executor_session_id"]
+                    )
+                    or (
+                        normalized["tmux_session"]
+                        and record.tmux_session == normalized["tmux_session"]
+                    )
+                ]
+            elif normalized["worktree_path"]:
+                selected_by = "worktree_path"
+                matches = [
+                    record
+                    for record in candidates
+                    if _normalize_path_value(record.worktree_path) == normalized["worktree_path"]
+                ]
+            elif normalized["repo_path"]:
+                selected_by = "repo_path"
+                matches = [
+                    record
+                    for record in candidates
+                    if _normalize_path_value(record.repo_path) == normalized["repo_path"]
+                ]
+            else:
+                return {
+                    "status": "missing",
+                    "reason": "insufficient_native_owner_correlation",
+                    "selected_by": None,
+                    "packet": normalized,
+                    "matches": [],
+                    "no_broadcast": True,
+                }
+
+            matches = [WorkRecord.from_dict(record.to_dict()) for record in matches]
+
+        if not matches:
+            return {
+                "status": "missing",
+                "reason": "missing_or_closed_native_owner_work_record",
+                "selected_by": selected_by,
+                "packet": normalized,
+                "matches": [],
+                "no_broadcast": True,
+            }
+        if len(matches) > 1:
+            return {
+                "status": "ambiguous",
+                "reason": "ambiguous_native_owner_work_resolution",
+                "selected_by": selected_by,
+                "packet": normalized,
+                "matches": [record.to_dict() for record in matches],
+                "no_broadcast": True,
+            }
+        record = matches[0]
+        return {
+            "status": "single_match",
+            "reason": "eligible",
+            "selected_by": selected_by,
+            "packet": normalized,
+            "matches": [record.to_dict()],
+            "record": record,
+            "owner_wake": {
+                "work_id": record.work_id,
+                "owner_session_id": record.owner_session_id,
+                "source": "work_record",
+                "webhook_session_id": None,
+            },
+            "no_broadcast": True,
         }
 
     def fail_close_delegated_process_exit(
