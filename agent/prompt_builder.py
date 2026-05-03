@@ -712,6 +712,7 @@ def _skill_should_show(
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
+    mode: str = "full",
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -750,6 +751,7 @@ def build_skills_system_prompt(
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
         tuple(sorted(disabled)),
+        str(mode or "full").lower().strip(),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -886,6 +888,7 @@ def build_skills_system_prompt(
     if not skills_by_category:
         result = ""
     else:
+        compact_mode = str(mode or "full").lower().strip() in {"compact", "summary", "categories"}
         index_lines = []
         for category in sorted(skills_by_category.keys()):
             cat_desc = category_descriptions.get(category, "")
@@ -893,6 +896,8 @@ def build_skills_system_prompt(
                 index_lines.append(f"  {category}: {cat_desc}")
             else:
                 index_lines.append(f"  {category}:")
+            if compact_mode:
+                continue
             # Deduplicate and sort skills within each category
             seen = set()
             for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
@@ -1136,6 +1141,48 @@ def _load_cursorrules(cwd_path: Path) -> str:
     if not cursorrules_content:
         return ""
     return _truncate_content(cursorrules_content, ".cursorrules")
+
+
+def should_load_context_files_for_session(
+    *,
+    platform: str | None = None,
+    terminal_cwd: str | None = None,
+    mode: str | bool | None = "auto",
+) -> bool:
+    """Return whether project context files should be preloaded for a session.
+
+    Gateway processes often run from the Hermes install checkout.  Loading
+    AGENTS.md from that cwd into every Discord/Telegram/etc. thread is expensive
+    and frequently irrelevant.  In explicit mode, gateway sessions only preload
+    project context when the gateway supplied an explicit TERMINAL_CWD; CLI/local
+    sessions keep the traditional cwd-based discovery.
+    """
+    if mode is False or str(mode).lower().strip() in {"false", "off", "never", "none", "disabled"}:
+        return False
+    if mode is True or str(mode).lower().strip() in {"true", "on", "always", "all"}:
+        return True
+
+    platform_key = (platform or "").lower().strip()
+    gateway_platforms = {
+        "discord", "telegram", "slack", "whatsapp", "signal", "matrix",
+        "mattermost", "email", "sms", "dingtalk", "wecom", "weixin",
+        "feishu", "qqbot", "bluebubbles", "webhook", "api_server",
+        "homeassistant",
+    }
+    mode_key = str(mode or "auto").lower().strip()
+    if mode_key in {"explicit", "gateway_explicit"} and platform_key in gateway_platforms:
+        cwd_text = str(terminal_cwd or "").strip()
+        if not cwd_text:
+            return False
+        try:
+            cwd_path = Path(cwd_text).expanduser().resolve()
+            hermes_checkout = Path(__file__).resolve().parents[1]
+            if cwd_path == hermes_checkout:
+                return False
+        except Exception:
+            pass
+        return True
+    return True
 
 
 def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = False) -> str:

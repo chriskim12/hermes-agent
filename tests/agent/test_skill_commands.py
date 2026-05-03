@@ -8,6 +8,7 @@ import tools.skills_tool as skills_tool_module
 from agent.skill_commands import (
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
+    resolve_natural_skill_invocation,
     resolve_skill_command_key,
     scan_skill_commands,
 )
@@ -266,6 +267,103 @@ class TestResolveSkillCommandKey:
             assert resolve_skill_command_key("foo-bar") == "/foo-bar"
             # Underscore form also works (Telegram round-trip)
             assert resolve_skill_command_key("foo_bar") == "/foo-bar"
+
+
+class TestNaturalSkillInvocationRouting:
+    def test_discord_thread_linear_execution_cue_routes_to_task_operator(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "linear-task-operator")
+            scan_skill_commands()
+
+            result = resolve_natural_skill_invocation(
+                "CH-123 진행",
+                platform="discord",
+                chat_type="thread",
+                thread_id="thread-1",
+            )
+
+        assert result is not None
+        cmd_key, user_instruction, runtime_note = result
+        assert cmd_key == "/linear-task-operator"
+        assert "CH-123" in user_instruction
+        assert "live Linear card preflight" in runtime_note
+        assert "omx-card-execution-routing" in runtime_note
+
+    def test_dedicated_linear_card_router_is_preferred_when_installed(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "linear-task-operator")
+            _make_skill(tmp_path, "linear-card-execution-router")
+            scan_skill_commands()
+
+            result = resolve_natural_skill_invocation(
+                "please execute CH-123",
+                platform="discord",
+                chat_type="thread",
+                thread_id="thread-1",
+            )
+
+        assert result is not None
+        assert result[0] == "/linear-card-execution-router"
+
+    def test_execution_cue_fails_closed_when_router_skill_is_missing(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            scan_skill_commands()
+
+            result = resolve_natural_skill_invocation(
+                "CH-123 계속해",
+                platform="discord",
+                chat_type="thread",
+                thread_id="thread-1",
+            )
+
+        assert result is not None
+        cmd_key, user_instruction, runtime_note = result
+        assert cmd_key is None
+        assert "CH-123" in user_instruction
+        assert "Router skill unavailable" in runtime_note
+        assert "fail closed" in runtime_note
+
+    def test_status_cue_is_not_treated_as_execution(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "linear-task-operator")
+            scan_skill_commands()
+
+            result = resolve_natural_skill_invocation(
+                "CH-123 진행상황",
+                platform="discord",
+                chat_type="thread",
+                thread_id="thread-1",
+            )
+
+        assert result is None
+
+    def test_simple_linear_issue_mention_does_not_route(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "linear-task-operator")
+            scan_skill_commands()
+
+            result = resolve_natural_skill_invocation(
+                "CH-123은 incident anchor였어",
+                platform="discord",
+                chat_type="thread",
+                thread_id="thread-1",
+            )
+
+        assert result is None
+
+    def test_non_discord_thread_does_not_route(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "linear-task-operator")
+            scan_skill_commands()
+
+            result = resolve_natural_skill_invocation(
+                "CH-123 진행해",
+                platform="discord",
+                chat_type="group",
+                thread_id=None,
+            )
+
+        assert result is None
 
 
 class TestBuildPreloadedSkillsPrompt:
