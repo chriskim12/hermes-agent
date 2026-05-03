@@ -773,6 +773,7 @@ class ProcessRegistry:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
         self._write_checkpoint()
+        self._maybe_update_delegated_work_on_exit(session)
 
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
@@ -787,6 +788,32 @@ class ProcessRegistry:
                 "exit_code": session.exit_code,
                 "output": output_tail,
             })
+
+    def _maybe_update_delegated_work_on_exit(self, session: ProcessSession) -> None:
+        """Fail-close delegated OMX work when a tracked process exits.
+
+        Process exit is lifecycle evidence, not completion proof; the work-state
+        store decides whether exactly one delegated record is eligible.
+        """
+        try:
+            from gateway.work_state import WorkStateStore
+
+            result = WorkStateStore().fail_close_delegated_process_exit(
+                executor_session_id=session.id,
+                exit_code=session.exit_code,
+            )
+            if result.get("updated"):
+                logger.info(
+                    "Delegated OMX work fail-closed from process exit: session=%s exit=%s",
+                    session.id,
+                    session.exit_code,
+                )
+        except Exception as exc:
+            logger.debug(
+                "Delegated work-state process-exit closeout skipped for %s: %s",
+                getattr(session, "id", ""),
+                exc,
+            )
 
     # ----- Query Methods -----
 

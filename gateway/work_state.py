@@ -39,6 +39,16 @@ OMX_LANES = frozenset({"omx_exec", "plan", "ralplan", "ralph", "team"})
 PLANNING_GATES = frozenset({"open", "closed"})
 NEXT_EXECUTION_BRANCHES = frozenset({"none", "pending", "ralph", "team"})
 CLOSE_AUTHORITIES = frozenset({"hermes"})
+USABLE_OUTCOMES = frozenset({
+    "no_progress_theater",
+    "red_only_partial_handoff",
+    "blocked",
+    "stale",
+    "retry_needed",
+    "handoff_needed",
+    "runtime_contamination",
+})
+CLOSE_DISPOSITIONS = frozenset({"update", "close"})
 
 
 def _utcnow() -> datetime:
@@ -112,6 +122,46 @@ def _normalize_close_authority(value: Optional[str]) -> Optional[str]:
         return None
     text = text.replace("-", "_").replace(" ", "_")
     return text if text in CLOSE_AUTHORITIES else None
+
+
+def _normalize_usable_outcome(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    return text if text in USABLE_OUTCOMES else None
+
+
+def _normalize_close_disposition(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    return text if text in CLOSE_DISPOSITIONS else None
+
+
+def derive_delegated_process_exit_closeout(exit_code: Optional[int]) -> Dict[str, str]:
+    """Return fail-closed delegated OMX closeout for a raw process exit.
+
+    A background process exit is only process-lifecycle evidence. It is not
+    proof that OMX produced usable implementation progress. Clean exits
+    therefore hand back to the owner for proof inspection instead of becoming
+    ``finished``.
+    """
+    proof = f"background_process_exit:{exit_code}"
+    if exit_code == 0:
+        return {
+            "state": "handoff_needed",
+            "usable_outcome": "no_progress_theater",
+            "close_disposition": "close",
+            "next_action": "Inspect the OMX run diff before claiming progress",
+            "proof": proof,
+        }
+    return {
+        "state": "failed",
+        "usable_outcome": "runtime_contamination",
+        "close_disposition": "close",
+        "next_action": "Inspect runtime contamination before any retry or handoff",
+        "proof": proof,
+    }
 
 
 def infer_omx_lane_from_command(command: str) -> Optional[str]:
@@ -241,6 +291,8 @@ class WorkRecord:
     worktree_path: Optional[str] = None
     escalation_target: Optional[str] = None
     proof: Optional[str] = None
+    usable_outcome: Optional[str] = None
+    close_disposition: Optional[str] = None
     current_lane: Optional[str] = None
     planning_gate: Optional[str] = None
     next_execution_branch: Optional[str] = None
@@ -272,6 +324,8 @@ class WorkRecord:
             worktree_path=data.get("worktree_path"),
             escalation_target=data.get("escalation_target"),
             proof=data.get("proof"),
+            usable_outcome=data.get("usable_outcome"),
+            close_disposition=data.get("close_disposition"),
             current_lane=data.get("current_lane"),
             planning_gate=data.get("planning_gate"),
             next_execution_branch=data.get("next_execution_branch"),
@@ -356,6 +410,10 @@ class WorkStateStore:
                 if record.work_id == work_id and record.owner_session_id == owner_session_id:
                     for key, value in updates.items():
                         if hasattr(record, key):
+                            if key == "usable_outcome" and value is not None:
+                                value = _normalize_usable_outcome(value)
+                            elif key == "close_disposition" and value is not None:
+                                value = _normalize_close_disposition(value)
                             setattr(record, key, value)
                     _apply_omx_lane_truth(record)
                     self._save_locked()
@@ -489,6 +547,47 @@ class WorkStateStore:
             "matches": [matches[0].to_dict()],
             "record": matches[0],
         }
+
+    def fail_close_delegated_process_exit(
+        self,
+        *,
+        executor_session_id: Optional[str] = None,
+        tmux_session: Optional[str] = None,
+        exit_code: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Fail-close exactly one live delegated OMX record for process exit.
+
+        Late launcher/process observations must not overwrite an explicit
+        closed usable outcome supplied by richer delegated ingress.
+        """
+        resolution = self.resolve_delegated_signal_candidate(
+            executor_session_id=executor_session_id,
+            tmux_session=tmux_session,
+            live_only=True,
+        )
+        if resolution.get("status") != "single_match":
+            return {"updated": False, "resolution": resolution}
+
+        record = resolution["record"]
+        if record.usable_outcome and record.close_disposition == "close":
+            return {
+                "updated": False,
+                "reason": "explicit_closed_usable_outcome_present",
+                "resolution": resolution,
+            }
+
+        closeout = derive_delegated_process_exit_closeout(exit_code)
+        updated = self.update_record(
+            record.work_id,
+            record.owner_session_id,
+            state=closeout["state"],
+            usable_outcome=closeout["usable_outcome"],
+            close_disposition=closeout["close_disposition"],
+            next_action=closeout["next_action"],
+            proof=closeout["proof"],
+            last_progress_at=_utcnow(),
+        )
+        return {"updated": updated, "resolution": resolution, "closeout": closeout}
 
     def mark_owner_sessions_blocked(
         self,

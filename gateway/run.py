@@ -10821,6 +10821,28 @@ class GatewayRunner:
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
 
+    def _update_delegated_work_for_process(self, session_id: str, exit_code: Optional[int]) -> None:
+        """Fail-close delegated OMX work from the gateway watcher path."""
+        try:
+            from gateway.work_state import WorkStateStore
+
+            result = WorkStateStore().fail_close_delegated_process_exit(
+                executor_session_id=session_id,
+                exit_code=exit_code,
+            )
+            if result.get("updated"):
+                logger.info(
+                    "Delegated OMX work fail-closed from gateway watcher: session=%s exit=%s",
+                    session_id,
+                    exit_code,
+                )
+        except Exception as exc:
+            logger.debug(
+                "Delegated work-state gateway closeout skipped for %s: %s",
+                session_id,
+                exc,
+            )
+
     async def _run_process_watcher(self, watcher: dict) -> None:
         """
         Periodically check a background process and push updates to the user.
@@ -10874,6 +10896,7 @@ class GatewayRunner:
             last_output_len = current_output_len
 
             if session.exited:
+                self._update_delegated_work_for_process(session_id, session.exit_code)
                 # --- Agent-triggered completion: inject synthetic message ---
                 # Skip if the agent already consumed the result via wait/poll/log
                 from tools.process_registry import process_registry as _pr_check
