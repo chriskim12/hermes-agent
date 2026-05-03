@@ -10821,6 +10821,91 @@ class GatewayRunner:
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
 
+    def _work_state_store(self):
+        """Return the gateway work-state store, allowing tests to inject one."""
+        store = getattr(self, "_injected_work_state_store", None)
+        if store is not None:
+            return store
+        from gateway.work_state import WorkStateStore
+
+        return WorkStateStore()
+
+    def _find_session_entry_by_session_id(self, session_id: Optional[str]):
+        if not session_id or not getattr(self, "session_store", None):
+            return None
+        try:
+            for entry in self.session_store.list_sessions():
+                if getattr(entry, "session_id", None) == session_id:
+                    return entry
+        except Exception as exc:
+            logger.debug("Owner-ingress session lookup failed for %s: %s", session_id, exc)
+        return None
+
+    @staticmethod
+    def _owner_ingress_note(packet: Dict[str, Any], record: Dict[str, Any]) -> str:
+        work_id = packet.get("work_id") or record.get("work_id") or "unknown"
+        state = packet.get("state") or record.get("state") or "unknown"
+        normalized_event = packet.get("normalized_event") or "owner_ingress"
+        next_action = packet.get("next_action") or record.get("next_action") or "Review the owner-ingress signal."
+        proof = packet.get("proof") or record.get("proof") or "owner_ingress"
+        title = record.get("title") or record.get("objective") or work_id
+        return (
+            f"[SYSTEM: Owner ingress signal for {work_id}]\n"
+            f"State: {state} ({normalized_event})\n"
+            f"Work: {title}\n"
+            f"Next action: {next_action}\n"
+            f"Proof: {proof}"
+        )
+
+    async def handle_owner_ingress_packet(self, packet: Dict[str, Any]) -> Dict[str, Any]:
+        """Relay a native owner-ingress signal into the resolved owner thread only.
+
+        clawhip's repo-channel delivery is intentionally separate from this
+        Hermes-owned thread relay.  We accept exactly one live work-state match,
+        resolve the stored owner session origin, and send a bounded system note
+        to that origin.  Missing/ambiguous metadata never falls back to a generic
+        webhook channel or the currently active conversation.
+        """
+        verdict = self._work_state_store().resolve_native_owner_ingress_packet(packet)
+        status = verdict.get("status")
+        if status != "single_match":
+            verdict["relayed"] = False
+            verdict["relay_reason"] = verdict.get("reason") or status or "unresolved"
+            return verdict
+
+        owner_wake = verdict.get("owner_wake") or {}
+        owner_session_id = owner_wake.get("owner_session_id")
+        entry = self._find_session_entry_by_session_id(owner_session_id)
+        source = getattr(entry, "origin", None) if entry else None
+        if entry is None or source is None:
+            verdict["relayed"] = False
+            verdict["relay_reason"] = "owner_session_not_found"
+            return verdict
+
+        adapter = getattr(self, "adapters", {}).get(source.platform)
+        if adapter is None:
+            verdict["relayed"] = False
+            verdict["relay_reason"] = "owner_platform_adapter_missing"
+            return verdict
+
+        matches = verdict.get("matches") or []
+        record = matches[0] if matches else {}
+        note = self._owner_ingress_note(verdict.get("packet") or packet, record)
+        metadata = source.to_dict()
+        raw_result = await adapter.send(source.chat_id, note, metadata=metadata)
+        success = bool(getattr(raw_result, "success", raw_result is not False))
+        verdict["relayed"] = success
+        verdict["relay_reason"] = "owner_thread_relayed" if success else "owner_thread_send_failed"
+        verdict["relay_target"] = {
+            "platform": getattr(source.platform, "value", str(source.platform)),
+            "chat_id": source.chat_id,
+            "thread_id": source.thread_id,
+            "session_id": owner_session_id,
+        }
+        if not success:
+            verdict["relay_error"] = getattr(raw_result, "error", None)
+        return verdict
+
     def _update_delegated_work_for_process(self, session_id: str, exit_code: Optional[int]) -> None:
         """Fail-close delegated OMX work from the gateway watcher path."""
         try:
