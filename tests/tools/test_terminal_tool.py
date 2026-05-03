@@ -1,5 +1,6 @@
 """Regression tests for sudo detection and sudo password handling."""
 
+import inspect
 import json
 
 import tools.terminal_tool as terminal_tool
@@ -107,7 +108,26 @@ def test_validate_workdir_blocks_shell_metacharacters_in_windows_paths():
     assert terminal_tool._validate_workdir("C:\\Users\\Alice\\project\nwhoami")
 
 
-def test_omx_ralph_forced_tmux_is_detected_after_default_flags():
+def test_default_omx_rewrite_source_guard_excludes_persistent_lanes():
+    source = inspect.getsource(terminal_tool._apply_default_omx_launch_flags)
+
+    assert "exec|plan|ralplan)" in source
+    assert "exec|plan|ralplan|ralph|team" not in source
+
+
+def test_default_omx_flags_apply_only_to_bounded_lanes():
+    assert terminal_tool._apply_default_omx_launch_flags('omx exec "ship it"') == 'omx --madmax --high exec "ship it"'
+    assert terminal_tool._apply_default_omx_launch_flags('omx plan "scope it"') == 'omx --madmax --high plan "scope it"'
+    assert terminal_tool._apply_default_omx_launch_flags('omx ralplan "scope it"') == 'omx --madmax --high ralplan "scope it"'
+
+
+def test_default_omx_flags_preserve_persistent_lane_surfaces():
+    assert terminal_tool._apply_default_omx_launch_flags('omx ralph --tmux "ship it"') == 'omx ralph --tmux "ship it"'
+    assert terminal_tool._apply_default_omx_launch_flags('omx ralph "ship it"') == 'omx ralph "ship it"'
+    assert terminal_tool._apply_default_omx_launch_flags('omx team 3:executor "ship it"') == 'omx team 3:executor "ship it"'
+
+
+def test_omx_ralph_forced_tmux_is_detected_without_default_flag_rewrite():
     command = terminal_tool._apply_default_omx_launch_flags('omx ralph --tmux "ship it"')
 
     assert command == 'omx ralph --tmux "ship it"'
@@ -171,3 +191,4 @@ def test_terminal_tool_allows_forced_tmux_ralph_when_pty_requested(monkeypatch):
 
     assert result["exit_code"] == 0
     assert "omx ralph --tmux" in result["output"]
+    assert "omx --madmax --high ralph" not in result["output"]
