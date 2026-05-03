@@ -45,7 +45,6 @@ import threading
 import atexit
 import shutil
 import subprocess
-from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -224,22 +223,44 @@ _sudo_password_cache_lock = threading.Lock()
 # Optional UI callbacks for interactive prompts. When set, these are called
 # instead of the default /dev/tty or input() readers. The CLI registers these
 # so prompts route through prompt_toolkit's event loop.
-#   _sudo_password_callback() -> str  (return password or "" to skip)
-#   _approval_callback(command, description) -> str  ("once"/"session"/"always"/"deny")
-_sudo_password_callback = None
-_approval_callback = None
+# Callback slots used by the approval prompt and sudo password prompt
+# routines. Stored in thread-local state so overlapping ACP sessions —
+# each running in its own ThreadPoolExecutor thread — don't stomp on
+# each other's callbacks. See GHSA-qg5c-hvr5-hjgr.
+#
+# CLI mode is single-threaded, so each thread (the only one) holds its
+# own callback exactly like before. Gateway mode resolves approvals via
+# the per-session queue in tools.approval, not through these callbacks,
+# so it's unaffected.
+import threading
+_callback_tls = threading.local()
+
+
+def _get_sudo_password_callback():
+    return getattr(_callback_tls, "sudo_password", None)
+
+
+def _get_approval_callback():
+    return getattr(_callback_tls, "approval", None)
 
 
 def set_sudo_password_callback(cb):
-    """Register a callback for sudo password prompts (used by CLI)."""
-    global _sudo_password_callback
-    _sudo_password_callback = cb
+    """Register a callback for sudo password prompts (used by CLI).
+
+    Per-thread scope — ACP sessions that run concurrently in a
+    ThreadPoolExecutor each have their own callback slot.
+    """
+    _callback_tls.sudo_password = cb
 
 
 def set_approval_callback(cb):
-    """Register a callback for dangerous command approval prompts (used by CLI)."""
-    global _approval_callback
-    _approval_callback = cb
+    """Register a callback for dangerous command approval prompts.
+
+    Per-thread scope — ACP sessions that run concurrently in a
+    ThreadPoolExecutor each have their own callback slot. See
+    GHSA-qg5c-hvr5-hjgr.
+    """
+    _callback_tls.approval = cb
 
 
 def _get_sudo_password_cache_scope() -> str:
@@ -312,14 +333,14 @@ from tools.worktree_policy import (
 def _check_all_guards(command: str, env_type: str) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
-                                  approval_callback=_approval_callback)
+                                  approval_callback=_get_approval_callback())
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
-# Covers alphanumeric, POSIX/Windows path separators, Windows drive colons,
-# tilde, dot, hyphen, underscore, space, plus, at, equals, and comma.
-# Everything else is rejected.
-_WORKDIR_SAFE_RE = re.compile(r'^[A-Za-z0-9/\\:.~ +@=,_-]+$')
+# Covers alphanumeric, path separators, Windows drive/UNC separators, tilde,
+# dot, hyphen, underscore, space, plus, at, equals, and comma.  Everything
+# else is rejected.
+_WORKDIR_SAFE_RE = re.compile(r'^[A-Za-z0-9/\\:_\-.~ +@=,]+$')
 
 
 def _validate_workdir(workdir: str) -> str | None:
@@ -385,12 +406,12 @@ def _prompt_for_sudo_password(timeout_seconds: int = 45) -> str:
     directly from /dev/tty with echo disabled.
     """
     import sys
-    import time as time_module
     
     # Use the registered callback when available (prompt_toolkit-compatible)
-    if _sudo_password_callback is not None:
+    _sudo_cb = _get_sudo_password_callback()
+    if _sudo_cb is not None:
         try:
-            return _sudo_password_callback() or ""
+            return _sudo_cb() or ""
         except Exception:
             return ""
 
@@ -446,7 +467,7 @@ def _prompt_for_sudo_password(timeout_seconds: int = 45) -> str:
     
     try:
         os.environ["HERMES_SPINNER_PAUSE"] = "1"
-        time_module.sleep(0.2)
+        time.sleep(0.2)
         
         print()
         print("┌" + "─" * 58 + "┐")
@@ -504,111 +525,6 @@ def _safe_command_preview(command: Any, limit: int = 200) -> str:
         return repr(command)[:limit]
     except Exception:
         return f"<{type(command).__name__}>"
-
-def _rewrite_compound_background(command: str) -> str:
-    """Rewrite top-level ``A && B &`` / ``A || B &`` into ``A && { B & }``.
-
-    Bash backgrounds the whole compound list for ``A && B &``.  If ``B`` is a
-    long-lived server, that creates a subshell which waits forever.  Wrapping
-    only the tail command keeps the background job simple and avoids the
-    subshell-wait leak.  This is intentionally conservative: it ignores quoted
-    text, comments, parens/command substitutions, pipes, and semicolon-delimited
-    statements.
-    """
-    if not command:
-        return command
-
-    def rewrite_line(line: str) -> str:
-        n = len(line)
-        i = 0
-        quote: str | None = None
-        escape = False
-        paren_depth = 0
-        last_chain: int | None = None
-        last_separator = 0
-        trailing_amp: int | None = None
-
-        while i < n:
-            ch = line[i]
-
-            if escape:
-                escape = False
-                i += 1
-                continue
-            if ch == "\\":
-                escape = True
-                i += 1
-                continue
-            if quote:
-                if ch == quote:
-                    quote = None
-                i += 1
-                continue
-            if ch in ("'", '"'):
-                quote = ch
-                i += 1
-                continue
-            if ch == "#" and line[:i].strip() == "":
-                break
-            if ch == "(":
-                paren_depth += 1
-                i += 1
-                continue
-            if ch == ")" and paren_depth > 0:
-                paren_depth -= 1
-                i += 1
-                continue
-            if paren_depth:
-                i += 1
-                continue
-
-            if line.startswith("&&", i) or line.startswith("||", i):
-                last_chain = i
-                i += 2
-                continue
-            if ch in ";|":
-                last_separator = i + 1
-                last_chain = None
-                i += 1
-                continue
-            if ch == "&":
-                prev_ch = line[i - 1] if i > 0 else ""
-                next_ch = line[i + 1] if i + 1 < n else ""
-                # Keep redirects such as &>, 2>&1, >&2 out of the background check.
-                if next_ch == ">" or prev_ch == ">":
-                    i += 1
-                    continue
-                if line[i + 1:].strip() == "":
-                    trailing_amp = i
-                i += 1
-                continue
-            i += 1
-
-        if trailing_amp is None or last_chain is None or last_chain < last_separator:
-            return line
-
-        tail_start = last_chain + 2
-        leading = line[tail_start:trailing_amp]
-        if leading.strip() == "":
-            return line
-        tail = leading.lstrip(" \t")
-        prefix = line[:tail_start] + leading[: len(leading) - len(tail)]
-        suffix = line[trailing_amp + 1:]
-        return f"{prefix}{{ {tail}& }}{suffix}"
-
-    parts = command.splitlines(keepends=True)
-    if not parts:
-        return command
-    out: list[str] = []
-    for part in parts:
-        newline = ""
-        body = part
-        if part.endswith("\r\n"):
-            body, newline = part[:-2], "\r\n"
-        elif part.endswith("\n"):
-            body, newline = part[:-1], "\n"
-        out.append(rewrite_line(body) + newline)
-    return "".join(out)
 
 def _looks_like_env_assignment(token: str) -> bool:
     """Return True when *token* is a leading shell environment assignment."""
@@ -999,6 +915,8 @@ Foreground (default): Commands return INSTANTLY when done, even if the timeout i
 Background: Set background=true to get a session_id. Two patterns:
   (1) Long-lived processes that never exit (servers, watchers).
   (2) Long-running tasks with notify_on_complete=true — you can keep working on other things and the system auto-notifies you when the task finishes. Great for test suites, builds, deployments, or anything that takes more than a minute.
+For servers/watchers, do NOT use shell-level background wrappers (nohup/disown/setsid/trailing '&') in foreground mode. Use background=true so Hermes can track lifecycle and output.
+After starting a server, verify readiness with a health check or log signal, then run tests in a separate terminal() call. Avoid blind sleep loops.
 Use process(action="poll") for progress checks, process(action="wait") to block until done.
 Working directory: Use 'workdir' for per-command cwd.
 PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
@@ -1272,8 +1190,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             if modal_state["managed_mode_blocked"]:
                 raise ValueError(
                     "Modal backend is configured for managed mode, but "
-                    "HERMES_ENABLE_NOUS_MANAGED_TOOLS is not enabled and no direct "
-                    "Modal credentials/config were found. Enable the feature flag or "
+                    "a paid Nous subscription is required for the Tool Gateway and no direct "
+                    "Modal credentials/config were found. Log in with `hermes model` or "
                     "choose TERMINAL_MODAL_MODE=direct/auto."
                 )
             if modal_state["mode"] == "managed":
@@ -1632,16 +1550,62 @@ def _command_requires_pipe_stdin(command: str) -> bool:
     )
 
 
-def _extract_tmux_session_name(command: str) -> Optional[str]:
-    try:
-        tokens = shlex.split(command)
-    except Exception:
+_SHELL_LEVEL_BACKGROUND_RE = re.compile(r"\b(?:nohup|disown|setsid)\b", re.IGNORECASE)
+_INLINE_BACKGROUND_AMP_RE = re.compile(r"\s&\s")
+_TRAILING_BACKGROUND_AMP_RE = re.compile(r"\s&\s*(?:#.*)?$")
+_LONG_LIVED_FOREGROUND_PATTERNS = (
+    re.compile(r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|start|serve|watch)\b", re.IGNORECASE),
+    re.compile(r"\bdocker\s+compose\s+up\b", re.IGNORECASE),
+    re.compile(r"\bnext\s+dev\b", re.IGNORECASE),
+    re.compile(r"\bvite(?:\s|$)", re.IGNORECASE),
+    re.compile(r"\bnodemon\b", re.IGNORECASE),
+    re.compile(r"\buvicorn\b", re.IGNORECASE),
+    re.compile(r"\bgunicorn\b", re.IGNORECASE),
+    re.compile(r"\bpython(?:3)?\s+-m\s+http\.server\b", re.IGNORECASE),
+)
+
+
+def _looks_like_help_or_version_command(command: str) -> bool:
+    """Return True for informational invocations that should never be blocked."""
+    normalized = " ".join(command.lower().split())
+    return (
+        " --help" in normalized
+        or normalized.endswith(" -h")
+        or " --version" in normalized
+        or normalized.endswith(" -v")
+    )
+
+
+def _foreground_background_guidance(command: str) -> str | None:
+    """Suggest background mode when a foreground command looks long-lived.
+
+    Prevents workflows that start a server/watch process and then stall before
+    follow-up checks or test commands run.
+    """
+    if _looks_like_help_or_version_command(command):
         return None
-    for idx, token in enumerate(tokens[:-1]):
-        if token == "-s" and idx + 1 < len(tokens):
-            value = str(tokens[idx + 1]).strip()
-            if value:
-                return value
+
+    if _SHELL_LEVEL_BACKGROUND_RE.search(command):
+        return (
+            "Foreground command uses shell-level background wrappers (nohup/disown/setsid). "
+            "Use terminal(background=true) so Hermes can track the process, then run "
+            "readiness checks and tests in separate commands."
+        )
+
+    if _INLINE_BACKGROUND_AMP_RE.search(command) or _TRAILING_BACKGROUND_AMP_RE.search(command):
+        return (
+            "Foreground command uses '&' backgrounding. Use terminal(background=true) for long-lived "
+            "processes, then run health checks and tests in follow-up terminal calls."
+        )
+
+    for pattern in _LONG_LIVED_FOREGROUND_PATTERNS:
+        if pattern.search(command):
+            return (
+                "This foreground command appears to start a long-lived server/watch process. "
+                "Run it with background=true, verify readiness (health endpoint/log signal), "
+                "then execute tests in a separate command."
+            )
+
     return None
 
 
@@ -1851,6 +1815,18 @@ def terminal_tool(
                     f"notify_on_complete=true for long-running commands."
                 ),
             }, ensure_ascii=False)
+
+        # Guardrail: long-lived server/watch commands should run as managed
+        # background sessions, not foreground shell hacks.
+        if not background:
+            guidance = _foreground_background_guidance(command)
+            if guidance:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": guidance,
+                    "status": "error",
+                }, ensure_ascii=False)
 
         # Start cleanup thread
         _start_cleanup_thread()
@@ -2078,27 +2054,15 @@ def terminal_tool(
                     "exit_code": 0,
                     "error": None,
                 }
-                delegated_marked = _maybe_mark_gateway_work_delegated(
-                    command=command,
-                    session_key=session_key,
-                    executor_session_id=proc_session.id,
-                    workdir=effective_cwd,
-                )
-                if delegated_marked:
-                    result_data["delegated_work_state"] = "marked"
                 if approval_note:
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:
                     result_data["pty_note"] = pty_disabled_reason
 
-                # Mark for agent notification on completion
-                if notify_on_complete and background:
-                    proc_session.notify_on_complete = True
-                    result_data["notify_on_complete"] = True
-
-                    # In gateway mode, auto-register a fast watcher so the
-                    # gateway can detect completion and trigger a new agent
-                    # turn.  CLI mode uses the completion_queue directly.
+                # Populate routing metadata on the session so that
+                # watch-pattern and completion notifications can be
+                # routed back to the correct chat/thread.
+                if background and (notify_on_complete or watch_patterns):
                     from gateway.session_context import get_session_env as _gse
                     _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
                     if _gw_platform:
@@ -2142,11 +2106,11 @@ def terminal_tool(
                             "session_id": proc_session.id,
                             "check_interval": 5,
                             "session_key": session_key,
-                            "platform": _gw_platform,
-                            "chat_id": _gw_chat_id,
-                            "user_id": _gw_user_id,
-                            "user_name": _gw_user_name,
-                            "thread_id": _gw_thread_id,
+                            "platform": proc_session.watcher_platform,
+                            "chat_id": proc_session.watcher_chat_id,
+                            "user_id": proc_session.watcher_user_id,
+                            "user_name": proc_session.watcher_user_name,
+                            "thread_id": proc_session.watcher_thread_id,
                             "notify_on_complete": True,
                         })
 
@@ -2209,6 +2173,27 @@ def terminal_tool(
 
             # Add helpful message for sudo failures in messaging context
             output = _handle_sudo_failure(output, env_type)
+
+            # Foreground terminal output canonicalization seam: plugins receive
+            # the full output string before default truncation and may only
+            # replace it by returning a string from transform_terminal_output.
+            # The hook is fail-open, and the first valid string return wins.
+            try:
+                from hermes_cli.plugins import invoke_hook
+                hook_results = invoke_hook(
+                    "transform_terminal_output",
+                    command=command,
+                    output=output,
+                    returncode=returncode,
+                    task_id=effective_task_id or "",
+                    env_type=env_type,
+                )
+                for hook_result in hook_results:
+                    if isinstance(hook_result, str):
+                        output = hook_result
+                        break
+            except Exception:
+                pass
             
             # Truncate output if too long, keeping both head and tail
             from tools.tool_output_limits import get_max_bytes
@@ -2304,8 +2289,8 @@ def check_terminal_requirements() -> bool:
                 if modal_state["managed_mode_blocked"]:
                     logger.error(
                         "Modal backend selected with TERMINAL_MODAL_MODE=managed, but "
-                        "HERMES_ENABLE_NOUS_MANAGED_TOOLS is not enabled and no direct "
-                        "Modal credentials/config were found. Enable the feature flag "
+                        "a paid Nous subscription is required for the Tool Gateway and no direct "
+                        "Modal credentials/config were found. Log in with `hermes model` "
                         "or choose TERMINAL_MODAL_MODE=direct/auto."
                     )
                     return False
