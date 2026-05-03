@@ -1672,7 +1672,6 @@ def _looks_like_noninteractive_omx_ralph(command: str) -> bool:
     return _omx_command_has_lane(command, "ralph")
 
 
-def _maybe_mark_gateway_work_delegated(
 def _resolve_notification_flag_conflict(
     *,
     notify_on_complete: bool,
