@@ -998,6 +998,24 @@ class DiscordAdapter(BasePlatformAdapter):
         deleted = 0
         http = self._client.http
 
+        # Discord caps each application at 100 global commands.  If the app is
+        # already full and this reconcile needs to create a newly desired
+        # command, create-before-prune fails with error 30032 even when stale
+        # commands are waiting to be deleted.  Make room first, but only when a
+        # new desired command is actually missing; otherwise preserve the old
+        # update-before-prune ordering for pure cleanup/update syncs.
+        missing_desired_keys = [
+            key for key in desired_by_key if key not in existing_by_key
+        ]
+        if missing_desired_keys:
+            stale_existing_keys = [
+                key for key in existing_by_key if key not in desired_by_key
+            ]
+            for stale_key in stale_existing_keys:
+                current = existing_by_key.pop(stale_key)
+                await http.delete_global_command(app_id, current.id)
+                deleted += 1
+
         for key, desired in desired_by_key.items():
             current = existing_by_key.pop(key, None)
             if current is None:

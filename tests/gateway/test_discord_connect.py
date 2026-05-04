@@ -448,6 +448,99 @@ async def test_safe_sync_slash_commands_only_mutates_diffs():
 
 
 @pytest.mark.asyncio
+async def test_safe_sync_slash_commands_prunes_orphans_before_creating_new_commands():
+    """Regression: when Discord is at the 100 global-command cap, creating a
+    newly desired command before deleting stale commands fails with 30032.
+    """
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+    class _DesiredCommand:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def to_dict(self, tree):
+            assert tree is not None
+            return dict(self._payload)
+
+    class _ExistingCommand:
+        def __init__(self, command_id, payload):
+            self.id = command_id
+            self.name = payload["name"]
+            self.type = SimpleNamespace(value=payload["type"])
+            self._payload = payload
+
+        def to_dict(self):
+            return {
+                "id": self.id,
+                "application_id": 999,
+                **self._payload,
+                "name_localizations": {},
+                "description_localizations": {},
+            }
+
+    desired_created = {
+        "name": "autopilot",
+        "description": "Control Hermes auto-pilot intent",
+        "type": 1,
+        "options": [],
+        "nsfw": False,
+        "dm_permission": True,
+        "default_member_permissions": None,
+    }
+    existing_orphan = _ExistingCommand(
+        42,
+        {
+            "name": "stale-skill-command",
+            "description": "Old top-level skill command",
+            "type": 1,
+            "options": [],
+            "nsfw": False,
+            "dm_permission": True,
+            "default_member_permissions": None,
+        },
+    )
+    calls = []
+
+    async def _delete(app_id, command_id):
+        calls.append(("delete", app_id, command_id))
+
+    async def _upsert(app_id, payload):
+        calls.append(("upsert", app_id, payload["name"]))
+
+    fake_tree = SimpleNamespace(
+        get_commands=lambda: [_DesiredCommand(desired_created)],
+        fetch_commands=AsyncMock(return_value=[existing_orphan]),
+    )
+    fake_http = SimpleNamespace(
+        upsert_global_command=AsyncMock(side_effect=_upsert),
+        edit_global_command=AsyncMock(),
+        delete_global_command=AsyncMock(side_effect=_delete),
+    )
+    adapter._client = SimpleNamespace(
+        tree=fake_tree,
+        http=fake_http,
+        application_id=999,
+        user=SimpleNamespace(id=999),
+    )
+
+    summary = await adapter._safe_sync_slash_commands()
+
+    assert summary == {
+        "total": 1,
+        "unchanged": 0,
+        "updated": 0,
+        "recreated": 0,
+        "created": 1,
+        "deleted": 1,
+    }
+    assert calls == [
+        ("delete", 999, 42),
+        ("upsert", 999, "autopilot"),
+    ]
+    fake_http.edit_global_command.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_safe_sync_slash_commands_recreates_metadata_only_diffs():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
 
