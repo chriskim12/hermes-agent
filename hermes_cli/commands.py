@@ -100,6 +100,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="<prompt>"),
     CommandDef("goal", "Set a standing goal Hermes works on across turns until achieved", "Session",
                args_hint="[text | pause | resume | clear | status]"),
+    CommandDef("autopilot", "Control Hermes auto-pilot intent without bypassing Linear admission", "Session",
+               args_hint="[status|dry-run|ON|OFF|CH-123]",
+               subcommands=("status", "dry-run", "on", "off")),
     CommandDef("status", "Show session info", "Session"),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
@@ -315,6 +318,7 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
     {
         "agents",
         "approve",
+        "autopilot",
         "background",
         "commands",
         "deny",

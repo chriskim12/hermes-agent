@@ -4854,6 +4854,12 @@ class GatewayRunner:
             if _cmd_def_inner and _cmd_def_inner.name == "agents":
                 return await self._handle_agents_command(event)
 
+            # /autopilot is controller-plane only here: status/dry-run are
+            # read-only, ON/OFF only record intent, and one-shot targets only
+            # classify admission. It must never interrupt a running turn.
+            if _cmd_def_inner and _cmd_def_inner.name == "autopilot":
+                return await self._handle_autopilot_command(event)
+
             # /background must bypass the running-agent guard — it starts a
             # parallel task and must never interrupt the active conversation.
             # /btw is an alias of /background and resolves to the same canonical
@@ -5099,6 +5105,9 @@ class GatewayRunner:
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
+
+        if canonical == "autopilot":
+            return await self._handle_autopilot_command(event)
 
         if canonical == "restart":
             return await self._handle_restart_command(event)
@@ -6875,6 +6884,22 @@ class GatewayRunner:
         if len(output) > 3800:
             output = output[:3800] + "\n… (truncated; use `hermes kanban …` in your terminal for full output)"
         return output or "(no output)"
+
+    async def _handle_autopilot_command(self, event: MessageEvent) -> str:
+        """Handle /autopilot command using the fail-closed controller entrypoint."""
+        from gateway.autopilot import handle_autopilot_command
+
+        raw_args = event.get_command_args()
+        source = getattr(event, "source", None)
+        actor = None
+        if source is not None:
+            actor = (
+                getattr(source, "user_name", None)
+                or getattr(source, "user_id", None)
+                or getattr(source, "description", None)
+            )
+        result = handle_autopilot_command(raw_args, actor=actor)
+        return result.message
 
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""
