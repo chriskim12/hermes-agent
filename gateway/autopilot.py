@@ -46,6 +46,15 @@ class LinearIssueClient(Protocol):
     def fetch_issue(self, identifier: str) -> Mapping[str, Any]:
         """Return a Linear issue payload for *identifier* without mutating Linear."""
 
+    def list_execution_ready_issues(
+        self,
+        *,
+        team_key: str = "CH",
+        state_name: str = "Execution Ready",
+        limit: int = 100,
+    ) -> Mapping[str, Any]:
+        """Return live Linear queue candidates without mutating Linear."""
+
 
 @dataclass(frozen=True)
 class AutopilotCommand:
@@ -241,31 +250,58 @@ class AutopilotStateStore:
 class EnvLinearIssueClient:
     """Read-only Linear GraphQL client using LINEAR_API_KEY from the environment."""
 
-    _QUERY = """
-    query AutopilotIssue($id: String!) {
-      issue(id: $id) {
+    _ISSUE_FIELDS = """
         identifier
         title
+        description
+        priority
+        url
         state { name type }
         parent { identifier title state { name type } }
-        children(first: 50) { nodes { identifier title state { name type } } }
-      }
-    }
+        project { name }
+        labels { nodes { name } }
+    """
+    _QUERY = f"""
+    query AutopilotIssue($id: String!) {{
+      issue(id: $id) {{
+        {_ISSUE_FIELDS}
+        children(first: 50) {{ nodes {{ {_ISSUE_FIELDS} }} }}
+      }}
+    }}
+    """
+    _QUEUE_QUERY = f"""
+    query AutopilotExecutionReadyQueue($teamKey: String!, $stateName: String!, $first: Int!) {{
+      teams(filter: {{ key: {{ eq: $teamKey }} }}, first: 1) {{
+        nodes {{
+          key
+          name
+          issues(first: $first, filter: {{ state: {{ name: {{ eq: $stateName }} }} }}) {{
+            nodes {{ {_ISSUE_FIELDS} children(first: 50) {{ nodes {{ {_ISSUE_FIELDS} }} }} }}
+          }}
+        }}
+      }}
+    }}
     """
 
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key if api_key is not None else os.getenv("LINEAR_API_KEY")
 
-    def fetch_issue(self, identifier: str) -> Mapping[str, Any]:
+    def _post_graphql(
+        self,
+        query: str,
+        variables: Mapping[str, Any],
+        *,
+        identifier: Optional[str] = None,
+    ) -> Mapping[str, Any]:
         if not self.api_key:
-            return {
+            payload: dict[str, Any] = {
                 "status": "unavailable",
                 "reason": "LINEAR_API_KEY_missing",
-                "identifier": identifier,
             }
-        body = json.dumps(
-            {"query": self._QUERY, "variables": {"id": identifier}}
-        ).encode("utf-8")
+            if identifier:
+                payload["identifier"] = identifier
+            return payload
+        body = json.dumps({"query": query, "variables": dict(variables)}).encode("utf-8")
         request = urllib.request.Request(
             "https://api.linear.app/graphql",
             data=body,
@@ -276,19 +312,28 @@ class EnvLinearIssueClient:
         )
         try:
             with urllib.request.urlopen(request, timeout=20) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+                return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            return {
+            payload = {
                 "status": "unavailable",
                 "reason": f"linear_http_{exc.code}",
-                "identifier": identifier,
             }
+            if identifier:
+                payload["identifier"] = identifier
+            return payload
         except Exception as exc:
-            return {
+            payload = {
                 "status": "unavailable",
                 "reason": f"linear_query_{type(exc).__name__}",
-                "identifier": identifier,
             }
+            if identifier:
+                payload["identifier"] = identifier
+            return payload
+
+    def fetch_issue(self, identifier: str) -> Mapping[str, Any]:
+        payload = self._post_graphql(self._QUERY, {"id": identifier}, identifier=identifier)
+        if payload.get("status") == "unavailable":
+            return payload
 
         errors = payload.get("errors") if isinstance(payload, dict) else None
         if errors:
@@ -307,6 +352,44 @@ class EnvLinearIssueClient:
             }
         issue["status"] = "ok"
         return issue
+
+    def list_execution_ready_issues(
+        self,
+        *,
+        team_key: str = "CH",
+        state_name: str = "Execution Ready",
+        limit: int = 100,
+    ) -> Mapping[str, Any]:
+        payload = self._post_graphql(
+            self._QUEUE_QUERY,
+            {"teamKey": team_key, "stateName": state_name, "first": int(limit)},
+        )
+        if payload.get("status") == "unavailable":
+            return payload
+        errors = payload.get("errors") if isinstance(payload, dict) else None
+        if errors:
+            return {
+                "status": "unavailable",
+                "reason": "linear_graphql_error",
+                "errors": errors,
+            }
+        teams = (((payload.get("data") or {}).get("teams") or {}).get("nodes") if isinstance(payload, dict) else None)
+        if not teams:
+            return {
+                "status": "missing",
+                "reason": "linear_team_not_found",
+                "team_key": team_key,
+                "issues": [],
+            }
+        team = teams[0]
+        issues = (((team.get("issues") or {}).get("nodes")) if isinstance(team, Mapping) else None)
+        return {
+            "status": "ok",
+            "team_key": team.get("key") or team_key,
+            "team_name": team.get("name"),
+            "state_name": state_name,
+            "issues": issues if isinstance(issues, list) else [],
+        }
 
 
 def classify_linear_target(issue: Mapping[str, Any], requested_id: str) -> dict[str, Any]:
@@ -433,12 +516,351 @@ def classify_work_state_target(target_id: str, work_state_store: Any = None) -> 
         }
 
 
+def _empty_dry_run(status: str, reason: str, **extra: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "status": status,
+        "reason": reason,
+        "selected_issue": None,
+        "would_create_work_state": None,
+        "would_goal_contract": None,
+        "candidates": [],
+        "groups": {"parents": {}, "projects": {}},
+    }
+    payload.update(extra)
+    return payload
+
+
+def _issue_identifier_sort_key(issue: Mapping[str, Any]) -> tuple[str, int, str]:
+    identifier = str(issue.get("identifier") or "")
+    match = re.fullmatch(r"([A-Z][A-Z0-9]*)-(\d+)", identifier.upper())
+    if not match:
+        return (identifier.upper(), 10**12, identifier.upper())
+    return (match.group(1), int(match.group(2)), identifier.upper())
+
+
+def _state_parts(issue: Mapping[str, Any]) -> tuple[str, str]:
+    state = issue.get("state") if isinstance(issue.get("state"), Mapping) else {}
+    return (str(state.get("name") or "").strip(), str(state.get("type") or "").strip())
+
+
+def _is_terminal_state(state_name: str, state_type: str) -> bool:
+    name = str(state_name or "").strip().lower()
+    typ = str(state_type or "").strip().lower()
+    return typ in {"completed", "canceled", "cancelled"} or name in {
+        "done",
+        "canceled",
+        "cancelled",
+        "duplicate",
+        "won't do",
+        "wont do",
+    }
+
+
+def _parent_payload(issue: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+    parent = issue.get("parent")
+    return parent if isinstance(parent, Mapping) else None
+
+
+def _parent_identifier(issue: Mapping[str, Any], parent_override: Optional[str] = None) -> Optional[str]:
+    if parent_override:
+        return parent_override
+    parent = _parent_payload(issue)
+    if not parent:
+        return None
+    identifier = parent.get("identifier")
+    return str(identifier) if identifier else None
+
+
+def _project_name(issue: Mapping[str, Any]) -> Optional[str]:
+    project = issue.get("project")
+    if isinstance(project, Mapping) and project.get("name"):
+        return str(project.get("name"))
+    return None
+
+
+def _description_text(issue: Mapping[str, Any]) -> str:
+    return str(issue.get("description") or "")
+
+
+def _has_done_when(issue: Mapping[str, Any]) -> bool:
+    text = _description_text(issue).lower()
+    return "done when" in text or "done_when" in text
+
+
+def _has_verification(issue: Mapping[str, Any]) -> bool:
+    text = _description_text(issue).lower()
+    return "verification" in text or "verify" in text
+
+
+def _work_state_backing_file_error(store: Any) -> Optional[str]:
+    path_value = getattr(store, "path", None)
+    if not path_value:
+        return None
+    try:
+        path = Path(path_value)
+    except TypeError:
+        return "work_state_unavailable:invalid_path"
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return f"work_state_unavailable:{type(exc).__name__}"
+    if isinstance(payload, list):
+        if not all(isinstance(item, dict) for item in payload):
+            return "work_state_unavailable:invalid_record_item_type"
+        return None
+    if not isinstance(payload, dict):
+        return "work_state_unavailable:invalid_payload_type"
+    if set(payload.keys()) != {"records"}:
+        return "work_state_unavailable:invalid_payload_schema"
+    records = payload.get("records")
+    if not isinstance(records, list):
+        return "work_state_unavailable:invalid_records_type"
+    if not all(isinstance(item, dict) for item in records):
+        return "work_state_unavailable:invalid_record_item_type"
+    return None
+
+
+def _work_state_lock_snapshot(work_state_store: Any = None) -> dict[str, Any]:
+    try:
+        from gateway.work_state import LIVE_STATES
+
+        store = work_state_store
+        if store is None:
+            from gateway.work_state import WorkStateStore
+
+            store = WorkStateStore()
+        backing_error = _work_state_backing_file_error(store)
+        if backing_error:
+            return {"available": False, "reason": backing_error, "active_work_ids": set()}
+        work_ids: set[str] = set()
+        for record in store.list_records():
+            if getattr(record, "owner", None) != "hermes":
+                continue
+            state = str(getattr(record, "state", "") or "")
+            if state not in LIVE_STATES:
+                continue
+            work_id = str(getattr(record, "work_id", "") or "").strip()
+            if work_id:
+                work_ids.add(work_id)
+        return {"available": True, "active_work_ids": work_ids}
+    except Exception as exc:
+        return {
+            "available": False,
+            "reason": f"work_state_unavailable:{type(exc).__name__}",
+            "active_work_ids": set(),
+        }
+
+
+def _candidate_from_issue(
+    issue: Mapping[str, Any],
+    *,
+    active_work_ids: set[str],
+    parent_override: Optional[str] = None,
+) -> dict[str, Any]:
+    identifier = str(issue.get("identifier") or "").strip()
+    classified = classify_linear_target(issue, identifier)
+    shape = str(classified.get("shape") or "unknown")
+    if parent_override and shape == "standalone":
+        shape = "child"
+    parent_id = _parent_identifier(issue, parent_override)
+    candidate = {
+        "identifier": identifier,
+        "eligible": False,
+        "reason": "unknown",
+        "shape": shape,
+        "parent_id": parent_id,
+        "project": _project_name(issue),
+    }
+    if classified.get("status") != "ok":
+        candidate["reason"] = str(classified.get("reason") or "linear_target_unavailable_fail_closed")
+        return candidate
+
+    state_name, state_type = _state_parts(issue)
+    parent = _parent_payload(issue)
+    parent_state = parent.get("state") if isinstance(parent, Mapping) else None
+    parent_state_name = str((parent_state or {}).get("name") or "") if isinstance(parent_state, Mapping) else ""
+    parent_state_type = str((parent_state or {}).get("type") or "") if isinstance(parent_state, Mapping) else ""
+
+    if _is_terminal_state(state_name, state_type):
+        candidate["reason"] = "terminal_state"
+    elif state_name.lower() != "execution ready":
+        candidate["reason"] = "state_not_execution_ready"
+    elif parent and _is_terminal_state(parent_state_name, parent_state_type):
+        candidate["reason"] = "parent_terminal"
+    elif shape == "parent":
+        candidate["reason"] = "parent_target_requires_child_selection"
+    elif identifier in active_work_ids:
+        candidate["reason"] = "active_work_state_lock"
+    elif not _has_done_when(issue):
+        candidate["reason"] = "missing_done_when"
+    elif not _has_verification(issue):
+        candidate["reason"] = "missing_verification"
+    else:
+        candidate["eligible"] = True
+        candidate["reason"] = "eligible_execution_ready"
+    return candidate
+
+
+def _group_candidates(candidates: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    parents: dict[str, int] = {}
+    projects: dict[str, int] = {}
+    for candidate in candidates:
+        parent_key = str(candidate.get("parent_id") or "standalone")
+        project_key = str(candidate.get("project") or "none")
+        parents[parent_key] = parents.get(parent_key, 0) + 1
+        projects[project_key] = projects.get(project_key, 0) + 1
+    return {"parents": parents, "projects": projects}
+
+
+def _selected_issue_payload(issue: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "identifier": issue.get("identifier"),
+        "title": issue.get("title") or "",
+        "url": issue.get("url"),
+    }
+
+
+def _would_goal_contract(issue: Mapping[str, Any]) -> dict[str, Any]:
+    identifier = str(issue.get("identifier") or "")
+    title = str(issue.get("title") or "")
+    summary = f"Execute Linear {identifier}: {title}".strip()
+    return {
+        "command": f"/goal {summary}; verify Done when before closeout; preserve dry-run side-effect boundaries.",
+        "summary": summary,
+    }
+
+
+def _would_work_state(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "work_id": candidate.get("identifier"),
+        "owner": "hermes",
+        "executor": "hermes",
+        "mode": "autopilot",
+        "state": "created",
+        "parent_id": candidate.get("parent_id"),
+    }
+
+
+def _finish_dry_run(
+    issues: list[Mapping[str, Any]],
+    *,
+    active_work_ids: set[str],
+    parent_override: Optional[str] = None,
+    no_eligible_reason: str = "no_eligible_execution_ready_issue",
+) -> dict[str, Any]:
+    sorted_issues = sorted(issues, key=_issue_identifier_sort_key)
+    candidates = [
+        _candidate_from_issue(
+            issue,
+            active_work_ids=active_work_ids,
+            parent_override=parent_override,
+        )
+        for issue in sorted_issues
+    ]
+    groups = _group_candidates(candidates)
+    for issue, candidate in zip(sorted_issues, candidates):
+        if candidate.get("eligible"):
+            return {
+                "status": "would_run",
+                "reason": "dry_run_selected_execution_ready_issue",
+                "selected_issue": _selected_issue_payload(issue),
+                "would_create_work_state": _would_work_state(candidate),
+                "would_goal_contract": _would_goal_contract(issue),
+                "candidates": candidates,
+                "groups": groups,
+            }
+    return {
+        "status": "blocked",
+        "reason": no_eligible_reason,
+        "selected_issue": None,
+        "would_create_work_state": None,
+        "would_goal_contract": None,
+        "candidates": candidates,
+        "groups": groups,
+    }
+
+
+def evaluate_dry_run_admission(
+    *,
+    command: AutopilotCommand,
+    state: Mapping[str, Any],
+    linear_client: LinearIssueClient,
+    work_state_store: Any = None,
+    target_issue: Optional[Mapping[str, Any]] = None,
+    target_classification: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    """Produce CH-388 read-only admission proof for /autopilot dry-run."""
+
+    if command.action != ACTION_DRY_RUN:
+        return _empty_dry_run("blocked", "not_a_dry_run")
+
+    lock_snapshot = _work_state_lock_snapshot(work_state_store)
+    if not lock_snapshot.get("available"):
+        return _empty_dry_run(
+            "blocked",
+            "work_state_unavailable_fail_closed",
+            work_state_reason=lock_snapshot.get("reason"),
+        )
+    active_ids = lock_snapshot.get("active_work_ids")
+    active_ids = active_ids if isinstance(active_ids, set) else set()
+    if not command.target_id:
+        if not bool(state.get("enabled")):
+            return _empty_dry_run("paused", "controller_disabled_noop")
+        queue = linear_client.list_execution_ready_issues(
+            team_key="CH",
+            state_name="Execution Ready",
+            limit=100,
+        )
+        if queue.get("status") != "ok":
+            return _empty_dry_run(
+                "blocked",
+                "linear_queue_unavailable_fail_closed",
+                linear_reason=queue.get("reason") or queue.get("status"),
+            )
+        issues = queue.get("issues") if isinstance(queue.get("issues"), list) else []
+        return _finish_dry_run(issues, active_work_ids=active_ids)
+
+    target_payload = target_issue or linear_client.fetch_issue(command.target_id)
+    if target_payload.get("status") != "ok":
+        return _empty_dry_run(
+            "blocked",
+            "linear_target_unavailable_fail_closed",
+            linear_reason=target_payload.get("reason") or target_payload.get("status"),
+        )
+    classified = target_classification or classify_linear_target(target_payload, command.target_id)
+    if classified.get("shape") == "parent":
+        state_name, state_type = _state_parts(target_payload)
+        if _is_terminal_state(state_name, state_type):
+            return _empty_dry_run("blocked", "parent_terminal")
+        children = target_payload.get("children") or {}
+        child_nodes = children.get("nodes") if isinstance(children, Mapping) else []
+        child_issues = [child for child in child_nodes if isinstance(child, Mapping)]
+        if not child_issues:
+            return _empty_dry_run("blocked", "no_eligible_child")
+        return _finish_dry_run(
+            child_issues,
+            active_work_ids=active_ids,
+            parent_override=str(classified.get("identifier") or command.target_id),
+            no_eligible_reason="no_eligible_child",
+        )
+    return _finish_dry_run([target_payload], active_work_ids=active_ids)
+
+
 def _admission_decision(
     *,
     command: AutopilotCommand,
     state: Mapping[str, Any],
     linear: Optional[Mapping[str, Any]],
+    dry_run: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
+    if command.action == ACTION_DRY_RUN and dry_run:
+        return {
+            "status": str(dry_run.get("status") or "blocked"),
+            "reason": str(dry_run.get("reason") or "dry_run_admission_unavailable"),
+            "admission_bypassed": False,
+        }
     if command.action in READ_ONLY_ACTIONS:
         return {
             "status": "read_only",
@@ -530,6 +952,38 @@ def _format_result_message(decision: Mapping[str, Any]) -> str:
             )
         else:
             lines.append(f"work_state: {work_state.get('reason', 'unavailable')}")
+    dry_run = decision.get("dry_run") or {}
+    if dry_run:
+        lines.append(
+            "Dry-run admission: "
+            f"{dry_run.get('status', 'unknown')} "
+            f"({dry_run.get('reason', 'no_reason')})."
+        )
+        selected = dry_run.get("selected_issue") or {}
+        if selected:
+            lines.append(
+                "Selected issue: "
+                f"{selected.get('identifier')} — {selected.get('title', '')}".rstrip()
+            )
+        else:
+            lines.append("Selected issue: none")
+        would_lock = dry_run.get("would_create_work_state") or {}
+        if would_lock:
+            lines.append(f"Would-lock id: {would_lock.get('work_id')}")
+        else:
+            lines.append("Would-lock id: none")
+        would_goal = dry_run.get("would_goal_contract") or {}
+        if would_goal:
+            lines.append(f"Would-contract: {would_goal.get('summary')}")
+        else:
+            lines.append("Would-contract: none")
+        if dry_run.get("status") == "would_run":
+            lines.append("Controller would: run after admission materializes the lock/goal contract.")
+        elif dry_run.get("status") == "paused":
+            lines.append("Controller would: pause; OFF intent prevents queue admission.")
+        else:
+            lines.append("Controller would: refuse/no-op until the blocker is resolved.")
+        lines.append("Dry-run side effects: work_state_written=false, executor_spawned=false, linear_mutated=false.")
     lines.append(
         "Decision: "
         f"{admission.get('status', 'unknown')} "
@@ -589,14 +1043,27 @@ def handle_autopilot_command(
         state = store.status()
 
     linear: Optional[dict[str, Any]] = None
+    target_issue: Optional[Mapping[str, Any]] = None
+    client = linear_client or EnvLinearIssueClient()
     if command.target_id:
-        client = linear_client or EnvLinearIssueClient()
-        linear = dict(classify_linear_target(client.fetch_issue(command.target_id), command.target_id))
+        target_issue = client.fetch_issue(command.target_id)
+        linear = dict(classify_linear_target(target_issue, command.target_id))
         work_state = classify_work_state_target(command.target_id, work_state_store)
     else:
         work_state = summarize_work_state(work_state_store)
 
-    admission = _admission_decision(command=command, state=state, linear=linear)
+    dry_run: Optional[dict[str, Any]] = None
+    if command.action == ACTION_DRY_RUN:
+        dry_run = evaluate_dry_run_admission(
+            command=command,
+            state=state,
+            linear_client=client,
+            work_state_store=work_state_store,
+            target_issue=target_issue,
+            target_classification=linear,
+        )
+
+    admission = _admission_decision(command=command, state=state, linear=linear, dry_run=dry_run)
     decision: dict[str, Any] = {
         "ok": True,
         "fail_closed": False,
@@ -616,6 +1083,8 @@ def handle_autopilot_command(
         },
         "generated_at": (now or _utcnow()).isoformat(),
     }
+    if dry_run is not None:
+        decision["dry_run"] = dry_run
     return AutopilotResult(
         ok=True,
         command=command,

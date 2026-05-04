@@ -27,35 +27,71 @@ from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
 class _FakeLinearClient:
-    def __init__(self, payloads):
+    def __init__(self, payloads, *, queue=None):
         self.payloads = payloads
+        self.queue = queue
         self.calls = []
+        self.queue_calls = []
 
     def fetch_issue(self, identifier: str):
         self.calls.append(identifier)
         return self.payloads[identifier]
 
+    def list_execution_ready_issues(self, *, team_key="CH", state_name="Execution Ready", limit=100):
+        self.queue_calls.append(
+            {"team_key": team_key, "state_name": state_name, "limit": limit}
+        )
+        if isinstance(self.queue, dict):
+            return self.queue
+        return {"status": "ok", "issues": list(self.queue or [])}
+
 
 class _FakeWorkStateStore:
-    def __init__(self):
+    def __init__(self, records=None):
+        self.records = records or []
         self.resolve_calls = []
 
     def list_records(self):
-        return []
+        return self.records
 
     def resolve_delegated_signal_candidate(self, *, work_id: str, live_only: bool):
         self.resolve_calls.append({"work_id": work_id, "live_only": live_only})
         return {"status": "no_match", "reason": "not_found", "matches": []}
 
 
-def _issue(identifier: str, *, state_name: str = "Execution Ready", parent=None, children=None):
+class _BrokenWorkStateStore:
+    def list_records(self):
+        raise RuntimeError("corrupt work_state")
+
+    def resolve_delegated_signal_candidate(self, *, work_id: str, live_only: bool):
+        raise RuntimeError("corrupt work_state")
+
+
+def _issue(
+    identifier: str,
+    *,
+    state_name: str = "Execution Ready",
+    state_type: str = "started",
+    parent=None,
+    children=None,
+    description: str | None = None,
+    priority: int = 3,
+    project: str | None = "Autopilot",
+):
     return {
         "status": "ok",
         "identifier": identifier,
         "title": f"{identifier} title",
-        "state": {"name": state_name, "type": "started"},
+        "description": description
+        if description is not None
+        else "## Done when\n- implementation complete\n\n## Verification\n- focused tests pass",
+        "priority": priority,
+        "url": f"https://linear.app/chriskim12/issue/{identifier.lower()}",
+        "state": {"name": state_name, "type": state_type},
         "parent": parent,
         "children": {"nodes": children or []},
+        "project": {"name": project} if project else None,
+        "labels": {"nodes": []},
     }
 
 
@@ -363,6 +399,368 @@ def test_unavailable_linear_target_blocks_fail_closed(tmp_path):
     }
     assert result.decision["side_effects"]["executor_spawned"] is False
     assert result.decision["side_effects"]["linear_done_mutated"] is False
+    spawner.assert_not_called()
+
+
+def test_dry_run_enabled_queue_selects_one_eligible_task_with_would_artifacts(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    spawner = MagicMock()
+    issue = _issue(
+        "CH-401",
+        parent={"identifier": "CH-173", "title": "parent", "state": {"name": "Backlog", "type": "backlog"}},
+    )
+    linear = _FakeLinearClient({}, queue=[issue])
+
+    result = handle_autopilot_command(
+        "dry-run",
+        state_store=store,
+        work_state_store=_FakeWorkStateStore(),
+        linear_client=linear,
+        executor_spawner=spawner,
+    )
+
+    dry_run = result.decision["dry_run"]
+    assert dry_run["status"] == "would_run"
+    assert dry_run["selected_issue"]["identifier"] == "CH-401"
+    assert dry_run["would_create_work_state"] == {
+        "work_id": "CH-401",
+        "owner": "hermes",
+        "executor": "hermes",
+        "mode": "autopilot",
+        "state": "created",
+        "parent_id": "CH-173",
+    }
+    assert dry_run["would_goal_contract"]["command"].startswith("/goal ")
+    assert "CH-401" in dry_run["would_goal_contract"]["summary"]
+    assert result.decision["admission"] == {
+        "status": "would_run",
+        "reason": "dry_run_selected_execution_ready_issue",
+        "admission_bypassed": False,
+    }
+    assert result.decision["side_effects"] == {
+        "state_written": False,
+        "executor_spawned": False,
+        "linear_done_mutated": False,
+    }
+    assert linear.queue_calls == [
+        {"team_key": "CH", "state_name": "Execution Ready", "limit": 100}
+    ]
+    assert store.status()["enabled"] is True
+    spawner.assert_not_called()
+
+
+def test_dry_run_multiple_eligible_tasks_uses_deterministic_identifier_order(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    linear = _FakeLinearClient(
+        {},
+        queue=[
+            _issue("CH-410", priority=3),
+            _issue("CH-409", priority=3),
+            _issue("CH-411", priority=3),
+        ],
+    )
+
+    result = handle_autopilot_command(
+        "dry-run",
+        state_store=store,
+        work_state_store=_FakeWorkStateStore(),
+        linear_client=linear,
+    )
+
+    dry_run = result.decision["dry_run"]
+    assert dry_run["status"] == "would_run"
+    assert dry_run["selected_issue"]["identifier"] == "CH-409"
+    assert [candidate["identifier"] for candidate in dry_run["candidates"]] == [
+        "CH-409",
+        "CH-410",
+        "CH-411",
+    ]
+
+
+def test_dry_run_off_returns_noop_without_linear_scan_or_executor(tmp_path):
+    store = _state_store(tmp_path)
+    linear = _FakeLinearClient({}, queue=[_issue("CH-401")])
+    spawner = MagicMock()
+
+    result = handle_autopilot_command(
+        "dry-run",
+        state_store=store,
+        work_state_store=_FakeWorkStateStore(),
+        linear_client=linear,
+        executor_spawner=spawner,
+    )
+
+    assert result.decision["dry_run"] == {
+        "status": "paused",
+        "reason": "controller_disabled_noop",
+        "selected_issue": None,
+        "would_create_work_state": None,
+        "would_goal_contract": None,
+        "candidates": [],
+        "groups": {"parents": {}, "projects": {}},
+    }
+    assert result.decision["admission"] == {
+        "status": "paused",
+        "reason": "controller_disabled_noop",
+        "admission_bypassed": False,
+    }
+    assert linear.queue_calls == []
+    spawner.assert_not_called()
+
+
+def test_dry_run_active_work_state_lock_blocks_candidate(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    locked = SimpleNamespace(
+        work_id="CH-401",
+        state="running",
+        owner="hermes",
+        executor="omx",
+        mode="delegated",
+    )
+    linear = _FakeLinearClient({}, queue=[_issue("CH-401")])
+
+    result = handle_autopilot_command(
+        "dry-run",
+        state_store=store,
+        work_state_store=_FakeWorkStateStore([locked]),
+        linear_client=linear,
+    )
+
+    dry_run = result.decision["dry_run"]
+    assert dry_run["status"] == "blocked"
+    assert dry_run["reason"] == "no_eligible_execution_ready_issue"
+    assert dry_run["selected_issue"] is None
+    assert dry_run["candidates"] == [
+        {
+            "identifier": "CH-401",
+            "eligible": False,
+            "reason": "active_work_state_lock",
+            "shape": "standalone",
+            "parent_id": None,
+            "project": "Autopilot",
+        }
+    ]
+
+
+def test_dry_run_unavailable_work_state_fails_closed_before_selection(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    linear = _FakeLinearClient({}, queue=[_issue("CH-401")])
+
+    result = handle_autopilot_command(
+        "dry-run",
+        state_store=store,
+        work_state_store=_BrokenWorkStateStore(),
+        linear_client=linear,
+    )
+
+    dry_run = result.decision["dry_run"]
+    assert dry_run["status"] == "blocked"
+    assert dry_run["reason"] == "work_state_unavailable_fail_closed"
+    assert dry_run["selected_issue"] is None
+    assert dry_run["would_create_work_state"] is None
+    assert dry_run["would_goal_contract"] is None
+    assert dry_run["work_state_reason"] == "work_state_unavailable:RuntimeError"
+    assert result.decision["admission"] == {
+        "status": "blocked",
+        "reason": "work_state_unavailable_fail_closed",
+        "admission_bypassed": False,
+    }
+    assert linear.queue_calls == []
+
+
+def test_dry_run_real_corrupt_work_state_file_fails_closed_before_selection(tmp_path):
+    from gateway.work_state import WorkStateStore
+
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    work_state_path = tmp_path / "gateway_work_state.json"
+    work_state_path.write_text("{ not json }", encoding="utf-8")
+    linear = _FakeLinearClient({}, queue=[_issue("CH-401")])
+
+    result = handle_autopilot_command(
+        "dry-run",
+        state_store=store,
+        work_state_store=WorkStateStore(work_state_path),
+        linear_client=linear,
+    )
+
+    dry_run = result.decision["dry_run"]
+    assert dry_run["status"] == "blocked"
+    assert dry_run["reason"] == "work_state_unavailable_fail_closed"
+    assert dry_run["selected_issue"] is None
+    assert dry_run["would_create_work_state"] is None
+    assert dry_run["would_goal_contract"] is None
+    assert dry_run["work_state_reason"] == "work_state_unavailable:JSONDecodeError"
+    assert linear.queue_calls == []
+
+
+def test_dry_run_malformed_work_state_payload_fails_closed_before_selection(tmp_path):
+    from gateway.work_state import WorkStateStore
+
+    cases = [
+        ({"sessions": [{"work_id": "CH-999"}]}, "work_state_unavailable:invalid_payload_schema"),
+        (["bad"], "work_state_unavailable:invalid_record_item_type"),
+        ({"records": ["bad"]}, "work_state_unavailable:invalid_record_item_type"),
+        ({"records": "bad"}, "work_state_unavailable:invalid_records_type"),
+    ]
+    for index, (payload, expected_reason) in enumerate(cases):
+        store = _state_store(tmp_path / f"state-{index}")
+        store.set_enabled(True, actor="tester")
+        work_state_path = tmp_path / f"gateway_work_state_{index}.json"
+        work_state_path.write_text(json.dumps(payload), encoding="utf-8")
+        linear = _FakeLinearClient({}, queue=[_issue("CH-401")])
+
+        result = handle_autopilot_command(
+            "dry-run",
+            state_store=store,
+            work_state_store=WorkStateStore(work_state_path),
+            linear_client=linear,
+        )
+
+        dry_run = result.decision["dry_run"]
+        assert dry_run["status"] == "blocked"
+        assert dry_run["reason"] == "work_state_unavailable_fail_closed"
+        assert dry_run["selected_issue"] is None
+        assert dry_run["work_state_reason"] == expected_reason
+        assert linear.queue_calls == []
+
+
+def test_dry_run_missing_linear_access_fails_closed(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    linear = _FakeLinearClient(
+        {},
+        queue={"status": "unavailable", "reason": "LINEAR_API_KEY_missing"},
+    )
+
+    result = handle_autopilot_command(
+        "dry-run",
+        state_store=store,
+        work_state_store=_FakeWorkStateStore(),
+        linear_client=linear,
+    )
+
+    assert result.decision["dry_run"] == {
+        "status": "blocked",
+        "reason": "linear_queue_unavailable_fail_closed",
+        "selected_issue": None,
+        "would_create_work_state": None,
+        "would_goal_contract": None,
+        "candidates": [],
+        "groups": {"parents": {}, "projects": {}},
+        "linear_reason": "LINEAR_API_KEY_missing",
+    }
+    assert result.decision["admission"] == {
+        "status": "blocked",
+        "reason": "linear_queue_unavailable_fail_closed",
+        "admission_bypassed": False,
+    }
+
+
+def test_dry_run_missing_verification_blocks_candidate(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    linear = _FakeLinearClient(
+        {},
+        queue=[_issue("CH-401", description="## Done when\n- implementation complete")],
+    )
+
+    result = handle_autopilot_command(
+        "dry-run",
+        state_store=store,
+        work_state_store=_FakeWorkStateStore(),
+        linear_client=linear,
+    )
+
+    dry_run = result.decision["dry_run"]
+    assert dry_run["status"] == "blocked"
+    assert dry_run["reason"] == "no_eligible_execution_ready_issue"
+    assert dry_run["candidates"][0]["reason"] == "missing_verification"
+    assert dry_run["selected_issue"] is None
+
+
+def test_dry_run_parent_terminal_refuses_targeted_parent(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    linear = _FakeLinearClient(
+        {
+            "CH-173": _issue(
+                "CH-173",
+                state_name="Done",
+                state_type="completed",
+                children=[_issue("CH-401")],
+            )
+        }
+    )
+
+    result = handle_autopilot_command(
+        "dry-run CH-173",
+        state_store=store,
+        work_state_store=_FakeWorkStateStore(),
+        linear_client=linear,
+    )
+
+    dry_run = result.decision["dry_run"]
+    assert dry_run["status"] == "blocked"
+    assert dry_run["reason"] == "parent_terminal"
+    assert dry_run["selected_issue"] is None
+    assert result.decision["admission"]["reason"] == "parent_terminal"
+
+
+def test_targeted_parent_dry_run_selects_at_most_one_eligible_child(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    linear = _FakeLinearClient(
+        {
+            "CH-173": _issue(
+                "CH-173",
+                state_name="Backlog",
+                state_type="backlog",
+                children=[_issue("CH-402"), _issue("CH-401")],
+            )
+        }
+    )
+
+    result = handle_autopilot_command(
+        "dry-run CH-173",
+        state_store=store,
+        work_state_store=_FakeWorkStateStore(),
+        linear_client=linear,
+    )
+
+    dry_run = result.decision["dry_run"]
+    assert dry_run["status"] == "would_run"
+    assert dry_run["selected_issue"]["identifier"] == "CH-401"
+    assert [candidate["identifier"] for candidate in dry_run["candidates"]] == ["CH-401", "CH-402"]
+    assert dry_run["would_create_work_state"]["parent_id"] == "CH-173"
+
+
+def test_dry_run_forbidden_side_effect_boundary_is_explicit(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    spawner = MagicMock()
+    linear = _FakeLinearClient({}, queue=[_issue("CH-401")])
+
+    result = handle_autopilot_command(
+        "dry-run",
+        state_store=store,
+        work_state_store=_FakeWorkStateStore(),
+        linear_client=linear,
+        executor_spawner=spawner,
+    )
+
+    assert result.decision["side_effects"] == {
+        "state_written": False,
+        "executor_spawned": False,
+        "linear_done_mutated": False,
+    }
+    assert "would_create_work_state" in result.decision["dry_run"]
+    assert result.decision["dry_run"]["would_create_work_state"]["work_id"] == "CH-401"
+    assert store.status()["enabled"] is True
     spawner.assert_not_called()
 
 
