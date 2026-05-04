@@ -213,7 +213,7 @@ def test_terminal_tool_rejects_plain_ralph_without_pty():
     assert result["status"] == "error"
     assert result["exit_code"] == 64
     assert result["blocked_reason"] == "omx_ralph_cli_noninteractive"
-    assert "valid persistent `$ralph` session surface" in result["error"]
+    assert "persistent `$ralph` session surface" in result["error"]
     assert "omx --madmax --high exec" in result["error"]
 
 
@@ -223,7 +223,17 @@ def test_terminal_tool_rejects_forced_tmux_ralph_without_pty():
     assert result["status"] == "error"
     assert result["exit_code"] == 64
     assert result["blocked_reason"] == "omx_ralph_forced_tmux_noninteractive"
-    assert "valid persistent `$ralph` session surface" in result["error"]
+    assert "persistent `$ralph` session surface" in result["error"]
+
+
+def test_terminal_tool_rejects_plain_ralph_even_with_pty():
+    result = json.loads(terminal_tool.terminal_tool(command='omx ralph "ship it"', pty=True))
+
+    assert result["status"] == "error"
+    assert result["exit_code"] == 64
+    assert result["blocked_reason"] == "omx_ralph_plain_pty"
+    assert "Plain PTY `omx ralph <task>` is only process-launch evidence" in result["error"]
+    assert "submit `$ralph <task>` inside it" in result["error"]
 
 
 def test_terminal_tool_allows_forced_tmux_ralph_when_pty_requested(monkeypatch):

@@ -52,7 +52,7 @@ class _FakeWorkStateStore:
         return True
 
 
-def test_builds_upstream_interactive_leader_and_ralph_commands():
+def test_builds_interactive_leader_and_plain_launcher_for_detection_only():
     assert build_omx_leader_command() == "omx --madmax --high"
     assert build_omx_ralph_command("fix owner ingress") == "omx ralph 'fix owner ingress'"
     assert build_ralph_in_session_message("fix owner ingress") == "$ralph 'fix owner ingress'"
@@ -85,7 +85,7 @@ def test_materialize_ralph_session_surface_accepts_pty_process_with_lane_truth(t
     assert surface.planning_gate == "closed"
     assert surface.next_execution_branch == "ralph"
     assert surface.close_authority == "hermes"
-    assert surface.command == "omx ralph 'continue CH-232'"
+    assert surface.command == "omx --madmax --high"
     assert surface.injected_message == "$ralph 'continue CH-232'"
 
 
@@ -101,7 +101,7 @@ def test_materialize_ralph_session_surface_accepts_existing_tmux_leader(tmp_path
     assert surface.injected_message == "$ralph 'continue CH-232'"
 
 
-def test_launch_pty_ralph_session_spawns_official_omx_ralph_entrypoint(tmp_path):
+def test_launch_pty_ralph_session_spawns_leader_and_injects_ralph_message(tmp_path):
     registry = _FakeRegistry()
     surface = launch_pty_ralph_session(
         task="throwaway smoke",
@@ -112,16 +112,19 @@ def test_launch_pty_ralph_session_spawns_official_omx_ralph_entrypoint(tmp_path)
 
     assert registry.spawned == [
         {
-            "command": "omx ralph 'throwaway smoke'",
+            "command": "omx --madmax --high",
             "cwd": str(tmp_path.resolve()),
             "session_key": "agent:main:discord:thread:1",
-            "env_vars": {"TERM": "xterm-256color"},
+            "env_vars": {"TERM": "xterm-256color", "OMX_LAUNCH_POLICY": "direct"},
             "use_pty": True,
         }
     ]
-    assert registry.submitted == []
+    assert registry.submitted == [
+        {"session_id": "proc-real-ralph-1", "data": "$ralph 'throwaway smoke'"}
+    ]
     assert surface.executor_session_id == "proc-real-ralph-1"
-    assert surface.command == "omx ralph 'throwaway smoke'"
+    assert surface.command == "omx --madmax --high"
+    assert surface.command != build_omx_ralph_command("throwaway smoke")
     assert surface.injected_message == "$ralph 'throwaway smoke'"
 
 
@@ -141,10 +144,14 @@ def test_start_omx_ralph_lane_is_operator_path_and_records_work_state(tmp_path):
 
     assert result["status"] == "accepted"
     assert result["work_state_updated"] is True
-    assert result["surface"]["command"] == "omx ralph 'continue CH-232'"
+    assert result["surface"]["command"] == "omx --madmax --high"
     assert result["surface"]["injected_message"] == "$ralph 'continue CH-232'"
     assert registry.spawned[0]["use_pty"] is True
-    assert registry.submitted == []
+    assert registry.spawned[0]["command"] == "omx --madmax --high"
+    assert registry.spawned[0]["env_vars"]["OMX_LAUNCH_POLICY"] == "direct"
+    assert registry.submitted == [
+        {"session_id": "proc-real-ralph-1", "data": "$ralph 'continue CH-232'"}
+    ]
     assert store.updates[0]["work_id"] == "wk-ch232"
     assert store.updates[0]["owner_session_id"] == "owner-session-1"
     updates = store.updates[0]["updates"]
@@ -152,7 +159,14 @@ def test_start_omx_ralph_lane_is_operator_path_and_records_work_state(tmp_path):
     assert updates["mode"] == "delegated"
     assert updates["state"] == "running"
     assert updates["executor_session_id"] == "proc-real-ralph-1"
-    assert updates["proof"] == "ralph_session_surface:pty_process"
+    assert updates["proof"] == "ralph_session_surface:pty_leader_injected"
+    assert updates["surface_started_at"] is not None
+    assert updates["first_progress_at"] is None
+    assert updates["first_progress_proof"] is None
+    assert updates["no_progress_watchdog_seconds"] == 180
+    assert updates["no_progress_deadline_at"] > updates["surface_started_at"]
+    assert "first useful Ralph progress" in updates["next_action"]
+    assert "bounded omx --madmax --high exec" in updates["reroute_recommendation"]
     assert updates["current_lane"] == "ralph"
     assert updates["planning_gate"] == "closed"
     assert updates["next_execution_branch"] == "ralph"

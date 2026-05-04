@@ -721,6 +721,163 @@ def bound_next_action(next_action: Optional[str], *, fallback: str) -> str:
     return text[:197].rstrip() + "..."
 
 
+RALPH_FIRST_PROGRESS_REROUTE_RECOMMENDATION = (
+    "reroute to bounded `omx --madmax --high exec`, `omx team`, or Hermes-direct "
+    "only when scope and authority allow it"
+)
+
+RALPH_APPROVAL_PROMPT_PATTERNS = (
+    "approval required",
+    "requires approval",
+    "approve this command",
+    "do you want to allow",
+    "allow command",
+    "press enter to approve",
+)
+RALPH_SANDBOX_PATTERNS = (
+    "bwrap:",
+    "bubblewrap",
+    "rtm_newaddr",
+    "failed to setup loopback",
+    "failed to make loopback",
+    "operation not permitted",
+)
+
+
+def _truthy_sequence(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [item for item in value if item]
+    if isinstance(value, tuple):
+        return [item for item in value if item]
+    if isinstance(value, dict):
+        return [value] if value else []
+    return [value] if str(value).strip() else []
+
+
+def _is_runtime_residue_path(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    normalized = text.replace("\\", "/")
+    return (
+        "/.omx" in normalized
+        or "/.clawhip" in normalized
+        or normalized.startswith(".omx/")
+        or normalized.startswith(".clawhip/")
+        or normalized in {".omx", ".clawhip"}
+    )
+
+
+def classify_ralph_first_progress_evidence(
+    *,
+    output: str = "",
+    progress_entries: Optional[Any] = None,
+    diff_stat: str = "",
+    artifact_paths: Optional[Any] = None,
+    tool_events: Optional[Any] = None,
+    residue_paths: Optional[Any] = None,
+    deadline_expired: bool = False,
+) -> Dict[str, Any]:
+    """Classify bounded Ralph first-progress evidence.
+
+    Surface/process liveness is intentionally ignored.  Accepted progress must
+    be a task-relevant diff/artifact/tool/progress entry; runtime residue alone
+    maps to cleanup-required no-progress, and approval/sandbox signatures map to
+    blocked outcomes.
+    """
+
+    text = str(output or "")
+    lowered = text.lower()
+    reroute = RALPH_FIRST_PROGRESS_REROUTE_RECOMMENDATION
+    for pattern in RALPH_APPROVAL_PROMPT_PATTERNS:
+        if pattern in lowered:
+            return {
+                "status": "blocked",
+                "blocked_reason": "approval_prompt",
+                "proof": f"ralph_blocked:approval_prompt:{pattern}",
+                "cleanup_required": True,
+                "cleanup_proof": "task_owned_runtime_residue_must_be_closed",
+                "reroute_recommendation": reroute,
+            }
+    for pattern in RALPH_SANDBOX_PATTERNS:
+        if pattern in lowered:
+            reason = "sandbox_rtm_newaddr" if "rtm_newaddr" in pattern else "sandbox_bwrap"
+            return {
+                "status": "blocked",
+                "blocked_reason": reason,
+                "proof": f"ralph_blocked:{reason}:{pattern}",
+                "cleanup_required": True,
+                "cleanup_proof": "task_owned_runtime_residue_must_be_closed",
+                "reroute_recommendation": reroute,
+            }
+
+    entries = _truthy_sequence(progress_entries)
+    if entries:
+        return {
+            "status": "progress",
+            "proof": f"ralph_first_progress:progress_entries:{len(entries)}",
+            "cleanup_required": False,
+            "reroute_recommendation": None,
+        }
+    if str(diff_stat or "").strip():
+        return {
+            "status": "progress",
+            "proof": "ralph_first_progress:diff_stat",
+            "cleanup_required": False,
+            "reroute_recommendation": None,
+        }
+    artifacts = [
+        str(item)
+        for item in _truthy_sequence(artifact_paths)
+        if str(item).strip() and not _is_runtime_residue_path(item)
+    ]
+    if artifacts:
+        return {
+            "status": "progress",
+            "proof": f"ralph_first_progress:artifact:{artifacts[0]}",
+            "cleanup_required": False,
+            "reroute_recommendation": None,
+        }
+    tools = _truthy_sequence(tool_events)
+    if tools:
+        return {
+            "status": "progress",
+            "proof": f"ralph_first_progress:tool_event:{len(tools)}",
+            "cleanup_required": False,
+            "reroute_recommendation": None,
+        }
+
+    residue = _truthy_sequence(residue_paths) + [
+        item for item in _truthy_sequence(artifact_paths) if _is_runtime_residue_path(item)
+    ]
+    if residue:
+        return {
+            "status": "no_progress",
+            "blocked_reason": "runtime_residue_only",
+            "proof": f"ralph_no_progress:runtime_residue_only:{len(residue)}",
+            "cleanup_required": True,
+            "cleanup_proof": "runtime_residue_only_no_product_diff",
+            "reroute_recommendation": reroute,
+        }
+    if deadline_expired:
+        return {
+            "status": "no_progress",
+            "blocked_reason": "first_progress_watchdog_expired",
+            "proof": "ralph_no_progress:first_progress_watchdog_expired",
+            "cleanup_required": True,
+            "cleanup_proof": "no_diff_no_artifact_no_tool_no_progress_entry",
+            "reroute_recommendation": reroute,
+        }
+    return {
+        "status": "waiting",
+        "proof": "ralph_first_progress_watchdog:waiting",
+        "cleanup_required": False,
+        "reroute_recommendation": None,
+    }
+
+
 def delegated_process_exit_closeout(exit_code: Optional[int]) -> Dict[str, str]:
     proof = f"background_process_exit:{exit_code}"
     if exit_code == 0:
@@ -1214,15 +1371,37 @@ class WorkRecord:
     planning_gate: Optional[str] = None
     next_execution_branch: Optional[str] = None
     close_authority: Optional[str] = None
+    surface_started_at: Optional[datetime] = None
+    first_progress_at: Optional[datetime] = None
+    first_progress_proof: Optional[str] = None
+    no_progress_watchdog_seconds: Optional[int] = None
+    no_progress_deadline_at: Optional[datetime] = None
+    no_progress_attempts: int = 0
+    blocked_reason: Optional[str] = None
+    cleanup_required: bool = False
+    cleanup_proof: Optional[str] = None
+    reroute_recommendation: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
         data["started_at"] = self.started_at.isoformat()
         data["last_progress_at"] = self.last_progress_at.isoformat()
+        for key in ("surface_started_at", "first_progress_at", "no_progress_deadline_at"):
+            value = data.get(key)
+            if isinstance(value, datetime):
+                data[key] = value.isoformat()
         return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "WorkRecord":
+        def _optional_datetime(key: str) -> Optional[datetime]:
+            value = data.get(key)
+            if not value:
+                return None
+            if isinstance(value, datetime):
+                return value
+            return datetime.fromisoformat(str(value))
+
         return cls(
             work_id=str(data["work_id"]),
             title=str(data.get("title", "")),
@@ -1247,6 +1426,20 @@ class WorkRecord:
             planning_gate=data.get("planning_gate"),
             next_execution_branch=data.get("next_execution_branch"),
             close_authority=data.get("close_authority"),
+            surface_started_at=_optional_datetime("surface_started_at"),
+            first_progress_at=_optional_datetime("first_progress_at"),
+            first_progress_proof=data.get("first_progress_proof"),
+            no_progress_watchdog_seconds=(
+                int(data.get("no_progress_watchdog_seconds"))
+                if data.get("no_progress_watchdog_seconds") not in (None, "")
+                else None
+            ),
+            no_progress_deadline_at=_optional_datetime("no_progress_deadline_at"),
+            no_progress_attempts=int(data.get("no_progress_attempts") or 0),
+            blocked_reason=data.get("blocked_reason"),
+            cleanup_required=bool(data.get("cleanup_required", False)),
+            cleanup_proof=data.get("cleanup_proof"),
+            reroute_recommendation=data.get("reroute_recommendation"),
         )
 
 
@@ -2315,6 +2508,67 @@ class WorkStateStore:
                     return True
         return False
 
+    def apply_ralph_first_progress_watchdog(
+        self,
+        work_id: str,
+        owner_session_id: str,
+        *,
+        evidence: Optional[Dict[str, Any]] = None,
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Apply Ralph first-progress classification to a live work record."""
+
+        evidence = dict(evidence or {})
+        event_at = now or _utcnow()
+        with self._lock:
+            self._ensure_loaded()
+            for record in self._records:
+                if record.work_id != work_id or record.owner_session_id != owner_session_id:
+                    continue
+                deadline = record.no_progress_deadline_at
+                deadline_expired = bool(
+                    evidence.pop("deadline_expired", False)
+                    or (deadline is not None and event_at >= deadline)
+                )
+                decision = classify_ralph_first_progress_evidence(
+                    deadline_expired=deadline_expired,
+                    **evidence,
+                )
+                status = decision["status"]
+                if status == "waiting":
+                    return {"updated": False, "record_found": True, **decision}
+
+                record.proof = decision.get("proof") or record.proof
+                record.reroute_recommendation = decision.get("reroute_recommendation")
+                record.cleanup_required = bool(decision.get("cleanup_required", False))
+                record.cleanup_proof = decision.get("cleanup_proof")
+                if status == "progress":
+                    record.first_progress_at = event_at
+                    record.first_progress_proof = str(decision.get("proof") or "")
+                    record.last_progress_at = event_at
+                    record.next_action = "Continue Ralph lane; verify completion before closeout"
+                    record.blocked_reason = None
+                    record.cleanup_required = False
+                    record.cleanup_proof = None
+                else:
+                    record.first_progress_at = None
+                    record.first_progress_proof = None
+                    record.no_progress_attempts = int(record.no_progress_attempts or 0) + 1
+                    record.blocked_reason = str(decision.get("blocked_reason") or status)
+                    record.next_action = bound_next_action(
+                        decision.get("reroute_recommendation"),
+                        fallback=RALPH_FIRST_PROGRESS_REROUTE_RECOMMENDATION,
+                    )
+                    record.usable_outcome = (
+                        "blocked" if status == "blocked" else "no_progress_theater"
+                    )
+                    record.close_disposition = "close"
+                    record.state = "blocked" if status == "blocked" else "handoff_needed"
+                _apply_omx_lane_truth(record)
+                self._save_locked()
+                return {"updated": True, "record_found": True, **decision}
+        return {"updated": False, "record_found": False, "status": "missing"}
+
     def find_matching_records(
         self,
         work_id: str,
@@ -2442,6 +2696,59 @@ class WorkStateStore:
             "matches": [matches[0].to_dict()],
             "record": matches[0],
         }
+
+    def fail_close_delegated_process_exit(
+        self,
+        *,
+        executor_session_id: str,
+        exit_code: Optional[int],
+    ) -> Dict[str, Any]:
+        """Fail-close delegated OMX work when the backing process merely exits.
+
+        A zero exit code from the background process is lifecycle evidence only;
+        it is not proof of useful work. Preserve any already closed usable
+        outcome and otherwise record an honest close disposition.
+        """
+
+        if not executor_session_id:
+            return {"updated": False, "reason": "missing_executor_session_id"}
+        with self._lock:
+            self._ensure_loaded()
+            matches = [
+                record
+                for record in self._records
+                if record.owner == "hermes"
+                and record.executor == "omx"
+                and record.mode == "delegated"
+                and record.executor_session_id == executor_session_id
+                and record.state in LIVE_STATES
+            ]
+            if not matches:
+                return {"updated": False, "reason": "missing_or_closed_delegated_work_record"}
+            if len(matches) > 1:
+                return {
+                    "updated": False,
+                    "reason": "ambiguous_delegated_work_resolution",
+                    "matches": [record.to_dict() for record in matches],
+                }
+            record = matches[0]
+            if record_has_closed_usable_outcome(record):
+                return {"updated": False, "reason": "already_closed_usable_outcome"}
+            closeout = delegated_process_exit_closeout(exit_code)
+            record.state = closeout["state"]
+            record.last_progress_at = _utcnow()
+            record.next_action = closeout["next_action"]
+            record.proof = closeout["proof"]
+            record.usable_outcome = closeout["usable_outcome"]
+            record.close_disposition = closeout["close_disposition"]
+            _apply_omx_lane_truth(record)
+            self._save_locked()
+            return {
+                "updated": True,
+                "reason": "delegated_process_exit_fail_closed",
+                "work_id": record.work_id,
+                "record": record.to_dict(),
+            }
 
     def resolve_native_owner_ingress_packet(
         self,

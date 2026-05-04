@@ -10826,9 +10826,85 @@ class GatewayRunner:
         store = getattr(self, "_injected_work_state_store", None)
         if store is not None:
             return store
+        store = getattr(self, "work_state_store", None)
+        if store is not None:
+            return store
         from gateway.work_state import WorkStateStore
 
         return WorkStateStore()
+
+    def _begin_direct_work_record(
+        self,
+        *,
+        session_id: str,
+        session_key: str,
+        message_text: str,
+        platform: str,
+        event_message_id: Optional[str] = None,
+    ) -> str:
+        """Create the direct Hermes work-state row for an owner message."""
+
+        from gateway.work_state import WorkRecord
+
+        work_id = f"wk-{platform}-{event_message_id or session_id or int(time.time())}"
+        now = datetime.now().astimezone()
+        store = self._work_state_store()
+        store.upsert(
+            WorkRecord(
+                work_id=work_id,
+                title=str(message_text or "").strip()[:120] or "direct Hermes work",
+                objective=str(message_text or "").strip() or "direct Hermes work",
+                owner="hermes",
+                executor="hermes",
+                mode="direct",
+                owner_session_id=session_key,
+                state="running",
+                started_at=now,
+                last_progress_at=now,
+                next_action="Continue direct Hermes execution",
+                proof=f"message_ingress:{platform}",
+            )
+        )
+        return work_id
+
+    def _mark_work_record_delegated(
+        self,
+        work_id: str,
+        owner_session_id: str,
+        *,
+        executor_session_id: Optional[str] = None,
+        tmux_session: Optional[str] = None,
+        repo_path: Optional[str] = None,
+        worktree_path: Optional[str] = None,
+        next_action: str = "Resume the delegated OMX work",
+        proof: str = "delegated_handoff:omx",
+        current_lane: Optional[str] = None,
+        planning_gate: Optional[str] = None,
+        next_execution_branch: Optional[str] = None,
+        close_authority: Optional[str] = None,
+    ) -> bool:
+        """Rewrite a direct owner work row as delegated OMX work."""
+
+        return self._work_state_store().update_record(
+            work_id,
+            owner_session_id,
+            executor="omx",
+            mode="delegated",
+            state="running",
+            last_progress_at=datetime.now().astimezone(),
+            executor_session_id=executor_session_id,
+            tmux_session=tmux_session,
+            repo_path=repo_path,
+            worktree_path=worktree_path,
+            next_action=next_action,
+            proof=proof,
+            usable_outcome=None,
+            close_disposition=None,
+            current_lane=current_lane,
+            planning_gate=planning_gate,
+            next_execution_branch=next_execution_branch,
+            close_authority=close_authority,
+        )
 
     def _find_session_entry_by_session_id(self, session_id: Optional[str]):
         if not session_id or not getattr(self, "session_store", None):

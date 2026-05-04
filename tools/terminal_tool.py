@@ -45,6 +45,7 @@ import threading
 import atexit
 import shutil
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -1624,6 +1625,90 @@ def _looks_like_omx_delegation(command: str) -> bool:
     return infer_omx_lane_from_command(command) is not None
 
 
+def _extract_tmux_session_name_from_command(command: str) -> Optional[str]:
+    """Extract a detached tmux session name from common `tmux new-session` shapes."""
+
+    text = str(command or "")
+    try:
+        tokens = shlex.split(text)
+    except Exception:
+        tokens = []
+
+    for idx, token in enumerate(tokens):
+        if token in {"-s", "--session-name"} and idx + 1 < len(tokens):
+            return tokens[idx + 1]
+        if token.startswith("-s") and len(token) > 2:
+            return token[2:]
+        if token.startswith("--session-name="):
+            return token.split("=", 1)[1]
+
+    match = re.search(r"\btmux\s+new-session\b(?=[\s\S]*?\s-s\s+)(?:[\s\S]*?)\s-s\s+([^\s'\"]+)", text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _mark_current_gateway_work_record_delegated(
+    *,
+    session_key: str,
+    command: str,
+    process_session_id: str,
+    workdir: str,
+) -> bool:
+    """Best-effort terminal background OMX handoff accounting.
+
+    Launching a background command is only lifecycle evidence. This rewrites the
+    current direct Hermes work record into delegated OMX state so later native
+    owner-ingress or process-exit signals resolve against one explicit record.
+    """
+
+    if not session_key or not _looks_like_omx_delegation(command):
+        return False
+    try:
+        from gateway.work_state import WorkStateStore, infer_omx_lane_from_command
+
+        lane = infer_omx_lane_from_command(command)
+        if not lane:
+            return False
+        store = WorkStateStore()
+        records = store.list_records()
+        candidates = [
+            record for record in records
+            if record.owner == "hermes"
+            and record.owner_session_id == session_key
+            and record.mode == "direct"
+            and record.state in {"created", "running", "blocked", "stale", "retry_needed", "handoff_needed", "failed"}
+        ]
+        if len(candidates) != 1:
+            return False
+        record = candidates[0]
+        tmux_session = _extract_tmux_session_name_from_command(command)
+        effective_workdir = str(Path(workdir).expanduser()) if workdir else None
+        return store.update_record(
+            record.work_id,
+            session_key,
+            executor="omx",
+            mode="delegated",
+            state="running",
+            last_progress_at=datetime.now(timezone.utc),
+            executor_session_id=None if tmux_session else process_session_id,
+            tmux_session=tmux_session,
+            repo_path=effective_workdir,
+            worktree_path=effective_workdir,
+            next_action="Resume the delegated OMX work",
+            proof=f"terminal_background:{lane}",
+            usable_outcome=None,
+            close_disposition=None,
+            current_lane=lane,
+            planning_gate=None,
+            next_execution_branch=None,
+            close_authority="hermes",
+        )
+    except Exception:
+        logger.debug("Failed to mark current work record delegated from terminal background", exc_info=True)
+        return False
+
+
 def _omx_command_has_lane(command: str, lane_name: str) -> bool:
     """Return True when a real ``omx`` command segment selects *lane_name*.
 
@@ -1755,21 +1840,27 @@ def terminal_tool(
             }, ensure_ascii=False)
 
         command = _apply_default_omx_launch_flags(command)
-        if not pty and _looks_like_noninteractive_omx_ralph(command):
+        if _looks_like_noninteractive_omx_ralph(command) and (
+            not pty or not _looks_like_forced_tmux_omx_ralph(command)
+        ):
             blocked_reason = (
                 "omx_ralph_forced_tmux_noninteractive"
                 if _looks_like_forced_tmux_omx_ralph(command)
+                else "omx_ralph_plain_pty"
+                if pty
                 else "omx_ralph_cli_noninteractive"
             )
             return json.dumps({
                 "output": "",
                 "exit_code": 64,
                 "error": (
-                    "Blocked unsafe OMX Ralph launch: Hermes non-interactive terminal is not "
-                    "a valid persistent `$ralph` session surface. Live non-TTY smoke for "
-                    "`omx --madmax --high ralph \"task\"` fails before useful execution. "
-                    "Use `omx --madmax --high exec` for a bounded noninteractive slice, or "
-                    "launch `$ralph` inside a real OMX/Codex PTY/tmux session."
+                    "Blocked unsafe OMX Ralph launch: Hermes terminal command shape is not "
+                    "valid first-progress evidence for a persistent `$ralph` session surface. "
+                    "Plain PTY `omx ralph <task>` is only process-launch evidence here, not "
+                    "the approved handoff contract. Use `omx --madmax --high exec` for a "
+                    "bounded noninteractive slice, or use the Ralph session-surface operator "
+                    "path: launch `omx --madmax --high` in a real PTY/tmux session and "
+                    "submit `$ralph <task>` inside it."
                 ),
                 "status": "error",
                 "blocked_reason": blocked_reason,
@@ -2058,6 +2149,13 @@ def terminal_tool(
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:
                     result_data["pty_note"] = pty_disabled_reason
+                if _mark_current_gateway_work_record_delegated(
+                    session_key=session_key,
+                    command=command,
+                    process_session_id=proc_session.id,
+                    workdir=effective_cwd,
+                ):
+                    result_data["work_state_updated"] = True
 
                 # Populate routing metadata on the session so that
                 # watch-pattern and completion notifications can be

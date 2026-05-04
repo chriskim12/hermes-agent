@@ -1810,8 +1810,8 @@ def test_mark_work_record_delegated_can_record_real_ralph_session_lane_truth(tmp
         tmux_session=None,
         repo_path=str(tmp_path),
         worktree_path=str(tmp_path),
-        next_action="Resume the in-session $ralph lane",
-        proof="ralph_session_surface:pty_process",
+        next_action="Verify first useful Ralph progress before closeout",
+        proof="ralph_session_surface:pty_leader_injected",
         current_lane="ralph",
     )
 
@@ -1823,7 +1823,7 @@ def test_mark_work_record_delegated_can_record_real_ralph_session_lane_truth(tmp
     )["record"]
     assert record.mode == "delegated"
     assert record.executor == "omx"
-    assert record.proof == "ralph_session_surface:pty_process"
+    assert record.proof == "ralph_session_surface:pty_leader_injected"
     assert record.executor_session_id == "proc-real-ralph-1"
     assert record.current_lane == "ralph"
     assert record.planning_gate == "closed"
