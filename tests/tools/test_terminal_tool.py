@@ -232,32 +232,15 @@ def test_terminal_tool_rejects_plain_ralph_even_with_pty():
     assert result["status"] == "error"
     assert result["exit_code"] == 64
     assert result["blocked_reason"] == "omx_ralph_plain_pty"
-    assert "Plain PTY `omx ralph <task>` is only process-launch evidence" in result["error"]
+    assert "Terminal `omx ralph` command shapes" in result["error"]
     assert "submit `$ralph <task>` inside it" in result["error"]
 
 
-def test_terminal_tool_allows_forced_tmux_ralph_when_pty_requested(monkeypatch):
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {
-        "env_type": "local",
-        "env_name": "default",
-        "cwd": ".",
-        "timeout": 180,
-    })
-
-    class _FakeEnv:
-        def execute(self, command, **kwargs):
-            return {
-                "output": f"ran: {command}",
-                "returncode": 0,
-            }
-
-    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
-    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": _FakeEnv()})
-    monkeypatch.setattr(terminal_tool, "_last_activity", {"default": 0})
-    monkeypatch.setattr(terminal_tool, "_check_all_guards", lambda *args, **kwargs: {"approved": True})
-
+def test_terminal_tool_rejects_forced_tmux_ralph_even_with_pty():
     result = json.loads(terminal_tool.terminal_tool(command='omx ralph --tmux "ship it"', pty=True))
 
-    assert result["exit_code"] == 0
-    assert "omx ralph --tmux" in result["output"]
-    assert "omx --madmax --high ralph" not in result["output"]
+    assert result["status"] == "error"
+    assert result["exit_code"] == 64
+    assert result["blocked_reason"] == "omx_ralph_forced_tmux_pty"
+    assert "including PTY/`--tmux`" in result["error"]
+    assert "omx_ralph" in result["error"]

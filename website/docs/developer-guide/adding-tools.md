@@ -17,9 +17,9 @@ Make it a **Tool** when it requires end-to-end integration with API keys, custom
 Adding a tool touches **2 files**:
 
 1. **`tools/your_tool.py`** — handler, schema, check function, `registry.register()` call
-2. **`toolsets.py`** — add tool name to `_HERMES_CORE_TOOLS` (or a specific toolset)
+2. **`toolsets.py`** — add the tool name to the static toolset that should expose it, and to `_HERMES_CORE_TOOLS` if default CLI/gateway platform sessions should see it
 
-Any `tools/*.py` file with a top-level `registry.register()` call is auto-discovered at startup — no manual import list required.
+Any `tools/*.py` file with a top-level `registry.register()` call is auto-discovered at startup — no manual import list required. Auto-discovery registers the tool, but it does not make the tool visible to the model unless `toolsets.py` includes the tool name.
 
 ## Step 1: Create the Tool File
 
@@ -111,11 +111,19 @@ registry.register(
 In `toolsets.py`, add the tool name:
 
 ```python
-# If it should be available on all platforms (CLI + messaging):
+# If it should be available on all default platforms (CLI + messaging):
 _HERMES_CORE_TOOLS = [
     ...
     "weather",  # <-- add here
 ]
+
+# If it belongs to an existing category toolset, add it there too so
+# enabled_toolsets=["weather-category"] and subagents can see it:
+"weather-category": {
+    "description": "Weather lookup tools",
+    "tools": ["weather"],
+    "includes": []
+},
 
 # Or create a new standalone toolset:
 "weather": {

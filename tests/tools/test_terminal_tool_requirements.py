@@ -25,6 +25,7 @@ class TestTerminalRequirements:
         tools = get_tool_definitions(enabled_toolsets=["terminal", "file"], quiet_mode=True)
         names = {tool["function"]["name"] for tool in tools}
         assert "terminal" in names
+        assert "omx_ralph" in names
         assert {"read_file", "write_file", "patch", "search_files"}.issubset(names)
 
     def test_terminal_and_execute_code_tools_resolve_for_managed_modal(self, monkeypatch, tmp_path):

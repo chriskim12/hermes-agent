@@ -280,9 +280,9 @@ registry.register(
 )
 ```
 
-**2. Add to `toolsets.py`** — either `_HERMES_CORE_TOOLS` (all platforms) or a new toolset.
+**2. Add to `toolsets.py`** — put the tool name in the static toolset that should expose it (for example `TOOLSETS["terminal"]["tools"]`). If it should also be available on the default CLI/gateway platform toolsets, add it to `_HERMES_CORE_TOOLS` too.
 
-Auto-discovery: any `tools/*.py` file with a top-level `registry.register()` call is imported automatically — no manual import list to maintain.
+Auto-discovery: any `tools/*.py` file with a top-level `registry.register()` call is imported automatically — no manual import list to maintain. Discovery only registers the handler/schema; model visibility still comes from `toolsets.py`, so a registered tool that is missing from its static toolset is effectively hidden.
 
 The registry handles schema collection, dispatch, availability checking, and error wrapping. All handlers MUST return a JSON string.
 

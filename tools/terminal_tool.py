@@ -1840,12 +1840,13 @@ def terminal_tool(
             }, ensure_ascii=False)
 
         command = _apply_default_omx_launch_flags(command)
-        if _looks_like_noninteractive_omx_ralph(command) and (
-            not pty or not _looks_like_forced_tmux_omx_ralph(command)
-        ):
+        if _looks_like_noninteractive_omx_ralph(command):
+            forced_tmux = _looks_like_forced_tmux_omx_ralph(command)
             blocked_reason = (
                 "omx_ralph_forced_tmux_noninteractive"
-                if _looks_like_forced_tmux_omx_ralph(command)
+                if forced_tmux and not pty
+                else "omx_ralph_forced_tmux_pty"
+                if forced_tmux and pty
                 else "omx_ralph_plain_pty"
                 if pty
                 else "omx_ralph_cli_noninteractive"
@@ -1856,11 +1857,11 @@ def terminal_tool(
                 "error": (
                     "Blocked unsafe OMX Ralph launch: Hermes terminal command shape is not "
                     "valid first-progress evidence for a persistent `$ralph` session surface. "
-                    "Plain PTY `omx ralph <task>` is only process-launch evidence here, not "
-                    "the approved handoff contract. Use `omx --madmax --high exec` for a "
-                    "bounded noninteractive slice, or use the Ralph session-surface operator "
-                    "path: launch `omx --madmax --high` in a real PTY/tmux session and "
-                    "submit `$ralph <task>` inside it."
+                    "Terminal `omx ralph` command shapes, including PTY/`--tmux`, are only "
+                    "process-launch evidence here, not the approved handoff contract. Use "
+                    "`omx --madmax --high exec` for a bounded noninteractive slice, or use "
+                    "the `omx_ralph` session-surface operator tool: launch `omx --madmax "
+                    "--high` in a real PTY and submit `$ralph <task>` inside it."
                 ),
                 "status": "error",
                 "blocked_reason": blocked_reason,

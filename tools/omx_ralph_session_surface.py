@@ -92,9 +92,9 @@ def validate_ralph_session_surface(
         "status": "error",
         "reason": "missing_real_ralph_session_surface",
         "message": (
-            "Persistent Ralph requires official `omx ralph <task>` or prompt-side "
-            "`$ralph` inside an OMX/Codex PTY/tmux leader surface; non-TTY CLI "
-            "`omx ralph` is not valid."
+            "Persistent Ralph requires prompt-side `$ralph <task>` inside a real "
+            "OMX/Codex PTY/tmux leader surface created by the operator path; "
+            "terminal `omx ralph` command shapes are not valid first-progress evidence."
         ),
     }
 

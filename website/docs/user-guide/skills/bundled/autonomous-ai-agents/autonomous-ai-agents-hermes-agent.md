@@ -723,9 +723,9 @@ registry.register(
 )
 ```
 
-**2. Add to `toolsets.py`** → `_HERMES_CORE_TOOLS` list.
+**2. Add to `toolsets.py`** → the static toolset that should expose the tool. Add it to `_HERMES_CORE_TOOLS` too when default CLI/gateway platform sessions should see it.
 
-Auto-discovery: any `tools/*.py` file with a top-level `registry.register()` call is imported automatically — no manual list needed.
+Auto-discovery: any `tools/*.py` file with a top-level `registry.register()` call is imported automatically — no manual list needed. Discovery registers the handler/schema; model visibility still depends on `toolsets.py`.
 
 All handlers must return JSON strings. Use `get_hermes_home()` for paths, never hardcode `~/.hermes`.
 
