@@ -6558,6 +6558,13 @@ class HermesCLI:
             self._show_gateway_status()
         elif canonical == "status":
             self._show_session_status()
+        elif canonical == "autopilot":
+            from gateway.autopilot import handle_autopilot_command
+
+            parts = cmd_original.split(None, 1)
+            raw_args = parts[1].strip() if len(parts) > 1 else ""
+            result = handle_autopilot_command(raw_args, actor="local-cli")
+            _cprint(result.message)
         elif canonical == "statusbar":
             self._status_bar_visible = not self._status_bar_visible
             state = "visible" if self._status_bar_visible else "hidden"

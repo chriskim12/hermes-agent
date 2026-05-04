@@ -164,7 +164,7 @@ async def test_auto_registers_missing_gateway_commands(adapter):
 
     # These commands are gateway-available but were not in the original
     # hardcoded registration list — they should be auto-registered.
-    expected_auto = {"debug", "yolo", "profile"}
+    expected_auto = {"autopilot", "debug", "yolo", "profile"}
     for name in expected_auto:
         assert name in tree_names, f"/{name} should be auto-registered on Discord"
 
@@ -196,6 +196,14 @@ async def test_auto_registered_command_with_args(adapter):
     await branch_cmd.callback(interaction, args="my-branch")
     adapter._run_simple_slash.assert_awaited_once_with(
         interaction, "/branch my-branch"
+    )
+
+    autopilot_cmd = adapter._client.tree.commands["autopilot"]
+    interaction = SimpleNamespace()
+    adapter._run_simple_slash.reset_mock()
+    await autopilot_cmd.callback(interaction, args="dry-run CH-385")
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction, "/autopilot dry-run CH-385"
     )
 
 

@@ -173,6 +173,18 @@ class TestCommandBypassActiveSession:
         assert any("handled:agents" in r for r in adapter.sent_responses)
 
     @pytest.mark.asyncio
+    async def test_autopilot_bypasses_guard(self):
+        """/autopilot must bypass so controller intent doesn't interrupt runs."""
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        await adapter.handle_message(_make_event("/autopilot status"))
+
+        assert sk not in adapter._pending_messages
+        assert any("handled:autopilot" in r for r in adapter.sent_responses)
+
+    @pytest.mark.asyncio
     async def test_tasks_alias_bypasses_guard(self):
         """/tasks alias must bypass active-session guard too."""
         adapter = _make_adapter()
@@ -326,7 +338,7 @@ class TestAllResolvableCommandsBypassGuard:
         for cmd in (
             "model", "reasoning", "personality", "voice", "insights", "title",
             "resume", "retry", "undo", "compress", "usage",
-            "reload-mcp", "sethome", "reset",
+            "reload-mcp", "sethome", "reset", "autopilot",
         ):
             assert should_bypass_active_session(cmd) is True, (
                 f"/{cmd} must bypass the active-session guard"
