@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Protocol
 
 from hermes_constants import get_hermes_home
+from gateway.goal_contract import GoalContractError, generate_goal_contract
 
 
 AUTOPILOT_USAGE = (
@@ -726,10 +727,19 @@ def _would_goal_contract(issue: Mapping[str, Any]) -> dict[str, Any]:
     identifier = str(issue.get("identifier") or "")
     title = str(issue.get("title") or "")
     summary = f"Execute Linear {identifier}: {title}".strip()
-    return {
-        "command": f"/goal {summary}; verify Done when before closeout; preserve dry-run side-effect boundaries.",
-        "summary": summary,
-    }
+    try:
+        contract = generate_goal_contract(issue, mode="single-card")
+        return {
+            "command": contract["prompt"],
+            "summary": summary,
+            "mode": contract["mode"],
+        }
+    except GoalContractError as exc:
+        return {
+            "command": f"/goal {summary}; verify Done when before closeout; preserve dry-run side-effect boundaries.",
+            "summary": summary,
+            "blocked_reason": exc.reason,
+        }
 
 
 def _would_work_state(candidate: Mapping[str, Any]) -> dict[str, Any]:
