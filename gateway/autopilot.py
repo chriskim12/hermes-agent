@@ -1044,6 +1044,15 @@ def _format_runtime_result_message(command: AutopilotCommand, materialization: M
     else:
         dry_run = materialization.get("dry_run") or {}
         blocker = dry_run.get("reason") or materialization.get("reason")
+        candidates = dry_run.get("candidates") if isinstance(dry_run, Mapping) else None
+        if candidates:
+            for candidate in candidates[:5]:
+                candidate_id = candidate.get("identifier") or "unknown"
+                candidate_reason = candidate.get("reason") or "unknown"
+                eligible = str(bool(candidate.get("eligible"))).lower()
+                lines.append(
+                    f"Admission candidate: {candidate_id} eligible={eligible} reason={candidate_reason}"
+                )
         if blocker:
             lines.append(f"Blocked/no-op reason: {blocker}")
     return "\n".join(lines)

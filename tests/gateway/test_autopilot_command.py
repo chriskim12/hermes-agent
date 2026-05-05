@@ -972,6 +972,34 @@ def test_runtime_command_on_records_intent_then_runs_one_queue_candidate(tmp_pat
     assert spawner.call_count == 1
 
 
+def test_runtime_command_reports_target_candidate_blocker(tmp_path):
+    store = _state_store(tmp_path)
+    work_state = _FakeWorkStateStore()
+    linear = _FakeLinearClient(
+        {"CH-401": _issue("CH-401", description="## Verification\n- focused tests pass")},
+        queue=[_issue("CH-401", description="## Verification\n- focused tests pass")],
+    )
+    spawner = MagicMock()
+
+    result = handle_autopilot_runtime_command(
+        "CH-401",
+        state_store=store,
+        work_state_store=work_state,
+        linear_client=linear,
+        executor_spawner=spawner,
+        actor="tester",
+        owner_session_id="owner-401",
+    )
+
+    assert result.ok is False
+    assert "Decision: blocked (no_eligible_execution_ready_issue)." in result.message
+    assert "Admission candidate: CH-401 eligible=false reason=missing_done_when" in result.message
+    assert "Blocked/no-op reason: no_eligible_execution_ready_issue" in result.message
+    assert work_state.records == []
+    spawner.assert_not_called()
+
+
+
 def test_runtime_command_keeps_status_and_dry_run_read_only(tmp_path):
     store = _state_store(tmp_path)
     store.set_enabled(True, actor="tester")
