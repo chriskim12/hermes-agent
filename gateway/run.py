@@ -6964,11 +6964,22 @@ class GatewayRunner:
                 message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
             )
-            self._enqueue_fifo(session_key, kickoff_event, adapter)
+            if session_key in self._running_agents:
+                self._enqueue_fifo(session_key, kickoff_event, adapter)
+                dispatch_mode = "queued"
+                proof = "set gateway /goal and queued generated goal text through gateway FIFO"
+            else:
+                task = asyncio.create_task(adapter.handle_message(kickoff_event))
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+                dispatch_mode = "dispatched"
+                proof = "set gateway /goal and dispatched generated goal text as an agent turn"
             return {
                 "session_id": owner_session_id or session_key,
-                "proof": "set gateway /goal and queued generated goal text through gateway FIFO",
-                "queued": True,
+                "proof": proof,
+                "queued": dispatch_mode == "queued",
+                "dispatched": dispatch_mode == "dispatched",
+                "dispatch_mode": dispatch_mode,
                 "work_id": work_id,
                 "selected_issue": selected_issue,
             }

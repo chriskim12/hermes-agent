@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -1033,7 +1034,10 @@ def _make_runner():
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
     )
-    runner.adapters = {Platform.TELEGRAM: MagicMock(send=AsyncMock())}
+    adapter = MagicMock(send=AsyncMock())
+    adapter._pending_messages = {}
+    adapter.handle_message = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: adapter}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
     runner.session_store.get_or_create_session.return_value = SessionEntry(
@@ -1070,6 +1074,7 @@ def _make_runner():
     runner._send_voice_reply = AsyncMock()
     runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
     runner._emit_gateway_run_progress = AsyncMock()
+    runner._background_tasks = set()
     return runner
 
 
@@ -1097,7 +1102,7 @@ async def test_gateway_autopilot_bypasses_running_agent_without_interrupt(monkey
 
 
 @pytest.mark.asyncio
-async def test_gateway_autopilot_target_queues_generated_goal_contract(monkeypatch):
+async def test_gateway_autopilot_target_dispatches_generated_goal_contract_when_session_idle(monkeypatch):
     fake_work_state = _FakeWorkStateStore()
 
     class _StoreFactory:
@@ -1122,7 +1127,6 @@ async def test_gateway_autopilot_target_queues_generated_goal_contract(monkeypat
     adapter = runner.adapters[Platform.TELEGRAM]
     adapter._pending_messages = {}
     event = _make_event("/autopilot CH-401")
-    session_key = build_session_key(event.source)
 
     result = await runner._handle_autopilot_command(event)
 
@@ -1131,11 +1135,14 @@ async def test_gateway_autopilot_target_queues_generated_goal_contract(monkeypat
     assert fake_work_state.records[0].work_id == "CH-401"
     assert fake_work_state.records[0].state == "running"
     assert fake_work_state.records[0].executor_session_id == "sess-1"
-    queued = adapter._pending_messages[session_key]
-    assert not queued.text.startswith("/goal")
-    assert goal_sets == [queued.text]
-    assert "CH-401" in queued.text
-    assert queued.source == event.source
+    await asyncio.sleep(0)
+    adapter.handle_message.assert_awaited_once()
+    dispatched = adapter.handle_message.await_args.args[0]
+    assert not dispatched.text.startswith("/goal")
+    assert goal_sets == [dispatched.text]
+    assert "CH-401" in dispatched.text
+    assert dispatched.source == event.source
+    assert adapter._pending_messages == {}
 
 
 def test_cli_autopilot_dispatch_uses_same_controller(monkeypatch):
