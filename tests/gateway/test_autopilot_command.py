@@ -19,9 +19,11 @@ from gateway.autopilot import (
     AutopilotParseError,
     AutopilotStateStore,
     classify_linear_target,
+    evaluate_autopilot_pr_closeout_gate,
     handle_autopilot_command,
     handle_autopilot_runtime_command,
     parse_autopilot_args,
+    resolve_autopilot_integration_branch,
     run_autopilot_once,
 )
 from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -826,6 +828,9 @@ def test_run_autopilot_once_materializes_one_task_lock_contract_and_executor(tmp
     assert record.state == "running"
     assert record.executor_session_id == "exec-1"
     assert record.proof == "spawned"
+    assert record.close_authority == "autopilot_pr_closeout_gate"
+    assert record.cleanup_required is True
+    assert record.cleanup_proof == "pending_autopilot_pr_closeout_cleanup"
     assert "Execute Linear CH-401" in record.objective
     spawner.assert_called_once()
     spawn_kwargs = spawner.call_args.kwargs
@@ -1192,3 +1197,124 @@ def test_cli_autopilot_dispatch_uses_same_controller(monkeypatch):
     assert cli.process_command("/autopilot dry-run CH-385") is True
     assert calls == [{"raw_args": "dry-run CH-385", "actor": "local-cli"}]
     assert captured == ["cli autopilot handled"]
+
+
+def _valid_pr_closeout_evidence(**overrides):
+    evidence = {
+        "commit": "1af1c992b4fe",
+        "remote_branch": "feature/CH-309-env-authority-coverage",
+        "branch_pushed": True,
+        "pr_created": True,
+        "pr_verified": True,
+        "pr_url": "https://github.com/chriskim12/hermes-agent/pull/173",
+        "pr_base": "main",
+        "pr_head": "feature/CH-309-env-authority-coverage",
+        "checks_passed": True,
+        "cleanup_done": True,
+        "cleanup_proof": "task_owned_worktree_removed",
+        "linear_evidence_comment_id": "comment-123",
+    }
+    evidence.update(overrides)
+    return evidence
+
+
+def test_autopilot_closeout_gate_blocks_linear_done_without_pr_and_cleanup_evidence():
+    gate = evaluate_autopilot_pr_closeout_gate(
+        evidence={"commit": "1af1c992b4fe"},
+        repo_name="hermes-agent",
+        remote_default_branch="main",
+    )
+
+    assert gate["allowed"] is False
+    assert gate["status"] == "blocked"
+    assert gate["linear_done_mutated"] is False
+    assert gate["expected_integration_branch"] == "main"
+    assert "pr_url" in gate["missing"]
+    assert "branch_pushed" in gate["missing"]
+    assert "cleanup_done" in gate["missing"]
+    assert "cleanup_proof" in gate["missing"]
+
+
+def test_autopilot_closeout_gate_allows_verified_pr_and_cleanup_to_integration_branch():
+    gate = evaluate_autopilot_pr_closeout_gate(
+        evidence=_valid_pr_closeout_evidence(),
+        repo_name="hermes-agent",
+        remote_default_branch="main",
+    )
+
+    assert gate == {
+        "allowed": True,
+        "status": "allowed",
+        "reason": "autopilot_pr_cleanup_evidence_satisfied",
+        "mode": "autopilot",
+        "requires_pr": True,
+        "expected_integration_branch": "main",
+        "linear_done_mutated": False,
+        "missing": [],
+        "violations": [],
+    }
+
+
+def test_autopilot_closeout_gate_uses_dailychingu_develop_not_main():
+    assert resolve_autopilot_integration_branch(repo_name="DailyChingu", remote_default_branch="main") == "develop"
+
+    gate = evaluate_autopilot_pr_closeout_gate(
+        evidence=_valid_pr_closeout_evidence(pr_base="main"),
+        repo_name="DailyChingu",
+        remote_default_branch="main",
+    )
+
+    assert gate["allowed"] is False
+    assert gate["expected_integration_branch"] == "develop"
+    assert "wrong_pr_base:expected=develop:actual=main" in gate["violations"]
+
+    allowed = evaluate_autopilot_pr_closeout_gate(
+        evidence=_valid_pr_closeout_evidence(pr_base="develop"),
+        repo_name="DailyChingu",
+        remote_default_branch="main",
+    )
+    assert allowed["allowed"] is True
+
+
+def test_autopilot_closeout_gate_rejects_pr_head_branch_mismatch_and_bad_url():
+    gate = evaluate_autopilot_pr_closeout_gate(
+        evidence=_valid_pr_closeout_evidence(
+            pr_url="https://example.com/not-a-github-pr",
+            pr_head="different-branch",
+        ),
+        repo_name="hermes-agent",
+        remote_default_branch="main",
+    )
+
+    assert gate["allowed"] is False
+    assert "pr_url_not_github_pull_url" in gate["violations"]
+    assert "pr_head_remote_branch_mismatch" in gate["violations"]
+
+def test_autopilot_closeout_gate_dailychingu_develop_cannot_be_overridden_by_policy():
+    gate = evaluate_autopilot_pr_closeout_gate(
+        evidence=_valid_pr_closeout_evidence(pr_base="main"),
+        repo_name="DailyChingu",
+        remote_default_branch="main",
+        repo_policy={"integration_branch": "main"},
+    )
+
+    assert gate["allowed"] is False
+    assert gate["expected_integration_branch"] == "develop"
+    assert "wrong_pr_base:expected=develop:actual=main" in gate["violations"]
+
+
+def test_autopilot_closeout_gate_rejects_pr_url_for_wrong_repo():
+    gate = evaluate_autopilot_pr_closeout_gate(
+        evidence=_valid_pr_closeout_evidence(
+            pr_url="https://github.com/someone-else/hermes-agent/pull/173"
+        ),
+        repo_name="hermes-agent",
+        remote_default_branch="main",
+        expected_repo_full_name="chriskim12/hermes-agent",
+    )
+
+    assert gate["allowed"] is False
+    assert (
+        "pr_url_repo_mismatch:expected=chriskim12/hermes-agent:actual=someone-else/hermes-agent"
+        in gate["violations"]
+    )

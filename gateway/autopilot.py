@@ -39,6 +39,158 @@ ACTION_ONE_SHOT = "one_shot"
 
 READ_ONLY_ACTIONS = {ACTION_STATUS, ACTION_DRY_RUN}
 
+AUTOPILOT_CLOSEOUT_MODE = "autopilot"
+AUTOPILOT_PR_CLOSEOUT_REQUIRED_REASON = "autopilot_pr_cleanup_evidence_required"
+_DAILYCHINGU_REPO_NAMES = frozenset({"dailychingu", "daily-chingu", "dc"})
+_RELEASE_ONLY_BASES = frozenset({"prod", "production"})
+_PR_URL_RE = re.compile(r"^https://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/pull/\d+/?$")
+_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
+
+
+def resolve_autopilot_integration_branch(
+    *,
+    repo_name: Optional[str] = None,
+    remote_default_branch: Optional[str] = None,
+    repo_policy: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """Return the PR base branch AUTOPILOT closeout should target.
+
+    DailyChingu integrates into ``develop`` by policy; release/prod promotion to
+    ``main``/``prod`` stays outside the normal AUTOPILOT implementation closeout.
+    Other repos use explicit policy first, then live remote default branch.
+    """
+
+    policy = repo_policy or {}
+    normalized_repo = str(repo_name or "").strip().lower().replace("_", "-")
+    if normalized_repo in _DAILYCHINGU_REPO_NAMES:
+        return "develop"
+    explicit = str(policy.get("integration_branch") or "").strip()
+    if explicit:
+        return explicit
+    default_branch = str(remote_default_branch or policy.get("default_branch") or "").strip()
+    return default_branch or "main"
+
+
+def _truthy_evidence(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    text = str(value).strip().lower()
+    return text in {"1", "true", "yes", "y", "ok", "passed", "pass", "clean", "done", "verified"}
+
+
+def evaluate_autopilot_pr_closeout_gate(
+    *,
+    mode: str = AUTOPILOT_CLOSEOUT_MODE,
+    evidence: Optional[Mapping[str, Any]] = None,
+    repo_name: Optional[str] = None,
+    remote_default_branch: Optional[str] = None,
+    repo_policy: Optional[Mapping[str, Any]] = None,
+    expected_repo_full_name: Optional[str] = None,
+    release_approved: bool = False,
+) -> dict[str, Any]:
+    """Fail closed unless AUTOPILOT closeout has PR and cleanup evidence.
+
+    This is the deterministic guard to run immediately before any future Linear
+    Done mutation for AUTOPILOT implementation work.  It does not create the PR,
+    push branches, clean worktrees, or mutate Linear; it only decides whether the
+    evidence is sufficient for the controller to proceed.
+    """
+
+    closeout = dict(evidence or {})
+    normalized_mode = str(mode or "").strip().lower()
+    policy = repo_policy or {}
+    expected_base = resolve_autopilot_integration_branch(
+        repo_name=repo_name or closeout.get("repo_name"),
+        remote_default_branch=remote_default_branch or closeout.get("remote_default_branch"),
+        repo_policy=policy,
+    )
+    expected_repo = str(
+        expected_repo_full_name or policy.get("github_repo") or policy.get("repo_full_name") or ""
+    ).strip().lower()
+    result: dict[str, Any] = {
+        "allowed": False,
+        "status": "blocked",
+        "reason": AUTOPILOT_PR_CLOSEOUT_REQUIRED_REASON,
+        "mode": normalized_mode,
+        "requires_pr": normalized_mode == AUTOPILOT_CLOSEOUT_MODE,
+        "expected_integration_branch": expected_base,
+        "linear_done_mutated": False,
+        "missing": [],
+        "violations": [],
+    }
+
+    if normalized_mode != AUTOPILOT_CLOSEOUT_MODE:
+        result.update(
+            {
+                "allowed": True,
+                "status": "not_applicable",
+                "reason": "non_autopilot_closeout_gate_not_applicable",
+                "requires_pr": False,
+            }
+        )
+        return result
+
+    required_text_fields = {
+        "commit": closeout.get("commit") or closeout.get("ref"),
+        "remote_branch": closeout.get("remote_branch") or closeout.get("branch"),
+        "pr_url": closeout.get("pr_url") or closeout.get("pull_request_url"),
+        "pr_base": closeout.get("pr_base") or closeout.get("base_branch"),
+        "pr_head": closeout.get("pr_head") or closeout.get("head_branch"),
+        "linear_evidence_comment_id": closeout.get("linear_evidence_comment_id")
+        or closeout.get("linear_comment_id"),
+        "cleanup_proof": closeout.get("cleanup_proof"),
+    }
+    for field, value in required_text_fields.items():
+        if not str(value or "").strip():
+            result["missing"].append(field)
+
+    required_bool_fields = {
+        "branch_pushed": closeout.get("branch_pushed"),
+        "pr_created": closeout.get("pr_created"),
+        "pr_verified": closeout.get("pr_verified"),
+        "checks_passed": closeout.get("checks_passed"),
+        "cleanup_done": closeout.get("cleanup_done") or closeout.get("cleanup_status"),
+    }
+    for field, value in required_bool_fields.items():
+        if not _truthy_evidence(value):
+            result["missing"].append(field)
+
+    commit = str(required_text_fields["commit"] or "").strip()
+    if commit and not _SHA_RE.fullmatch(commit):
+        result["violations"].append("commit_ref_not_sha_like")
+
+    pr_url = str(required_text_fields["pr_url"] or "").strip()
+    pr_match = _PR_URL_RE.fullmatch(pr_url) if pr_url else None
+    if pr_url and not pr_match:
+        result["violations"].append("pr_url_not_github_pull_url")
+    elif pr_match and expected_repo:
+        actual_repo = f"{pr_match.group('owner')}/{pr_match.group('repo')}".lower()
+        if actual_repo != expected_repo:
+            result["violations"].append(
+                f"pr_url_repo_mismatch:expected={expected_repo}:actual={actual_repo}"
+            )
+
+    pr_base = str(required_text_fields["pr_base"] or "").strip()
+    if pr_base and pr_base != expected_base:
+        result["violations"].append(f"wrong_pr_base:expected={expected_base}:actual={pr_base}")
+
+    pr_head = str(required_text_fields["pr_head"] or "").strip()
+    remote_branch = str(required_text_fields["remote_branch"] or "").strip()
+    if pr_head and remote_branch and pr_head != remote_branch:
+        result["violations"].append("pr_head_remote_branch_mismatch")
+
+    if pr_base in _RELEASE_ONLY_BASES and not release_approved:
+        result["violations"].append(f"release_base_requires_explicit_approval:{pr_base}")
+
+    if result["missing"] or result["violations"]:
+        return result
+
+    result.update({"allowed": True, "status": "allowed", "reason": "autopilot_pr_cleanup_evidence_satisfied"})
+    return result
+
+
 
 class AutopilotParseError(ValueError):
     """Invalid /autopilot shape.  The caller must fail closed."""
@@ -1040,7 +1192,10 @@ def _format_runtime_result_message(command: AutopilotCommand, materialization: M
         f"linear_done_mutated={str(bool(materialization.get('linear_done_mutated'))).lower()}."
     )
     if materialization.get("status") == "started":
-        lines.append("Closeout guard: Linear Done remains forbidden until executor evidence verifies the Done criteria.")
+        lines.append(
+            "Closeout guard: Linear Done remains forbidden until executor evidence, "
+            "verified PR to the repo integration branch, and cleanup proof satisfy the closeout gate."
+        )
     else:
         dry_run = materialization.get("dry_run") or {}
         blocker = dry_run.get("reason") or materialization.get("reason")
@@ -1178,6 +1333,9 @@ def run_autopilot_once(
         last_progress_at=event_at,
         next_action="Spawn selected executor from generated /goal contract",
         proof="work_state lock created before executor spawn",
+        close_authority="autopilot_pr_closeout_gate",
+        cleanup_required=True,
+        cleanup_proof="pending_autopilot_pr_closeout_cleanup",
     )
     if work_state_store is None or not hasattr(work_state_store, "upsert"):
         return {
