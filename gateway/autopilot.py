@@ -1,9 +1,10 @@
 """Hermes /autopilot command controller surface.
 
-CH-385 deliberately stops at the command/plugin entrypoint and deterministic
-classification layer.  It may record controller intent (ON/OFF) and read Linear /
-work_state truth, but it must not spawn executors, bypass admission, or mark
-Linear cards Done.
+CH-385 deliberately stopped at the command/plugin entrypoint and deterministic
+classification layer.  CH-389 adds the bounded one-task materialization helper:
+controller intent + Linear admission can create one work_state lock and invoke a
+caller-supplied executor spawner, while still refusing Linear Done mutations and
+multi-task continuation.
 """
 
 from __future__ import annotations
@@ -1001,6 +1002,208 @@ def _format_result_message(decision: Mapping[str, Any]) -> str:
     )
     lines.append("Side effects: executor_spawned=false, linear_done_mutated=false.")
     return "\n".join(lines)
+
+
+def run_autopilot_once(
+    *,
+    state_store: Optional[AutopilotStateStore] = None,
+    work_state_store: Any = None,
+    linear_client: Optional[LinearIssueClient] = None,
+    executor_spawner: Optional[Callable[..., Any]] = None,
+    actor: Optional[str] = None,
+    owner_session_id: Optional[str] = None,
+    target_id: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Materialize at most one admitted autopilot task.
+
+    This is the CH-389 controller boundary below the slash-command entrypoint:
+    it reuses dry-run admission, writes exactly one work_state lock, then calls a
+    caller-supplied executor spawner with the generated `/goal` contract.  It
+    never mutates Linear Done and never loops to a second task.
+    """
+
+    event_at = now or _utcnow()
+    store = state_store or AutopilotStateStore()
+    state = store.status()
+    if not target_id and not bool(state.get("enabled")):
+        return {
+            "status": "paused",
+            "reason": "controller_disabled_noop",
+            "selected_issue": None,
+            "work_id": None,
+            "owner_session_id": owner_session_id,
+            "work_state_written": False,
+            "executor_spawned": False,
+            "linear_done_mutated": False,
+            "generated_at": event_at.isoformat(),
+        }
+    if executor_spawner is None:
+        return {
+            "status": "blocked",
+            "reason": "executor_spawner_missing_fail_closed",
+            "selected_issue": None,
+            "work_id": None,
+            "owner_session_id": owner_session_id,
+            "work_state_written": False,
+            "executor_spawned": False,
+            "linear_done_mutated": False,
+            "generated_at": event_at.isoformat(),
+        }
+
+    client = linear_client or EnvLinearIssueClient()
+    command = AutopilotCommand(
+        action=ACTION_DRY_RUN,
+        target_id=target_id.upper() if target_id else None,
+        raw_args=(f"dry-run {target_id.upper()}" if target_id else "dry-run"),
+    )
+    dry_run = evaluate_dry_run_admission(
+        command=command,
+        state=state,
+        linear_client=client,
+        work_state_store=work_state_store,
+    )
+    if dry_run.get("status") != "would_run":
+        return {
+            "status": str(dry_run.get("status") or "blocked"),
+            "reason": str(dry_run.get("reason") or "admission_refused"),
+            "selected_issue": dry_run.get("selected_issue"),
+            "work_id": None,
+            "owner_session_id": owner_session_id,
+            "dry_run": dry_run,
+            "work_state_written": False,
+            "executor_spawned": False,
+            "linear_done_mutated": False,
+            "generated_at": event_at.isoformat(),
+        }
+
+    selected_issue = dry_run.get("selected_issue") or {}
+    work_id = str(selected_issue.get("identifier") or "").strip()
+    if not work_id:
+        return {
+            "status": "blocked",
+            "reason": "selected_issue_missing_identifier_fail_closed",
+            "selected_issue": selected_issue,
+            "work_id": None,
+            "owner_session_id": owner_session_id,
+            "dry_run": dry_run,
+            "work_state_written": False,
+            "executor_spawned": False,
+            "linear_done_mutated": False,
+            "generated_at": event_at.isoformat(),
+        }
+    owner_session = owner_session_id or f"autopilot:{work_id}"
+    goal = dry_run.get("would_goal_contract") or {}
+    goal_contract = str(goal.get("command") or "")
+    if not goal_contract.startswith("/goal"):
+        return {
+            "status": "blocked",
+            "reason": "goal_contract_unavailable_fail_closed",
+            "selected_issue": selected_issue,
+            "work_id": work_id,
+            "owner_session_id": owner_session,
+            "dry_run": dry_run,
+            "work_state_written": False,
+            "executor_spawned": False,
+            "linear_done_mutated": False,
+            "generated_at": event_at.isoformat(),
+        }
+
+    from gateway.work_state import WorkRecord
+
+    record = WorkRecord(
+        work_id=work_id,
+        title=str(selected_issue.get("title") or work_id),
+        objective=str(goal.get("summary") or f"Execute Linear {work_id}"),
+        owner="hermes",
+        executor="hermes",
+        mode="autopilot",
+        owner_session_id=owner_session,
+        state="created",
+        started_at=event_at,
+        last_progress_at=event_at,
+        next_action="Spawn selected executor from generated /goal contract",
+        proof="work_state lock created before executor spawn",
+    )
+    if work_state_store is None or not hasattr(work_state_store, "upsert"):
+        return {
+            "status": "blocked",
+            "reason": "work_state_store_missing_upsert_fail_closed",
+            "selected_issue": selected_issue,
+            "work_id": work_id,
+            "owner_session_id": owner_session,
+            "dry_run": dry_run,
+            "work_state_written": False,
+            "executor_spawned": False,
+            "linear_done_mutated": False,
+            "generated_at": event_at.isoformat(),
+        }
+    work_state_store.upsert(record)
+
+    try:
+        spawn_result = executor_spawner(
+            goal_contract=goal_contract,
+            work_id=work_id,
+            owner_session_id=owner_session,
+            selected_issue=selected_issue,
+            actor=actor,
+            dry_run=dry_run,
+        )
+    except Exception as exc:  # fail closed and leave an auditable blocked record
+        blocked_reason = f"executor_spawn_failed:{type(exc).__name__}:{exc}"
+        if hasattr(work_state_store, "update_record"):
+            work_state_store.update_record(
+                work_id,
+                owner_session,
+                state="blocked",
+                last_progress_at=event_at,
+                blocked_reason=blocked_reason,
+                proof=blocked_reason,
+                usable_outcome="blocked",
+                close_disposition="close",
+                next_action="Executor spawn failed; operator review required before retry",
+            )
+        return {
+            "status": "blocked",
+            "reason": "executor_spawn_failed",
+            "selected_issue": selected_issue,
+            "work_id": work_id,
+            "owner_session_id": owner_session,
+            "dry_run": dry_run,
+            "work_state_written": True,
+            "executor_spawned": False,
+            "linear_done_mutated": False,
+            "error": blocked_reason,
+            "generated_at": event_at.isoformat(),
+        }
+
+    spawn_payload = spawn_result if isinstance(spawn_result, Mapping) else {"result": spawn_result}
+    executor_session_id = spawn_payload.get("session_id") or spawn_payload.get("executor_session_id")
+    proof = str(spawn_payload.get("proof") or "executor spawned from generated /goal contract")
+    if hasattr(work_state_store, "update_record"):
+        work_state_store.update_record(
+            work_id,
+            owner_session,
+            state="running",
+            executor_session_id=str(executor_session_id) if executor_session_id else None,
+            proof=proof,
+            last_progress_at=event_at,
+            next_action="Await executor evidence; do not mark Linear Done without verification",
+        )
+    return {
+        "status": "started",
+        "reason": "one_task_autopilot_started",
+        "selected_issue": selected_issue,
+        "work_id": work_id,
+        "owner_session_id": owner_session,
+        "executor_session_id": executor_session_id,
+        "dry_run": dry_run,
+        "work_state_written": True,
+        "executor_spawned": True,
+        "linear_done_mutated": False,
+        "spawn_result": spawn_payload,
+        "generated_at": event_at.isoformat(),
+    }
 
 
 def handle_autopilot_command(

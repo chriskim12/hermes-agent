@@ -20,6 +20,7 @@ from gateway.autopilot import (
     classify_linear_target,
     handle_autopilot_command,
     parse_autopilot_args,
+    run_autopilot_once,
 )
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
@@ -50,9 +51,34 @@ class _FakeWorkStateStore:
     def __init__(self, records=None):
         self.records = records or []
         self.resolve_calls = []
+        self.upsert_calls = []
+        self.update_calls = []
 
     def list_records(self):
         return self.records
+
+    def upsert(self, record):
+        self.upsert_calls.append(record)
+        self.records = [
+            existing
+            for existing in self.records
+            if not (
+                existing.work_id == record.work_id
+                and existing.owner_session_id == record.owner_session_id
+            )
+        ]
+        self.records.append(record)
+
+    def update_record(self, work_id: str, owner_session_id: str, **updates):
+        self.update_calls.append(
+            {"work_id": work_id, "owner_session_id": owner_session_id, "updates": updates}
+        )
+        for record in self.records:
+            if record.work_id == work_id and record.owner_session_id == owner_session_id:
+                for key, value in updates.items():
+                    setattr(record, key, value)
+                return True
+        return False
 
     def resolve_delegated_signal_candidate(self, *, work_id: str, live_only: bool):
         self.resolve_calls.append({"work_id": work_id, "live_only": live_only})
@@ -762,6 +788,131 @@ def test_dry_run_forbidden_side_effect_boundary_is_explicit(tmp_path):
     assert result.decision["dry_run"]["would_create_work_state"]["work_id"] == "CH-401"
     assert store.status()["enabled"] is True
     spawner.assert_not_called()
+
+
+def test_run_autopilot_once_materializes_one_task_lock_contract_and_executor(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    work_state = _FakeWorkStateStore()
+    linear = _FakeLinearClient({}, queue=[_issue("CH-401")])
+    spawner = MagicMock(return_value={"session_id": "exec-1", "proof": "spawned"})
+    now = datetime(2026, 5, 5, 5, 0, tzinfo=timezone.utc)
+
+    result = run_autopilot_once(
+        state_store=store,
+        work_state_store=work_state,
+        linear_client=linear,
+        executor_spawner=spawner,
+        actor="tester",
+        owner_session_id="owner-1",
+        now=now,
+    )
+
+    assert result["status"] == "started"
+    assert result["selected_issue"]["identifier"] == "CH-401"
+    assert result["work_state_written"] is True
+    assert result["executor_spawned"] is True
+    assert result["linear_done_mutated"] is False
+    assert result["work_id"] == "CH-401"
+    assert result["owner_session_id"] == "owner-1"
+    assert len(work_state.upsert_calls) == 1
+    record = work_state.records[0]
+    assert record.work_id == "CH-401"
+    assert record.owner == "hermes"
+    assert record.executor == "hermes"
+    assert record.mode == "autopilot"
+    assert record.state == "running"
+    assert record.executor_session_id == "exec-1"
+    assert record.proof == "spawned"
+    assert "Execute Linear CH-401" in record.objective
+    spawner.assert_called_once()
+    spawn_kwargs = spawner.call_args.kwargs
+    assert spawn_kwargs["work_id"] == "CH-401"
+    assert spawn_kwargs["owner_session_id"] == "owner-1"
+    assert spawn_kwargs["goal_contract"].startswith("/goal")
+
+
+def test_run_autopilot_once_refuses_when_controller_off_without_queue_scan(tmp_path):
+    store = _state_store(tmp_path)
+    work_state = _FakeWorkStateStore()
+    linear = _FakeLinearClient({}, queue=[_issue("CH-401")])
+    spawner = MagicMock()
+
+    result = run_autopilot_once(
+        state_store=store,
+        work_state_store=work_state,
+        linear_client=linear,
+        executor_spawner=spawner,
+        actor="tester",
+        owner_session_id="owner-1",
+    )
+
+    assert result["status"] == "paused"
+    assert result["reason"] == "controller_disabled_noop"
+    assert result["work_state_written"] is False
+    assert result["executor_spawned"] is False
+    assert result["linear_done_mutated"] is False
+    assert linear.queue_calls == []
+    spawner.assert_not_called()
+
+
+def test_run_autopilot_once_rolls_back_lock_when_executor_spawn_fails(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    work_state = _FakeWorkStateStore()
+    linear = _FakeLinearClient({}, queue=[_issue("CH-401")])
+    spawner = MagicMock(side_effect=RuntimeError("executor unavailable"))
+
+    result = run_autopilot_once(
+        state_store=store,
+        work_state_store=work_state,
+        linear_client=linear,
+        executor_spawner=spawner,
+        actor="tester",
+        owner_session_id="owner-1",
+    )
+
+    assert result["status"] == "blocked"
+    assert result["reason"] == "executor_spawn_failed"
+    assert result["work_state_written"] is True
+    assert result["executor_spawned"] is False
+    assert result["linear_done_mutated"] is False
+    record = work_state.records[0]
+    assert record.state == "blocked"
+    assert record.close_disposition == "close"
+    assert record.usable_outcome == "blocked"
+    assert "executor_spawn_failed" in record.blocked_reason
+
+
+def test_run_autopilot_once_off_after_run_blocks_next_start(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    work_state = _FakeWorkStateStore()
+    linear = _FakeLinearClient({}, queue=[_issue("CH-401"), _issue("CH-402")])
+    spawner = MagicMock(return_value={"session_id": "exec-1", "proof": "spawned"})
+
+    first = run_autopilot_once(
+        state_store=store,
+        work_state_store=work_state,
+        linear_client=linear,
+        executor_spawner=spawner,
+        actor="tester",
+        owner_session_id="owner-1",
+    )
+    handle_autopilot_command("OFF", state_store=store, work_state_store=work_state, actor="tester")
+    second = run_autopilot_once(
+        state_store=store,
+        work_state_store=work_state,
+        linear_client=linear,
+        executor_spawner=spawner,
+        actor="tester",
+        owner_session_id="owner-2",
+    )
+
+    assert first["status"] == "started"
+    assert second["status"] == "paused"
+    assert second["work_state_written"] is False
+    assert spawner.call_count == 1
 
 
 def test_command_registry_exposes_autopilot_to_gateway_surfaces():
