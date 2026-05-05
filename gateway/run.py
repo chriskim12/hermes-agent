@@ -6921,19 +6921,65 @@ class GatewayRunner:
         return output or "(no output)"
 
     async def _handle_autopilot_command(self, event: MessageEvent) -> str:
-        """Handle /autopilot command using the fail-closed controller entrypoint."""
-        from gateway.autopilot import handle_autopilot_command
+        """Handle /autopilot through the live runtime entrypoint."""
+        from gateway.autopilot import handle_autopilot_runtime_command
+        from gateway.work_state import WorkStateStore
 
         raw_args = event.get_command_args()
         source = getattr(event, "source", None)
         actor = None
+        adapter = None
+        session_key = None
+        owner_session_id = None
         if source is not None:
             actor = (
                 getattr(source, "user_name", None)
                 or getattr(source, "user_id", None)
                 or getattr(source, "description", None)
             )
-        result = handle_autopilot_command(raw_args, actor=actor)
+            adapter = self.adapters.get(source.platform)
+            session_key = self._session_key_for_source(source)
+            try:
+                session_entry = self.session_store.get_or_create_session(source)
+                owner_session_id = getattr(session_entry, "session_id", None) or session_key
+            except Exception:
+                owner_session_id = session_key
+
+        def _spawn_goal_contract(*, goal_contract, work_id, owner_session_id, selected_issue, actor=None, dry_run=None):
+            if source is None or adapter is None or not session_key:
+                raise RuntimeError("gateway_autopilot_executor_queue_unavailable")
+            goal_text = str(goal_contract or "").strip()
+            if goal_text.startswith("/goal"):
+                goal_text = goal_text[len("/goal"):].strip()
+            if not goal_text:
+                raise RuntimeError("gateway_autopilot_goal_contract_empty")
+            mgr, _session_entry = self._get_goal_manager_for_event(event)
+            if mgr is None:
+                raise RuntimeError("gateway_autopilot_goal_manager_unavailable")
+            goal_state = mgr.set(goal_text)
+            kickoff_event = MessageEvent(
+                text=goal_state.goal,
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id=event.message_id,
+                channel_prompt=event.channel_prompt,
+            )
+            self._enqueue_fifo(session_key, kickoff_event, adapter)
+            return {
+                "session_id": owner_session_id or session_key,
+                "proof": "set gateway /goal and queued generated goal text through gateway FIFO",
+                "queued": True,
+                "work_id": work_id,
+                "selected_issue": selected_issue,
+            }
+
+        result = handle_autopilot_runtime_command(
+            raw_args,
+            actor=actor,
+            work_state_store=WorkStateStore(),
+            executor_spawner=_spawn_goal_contract,
+            owner_session_id=owner_session_id,
+        )
         return result.message
 
     async def _handle_status_command(self, event: MessageEvent) -> str:

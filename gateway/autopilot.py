@@ -1004,6 +1004,51 @@ def _format_result_message(decision: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_runtime_result_message(command: AutopilotCommand, materialization: Mapping[str, Any]) -> str:
+    action = command.action.replace("_", "-")
+    target = f" {command.target_id}" if command.target_id else ""
+    lines = [f"/autopilot {action}{target}"]
+    lines.append("Mode: execution — live admission must materialize lock/goal before executor kickoff.")
+    lines.append(
+        "Decision: "
+        f"{materialization.get('status', 'unknown')} "
+        f"({materialization.get('reason', 'no_reason')})."
+    )
+    selected = materialization.get("selected_issue") or {}
+    if selected:
+        lines.append(
+            "Selected issue: "
+            f"{selected.get('identifier')} — {selected.get('title', '')}".rstrip()
+        )
+    else:
+        lines.append("Selected issue: none")
+    work_id = materialization.get("work_id")
+    owner_session_id = materialization.get("owner_session_id")
+    if work_id:
+        lines.append(f"work_state lock: {work_id} owner_session={owner_session_id}")
+    else:
+        lines.append("work_state lock: none")
+    executor_session_id = materialization.get("executor_session_id")
+    if executor_session_id:
+        lines.append(f"Executor session: {executor_session_id}")
+    else:
+        lines.append("Executor session: none")
+    lines.append(
+        "Side effects: "
+        f"work_state_written={str(bool(materialization.get('work_state_written'))).lower()}, "
+        f"executor_spawned={str(bool(materialization.get('executor_spawned'))).lower()}, "
+        f"linear_done_mutated={str(bool(materialization.get('linear_done_mutated'))).lower()}."
+    )
+    if materialization.get("status") == "started":
+        lines.append("Closeout guard: Linear Done remains forbidden until executor evidence verifies the Done criteria.")
+    else:
+        dry_run = materialization.get("dry_run") or {}
+        blocker = dry_run.get("reason") or materialization.get("reason")
+        if blocker:
+            lines.append(f"Blocked/no-op reason: {blocker}")
+    return "\n".join(lines)
+
+
 def run_autopilot_once(
     *,
     state_store: Optional[AutopilotStateStore] = None,
@@ -1302,6 +1347,91 @@ def handle_autopilot_command(
         ok=True,
         command=command,
         message=_format_result_message(decision),
+        decision=decision,
+    )
+
+
+def handle_autopilot_runtime_command(
+    raw_args: str,
+    *,
+    actor: Optional[str] = None,
+    state_store: Optional[AutopilotStateStore] = None,
+    work_state_store: Any = None,
+    linear_client: Optional[LinearIssueClient] = None,
+    executor_spawner: Optional[Callable[..., Any]] = None,
+    owner_session_id: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> AutopilotResult:
+    """Handle the live operator /autopilot path.
+
+    Read-only/status/OFF commands keep the CH-385 fail-closed controller
+    behavior.  Execution commands (``ON`` and targeted one-shot ``CH-123``)
+    must traverse ``run_autopilot_once`` so the user-facing entrypoint proves
+    the same path as the materialization helper: live admission -> work_state
+    lock -> generated /goal contract -> executor spawner.  Linear Done remains
+    forbidden here.
+    """
+
+    try:
+        command = parse_autopilot_args(raw_args)
+    except AutopilotParseError as exc:
+        return handle_autopilot_command(
+            raw_args,
+            actor=actor,
+            state_store=state_store,
+            work_state_store=work_state_store,
+            linear_client=linear_client,
+            now=now,
+        )
+
+    if command.action in {ACTION_STATUS, ACTION_DRY_RUN, ACTION_DISABLE}:
+        return handle_autopilot_command(
+            raw_args,
+            actor=actor,
+            state_store=state_store,
+            work_state_store=work_state_store,
+            linear_client=linear_client,
+            now=now,
+        )
+
+    store = state_store or AutopilotStateStore()
+    state_written = False
+    if command.action == ACTION_ENABLE:
+        store.set_enabled(True, actor=actor, now=now)
+        state_written = True
+
+    materialization = run_autopilot_once(
+        state_store=store,
+        work_state_store=work_state_store,
+        linear_client=linear_client,
+        executor_spawner=executor_spawner,
+        actor=actor,
+        owner_session_id=owner_session_id,
+        target_id=command.target_id,
+        now=now,
+    )
+    decision: dict[str, Any] = {
+        "ok": materialization.get("status") == "started",
+        "fail_closed": materialization.get("status") != "started",
+        "command": {
+            "action": command.action,
+            "target_id": command.target_id,
+            "read_only": False,
+        },
+        "materialization": materialization,
+        "side_effects": {
+            "state_written": state_written,
+            "work_state_written": bool(materialization.get("work_state_written")),
+            "executor_spawned": bool(materialization.get("executor_spawned")),
+            "linear_done_mutated": bool(materialization.get("linear_done_mutated")),
+        },
+        "generated_at": (now or _utcnow()).isoformat(),
+    }
+    return AutopilotResult(
+        ok=bool(decision["ok"]),
+        command=command,
+        fail_closed=bool(decision["fail_closed"]),
+        message=_format_runtime_result_message(command, materialization),
         decision=decision,
     )
 

@@ -19,6 +19,7 @@ from gateway.autopilot import (
     AutopilotStateStore,
     classify_linear_target,
     handle_autopilot_command,
+    handle_autopilot_runtime_command,
     parse_autopilot_args,
     run_autopilot_once,
 )
@@ -915,6 +916,85 @@ def test_run_autopilot_once_off_after_run_blocks_next_start(tmp_path):
     assert spawner.call_count == 1
 
 
+def test_runtime_command_targeted_one_shot_materializes_lock_goal_and_executor(tmp_path):
+    store = _state_store(tmp_path)
+    work_state = _FakeWorkStateStore()
+    linear = _FakeLinearClient({"CH-401": _issue("CH-401")}, queue=[_issue("CH-401")])
+    spawner = MagicMock(return_value={"session_id": "exec-401", "proof": "queued"})
+
+    result = handle_autopilot_runtime_command(
+        "CH-401",
+        state_store=store,
+        work_state_store=work_state,
+        linear_client=linear,
+        executor_spawner=spawner,
+        actor="tester",
+        owner_session_id="owner-401",
+    )
+
+    assert result.ok is True
+    assert result.decision["side_effects"] == {
+        "state_written": False,
+        "work_state_written": True,
+        "executor_spawned": True,
+        "linear_done_mutated": False,
+    }
+    assert result.decision["materialization"]["work_id"] == "CH-401"
+    assert work_state.records[0].state == "running"
+    assert work_state.records[0].executor_session_id == "exec-401"
+    spawner.assert_called_once()
+    assert spawner.call_args.kwargs["goal_contract"].startswith("/goal")
+    assert "Mode: execution" in result.message
+
+
+def test_runtime_command_on_records_intent_then_runs_one_queue_candidate(tmp_path):
+    store = _state_store(tmp_path)
+    work_state = _FakeWorkStateStore()
+    linear = _FakeLinearClient({}, queue=[_issue("CH-401"), _issue("CH-402")])
+    spawner = MagicMock(return_value={"session_id": "exec-queue", "proof": "queued"})
+
+    result = handle_autopilot_runtime_command(
+        "ON",
+        state_store=store,
+        work_state_store=work_state,
+        linear_client=linear,
+        executor_spawner=spawner,
+        actor="tester",
+        owner_session_id="owner-on",
+    )
+
+    assert store.status()["enabled"] is True
+    assert result.ok is True
+    assert result.decision["side_effects"]["state_written"] is True
+    assert result.decision["materialization"]["selected_issue"]["identifier"] == "CH-401"
+    assert [record.work_id for record in work_state.records] == ["CH-401"]
+    assert spawner.call_count == 1
+
+
+def test_runtime_command_keeps_status_and_dry_run_read_only(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    work_state = _FakeWorkStateStore()
+    linear = _FakeLinearClient({}, queue=[_issue("CH-401")])
+    spawner = MagicMock()
+
+    result = handle_autopilot_runtime_command(
+        "dry-run",
+        state_store=store,
+        work_state_store=work_state,
+        linear_client=linear,
+        executor_spawner=spawner,
+        actor="tester",
+    )
+
+    assert result.ok is True
+    assert result.command.action == ACTION_DRY_RUN
+    assert result.decision["side_effects"]["executor_spawned"] is False
+    assert work_state.records == []
+    spawner.assert_not_called()
+
+
+
 def test_command_registry_exposes_autopilot_to_gateway_surfaces():
     from hermes_cli.commands import (
         is_gateway_known_command,
@@ -997,11 +1077,11 @@ def _make_runner():
 async def test_gateway_autopilot_bypasses_running_agent_without_interrupt(monkeypatch):
     calls = []
 
-    def _fake_handle(raw_args, *, actor=None):
+    def _fake_handle(raw_args, *, actor=None, **kwargs):
         calls.append({"raw_args": raw_args, "actor": actor})
         return SimpleNamespace(message="autopilot handled")
 
-    monkeypatch.setattr("gateway.autopilot.handle_autopilot_command", _fake_handle)
+    monkeypatch.setattr("gateway.autopilot.handle_autopilot_runtime_command", _fake_handle)
     runner = _make_runner()
     session_key = build_session_key(_make_source())
     running_agent = SimpleNamespace(interrupt=MagicMock())
@@ -1014,6 +1094,48 @@ async def test_gateway_autopilot_bypasses_running_agent_without_interrupt(monkey
     assert calls == [{"raw_args": "status CH-385", "actor": "tester"}]
     running_agent.interrupt.assert_not_called()
     assert runner._pending_messages == {}
+
+
+@pytest.mark.asyncio
+async def test_gateway_autopilot_target_queues_generated_goal_contract(monkeypatch):
+    fake_work_state = _FakeWorkStateStore()
+
+    class _StoreFactory:
+        def __call__(self):
+            return fake_work_state
+
+    class _LinearFactory:
+        def __call__(self):
+            return _FakeLinearClient({"CH-401": _issue("CH-401")}, queue=[_issue("CH-401")])
+
+    monkeypatch.setattr("gateway.work_state.WorkStateStore", _StoreFactory())
+    monkeypatch.setattr("gateway.autopilot.EnvLinearIssueClient", _LinearFactory())
+    runner = _make_runner()
+    goal_sets = []
+
+    class _FakeGoalManager:
+        def set(self, goal):
+            goal_sets.append(goal)
+            return SimpleNamespace(goal=goal)
+
+    runner._get_goal_manager_for_event = lambda _event: (_FakeGoalManager(), runner.session_store.get_or_create_session.return_value)
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter._pending_messages = {}
+    event = _make_event("/autopilot CH-401")
+    session_key = build_session_key(event.source)
+
+    result = await runner._handle_autopilot_command(event)
+
+    assert "Decision: started" in result
+    assert "work_state lock: CH-401" in result
+    assert fake_work_state.records[0].work_id == "CH-401"
+    assert fake_work_state.records[0].state == "running"
+    assert fake_work_state.records[0].executor_session_id == "sess-1"
+    queued = adapter._pending_messages[session_key]
+    assert not queued.text.startswith("/goal")
+    assert goal_sets == [queued.text]
+    assert "CH-401" in queued.text
+    assert queued.source == event.source
 
 
 def test_cli_autopilot_dispatch_uses_same_controller(monkeypatch):
