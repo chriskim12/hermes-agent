@@ -233,15 +233,28 @@ def normalize_native_owner_ingress_packet(packet: Dict[str, Any]) -> Dict[str, O
             _coalesce_text(packet.get("worktree_path"), context.get("worktree_path"))
         ),
         "repo_name": _coalesce_text(packet.get("repo_name"), context.get("repo_name")),
+        "owner_session_id": _coalesce_text(
+            packet.get("owner_session_id"),
+            packet.get("owner_session_key"),
+            _nested_get(packet, "owner", "session_id"),
+            _nested_get(packet, "owner", "session_key"),
+            context.get("owner_session_id"),
+            context.get("owner_session_key"),
+        ),
         "executor_session_id": _coalesce_text(
             packet.get("executor_session_id"),
             packet.get("session_id"),
+            context.get("executor_session_id"),
+            context.get("session_id"),
             _nested_get(packet, "executor", "session_id"),
         ),
         "tmux_session": _coalesce_text(
             packet.get("tmux_session"),
             packet.get("tmuxSession"),
             packet.get("session_name"),
+            context.get("tmux_session"),
+            context.get("tmuxSession"),
+            context.get("session_name"),
             _nested_get(packet, "executor", "tmux_session"),
         ),
     }

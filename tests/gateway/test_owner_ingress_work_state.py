@@ -757,6 +757,176 @@ async def test_handle_delegated_ingress_packet_rejects_missing_discord_thread_so
 
 
 @pytest.mark.asyncio
+async def test_handle_delegated_ingress_packet_rejects_uncorrelated_single_live_record(tmp_path):
+    runner, store, work_state_store = _make_runner(tmp_path)
+    source = _make_source()
+    session_entry = store.get_or_create_session(source)
+    now = datetime.now(timezone.utc)
+    work_state_store.upsert(
+        WorkRecord(
+            work_id="wk-delegated-uncorrelated",
+            title="delegated uncorrelated work",
+            objective="do not let weak packets mutate the only live delegated record",
+            owner="hermes",
+            executor="omx",
+            mode="delegated",
+            owner_session_id=session_entry.session_key,
+            state="running",
+            started_at=now,
+            last_progress_at=now,
+            next_action="Wait for a correlated delegated signal",
+            executor_session_id="omx-uncorrelated-1",
+            tmux_session="omx-uncorrelated",
+            repo_path="/repo/demo",
+            worktree_path="/repo/demo",
+            proof="delegated_handoff:test",
+        )
+    )
+
+    result = await GatewayRunner.handle_delegated_ingress_packet(
+        runner,
+        {
+            "owner": "hermes",
+            "executor": "omx",
+            "state": "blocked",
+            "usable_outcome": "blocked",
+            "close_disposition": "close",
+            "next_action": "This should not wake the owner",
+            "proof": "clawhip:session.blocked",
+        },
+        route_name="delegated-ingress",
+        delivery_id="delegated-uncorrelated",
+    )
+
+    assert result["status"] == "reject"
+    assert result["reason"] == "insufficient_delegated_correlation"
+    assert result["no_broadcast"] is True
+    assert runner.adapters[Platform.TELEGRAM].events == []
+    record = work_state_store.resolve_delegated_signal_candidate(
+        work_id="wk-delegated-uncorrelated",
+        live_only=False,
+    )["record"]
+    assert record.state == "running"
+    assert record.usable_outcome is None
+    assert record.close_disposition is None
+
+
+@pytest.mark.asyncio
+async def test_handle_delegated_ingress_packet_rejects_wrong_owner_or_executor(tmp_path):
+    runner, store, work_state_store = _make_runner(tmp_path)
+    source = _make_source()
+    session_entry = store.get_or_create_session(source)
+    now = datetime.now(timezone.utc)
+    work_state_store.upsert(
+        WorkRecord(
+            work_id="wk-delegated-invalid-actor",
+            title="delegated invalid actor work",
+            objective="reject packets that are not hermes-owned OMX/clawhip delegated signals",
+            owner="hermes",
+            executor="omx",
+            mode="delegated",
+            owner_session_id=session_entry.session_key,
+            state="running",
+            started_at=now,
+            last_progress_at=now,
+            next_action="Wait for valid delegated actor",
+            executor_session_id="omx-invalid-actor-1",
+            proof="delegated_handoff:test",
+        )
+    )
+
+    bad_owner = await GatewayRunner.handle_delegated_ingress_packet(
+        runner,
+        {
+            "owner": "human",
+            "executor": "omx",
+            "work_id": "wk-delegated-invalid-actor",
+            "state": "blocked",
+            "usable_outcome": "blocked",
+            "close_disposition": "close",
+        },
+        route_name="delegated-ingress",
+        delivery_id="delegated-bad-owner",
+    )
+    bad_executor = await GatewayRunner.handle_delegated_ingress_packet(
+        runner,
+        {
+            "owner": "hermes",
+            "executor": "unknown-agent",
+            "work_id": "wk-delegated-invalid-actor",
+            "state": "blocked",
+            "usable_outcome": "blocked",
+            "close_disposition": "close",
+        },
+        route_name="delegated-ingress",
+        delivery_id="delegated-bad-executor",
+    )
+
+    assert bad_owner["status"] == "reject"
+    assert bad_owner["reason"] == "invalid_owner"
+    assert bad_executor["status"] == "reject"
+    assert bad_executor["reason"] == "invalid_executor"
+    assert runner.adapters[Platform.TELEGRAM].events == []
+    record = work_state_store.resolve_delegated_signal_candidate(
+        work_id="wk-delegated-invalid-actor",
+        live_only=False,
+    )["record"]
+    assert record.state == "running"
+    assert record.usable_outcome is None
+
+
+@pytest.mark.asyncio
+async def test_handle_delegated_ingress_packet_rejects_invalid_state_surface(tmp_path):
+    runner, store, work_state_store = _make_runner(tmp_path)
+    source = _make_source()
+    session_entry = store.get_or_create_session(source)
+    now = datetime.now(timezone.utc)
+    work_state_store.upsert(
+        WorkRecord(
+            work_id="wk-delegated-invalid-state",
+            title="delegated invalid state work",
+            objective="reject state/outcome/disposition drift before writing work_state",
+            owner="hermes",
+            executor="omx",
+            mode="delegated",
+            owner_session_id=session_entry.session_key,
+            state="running",
+            started_at=now,
+            last_progress_at=now,
+            next_action="Wait for valid delegated state",
+            executor_session_id="omx-invalid-state-1",
+            proof="delegated_handoff:test",
+        )
+    )
+
+    result = await GatewayRunner.handle_delegated_ingress_packet(
+        runner,
+        {
+            "owner": "hermes",
+            "executor": "omx",
+            "work_id": "wk-delegated-invalid-state",
+            "state": "success-but-not-really",
+            "usable_outcome": "success-but-not-really",
+            "close_disposition": "close",
+        },
+        route_name="delegated-ingress",
+        delivery_id="delegated-invalid-state",
+    )
+
+    assert result["status"] == "reject"
+    assert result["reason"] == "invalid_delegated_state"
+    assert result["no_broadcast"] is True
+    assert runner.adapters[Platform.TELEGRAM].events == []
+    record = work_state_store.resolve_delegated_signal_candidate(
+        work_id="wk-delegated-invalid-state",
+        live_only=False,
+    )["record"]
+    assert record.state == "running"
+    assert record.usable_outcome is None
+    assert record.close_disposition is None
+
+
+@pytest.mark.asyncio
 async def test_handle_delegated_ingress_packet_retry_needed_prefers_executor_followup_without_owner_wake(
     tmp_path,
     monkeypatch,

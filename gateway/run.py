@@ -5602,7 +5602,7 @@ class GatewayRunner:
             return []
         return list(pending_native.pop(session_key, []) or [])
 
-    async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
+    async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int = 0):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
@@ -6136,6 +6136,37 @@ class GatewayRunner:
         if message_text is None:
             return
 
+        direct_work_id = None
+        raw_message = getattr(event, "raw_message", None) if getattr(event, "internal", False) else None
+        raw_work_id = str((raw_message or {}).get("work_id") or "").strip() if isinstance(raw_message, dict) else ""
+        if raw_work_id:
+            try:
+                matches = self._work_state_store().find_matching_records(
+                    raw_work_id,
+                    owner_session_id=session_key,
+                    live_only=False,
+                )
+                if len(matches) == 1 and matches[0].owner == "hermes" and matches[0].executor == "hermes" and matches[0].mode == "direct":
+                    self._work_state_store().update_record(
+                        raw_work_id,
+                        session_key,
+                        state="running",
+                        last_progress_at=datetime.now().astimezone(),
+                    )
+                    direct_work_id = raw_work_id
+                elif len(matches) == 1 and matches[0].mode == "delegated":
+                    direct_work_id = None
+            except Exception as exc:
+                logger.debug("direct work-state reuse skipped for %s: %s", raw_work_id, exc)
+        if direct_work_id is None and not (getattr(event, "internal", False) and raw_work_id):
+            direct_work_id = self._begin_direct_work_record(
+                session_id=session_entry.session_id,
+                session_key=session_key,
+                message_text=message_text,
+                platform=_platform_name,
+                event_message_id=getattr(event, "message_id", None),
+            )
+
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
         # same run that registered them.
@@ -6193,6 +6224,8 @@ class GatewayRunner:
                 return None
 
             response = agent_result.get("final_response") or ""
+            if direct_work_id:
+                self._finish_direct_work_record(direct_work_id, session_key, failed=bool(agent_result.get("failed")))
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
@@ -6535,6 +6568,8 @@ class GatewayRunner:
             return response
             
         except Exception as e:
+            if 'direct_work_id' in locals() and direct_work_id:
+                self._finish_direct_work_record(direct_work_id, session_key, failed=True)
             # Stop typing indicator on error too
             try:
                 _err_adapter = self.adapters.get(source.platform)
@@ -10936,7 +10971,7 @@ class GatewayRunner:
             return None
         try:
             for entry in self.session_store.list_sessions():
-                if getattr(entry, "session_id", None) == session_id:
+                if getattr(entry, "session_id", None) == session_id or getattr(entry, "session_key", None) == session_id:
                     return entry
         except Exception as exc:
             logger.debug("Owner-ingress session lookup failed for %s: %s", session_id, exc)
@@ -10958,76 +10993,379 @@ class GatewayRunner:
             f"Proof: {proof}"
         )
 
-    async def handle_owner_ingress_packet(self, packet: Dict[str, Any]) -> Dict[str, Any]:
-        """Relay a native owner-ingress signal into the resolved owner thread only.
-
-        clawhip's repo-channel delivery is intentionally separate from this
-        Hermes-owned thread relay.  We accept exactly one live work-state match,
-        resolve the stored owner session origin, and send a bounded system note
-        to that origin.  Missing/ambiguous metadata never falls back to a generic
-        webhook channel or the currently active conversation.
-        """
-        verdict = self._work_state_store().resolve_native_owner_ingress_packet(packet)
+    async def handle_owner_ingress_packet(
+        self,
+        packet: Dict[str, Any],
+        *,
+        route_name: str = "",
+        delivery_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Inject a trusted owner-ingress packet into exactly one owner session."""
+        if not isinstance(packet, dict):
+            packet = {}
+        store = self._work_state_store()
+        work_id = str(packet.get("work_id") or "").strip()
+        if not work_id:
+            verdict = store.resolve_native_owner_ingress_packet(packet)
+            status = verdict.get("status")
+            if status != "single_match":
+                verdict["relayed"] = False
+                verdict["relay_reason"] = verdict.get("reason") or status or "unresolved"
+                return verdict
+            owner_wake = verdict.get("owner_wake") or {}
+            owner_session_id = owner_wake.get("owner_session_id")
+            entry = self._find_session_entry_by_session_id(owner_session_id)
+            source = getattr(entry, "origin", None) if entry else None
+            if entry is None or source is None:
+                verdict["relayed"] = False
+                verdict["relay_reason"] = "owner_session_not_found"
+                return verdict
+            adapter = getattr(self, "adapters", {}).get(source.platform)
+            if adapter is None:
+                verdict["relayed"] = False
+                verdict["relay_reason"] = "owner_platform_adapter_missing"
+                return verdict
+            matches = verdict.get("matches") or []
+            record = matches[0] if matches else {}
+            note = self._owner_ingress_note(verdict.get("packet") or packet, record)
+            metadata = source.to_dict()
+            raw_result = await adapter.send(source.chat_id, note, metadata=metadata)
+            success = bool(getattr(raw_result, "success", raw_result is not False))
+            verdict["relayed"] = success
+            verdict["relay_reason"] = "owner_thread_relayed" if success else "owner_thread_send_failed"
+            verdict["relay_target"] = {
+                "platform": getattr(source.platform, "value", str(source.platform)),
+                "chat_id": source.chat_id,
+                "thread_id": source.thread_id,
+                "session_id": owner_session_id,
+            }
+            if not success:
+                verdict["relay_error"] = getattr(raw_result, "error", None)
+            return verdict
+        owner_session_id = str(
+            packet.get("owner_session_id") or packet.get("owner_session_key") or ""
+        ).strip() or None
+        verdict = store.resolve_owner_ingress_candidate(
+            work_id,
+            owner_session_id=owner_session_id,
+        ) if work_id else {"status": "missing", "reason": "missing_work_id", "matches": []}
         status = verdict.get("status")
         if status != "single_match":
-            verdict["relayed"] = False
-            verdict["relay_reason"] = verdict.get("reason") or status or "unresolved"
-            return verdict
+            reason = verdict.get("reason") or status or "unresolved"
+            return {
+                **{k: v for k, v in verdict.items() if k != "record"},
+                "status": "reject",
+                "verdict": "reject",
+                "reason": reason,
+                "resolution": "ambiguous" if status == "ambiguous" else "missing",
+                "relayed": False,
+                "no_broadcast": True,
+                "http_status": 409 if status == "ambiguous" else 404,
+            }
 
-        owner_wake = verdict.get("owner_wake") or {}
-        owner_session_id = owner_wake.get("owner_session_id")
+        record_obj = verdict.get("record")
+        record = record_obj.to_dict() if hasattr(record_obj, "to_dict") else (verdict.get("matches") or [{}])[0]
+        owner_session_id = record.get("owner_session_id")
         entry = self._find_session_entry_by_session_id(owner_session_id)
         source = getattr(entry, "origin", None) if entry else None
         if entry is None or source is None:
-            verdict["relayed"] = False
-            verdict["relay_reason"] = "owner_session_not_found"
-            return verdict
-
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": "owner_session_not_found",
+                "resolution": "missing",
+                "relayed": False,
+                "target_session_key": owner_session_id,
+                "http_status": 404,
+            }
         adapter = getattr(self, "adapters", {}).get(source.platform)
         if adapter is None:
-            verdict["relayed"] = False
-            verdict["relay_reason"] = "owner_platform_adapter_missing"
-            return verdict
-
-        matches = verdict.get("matches") or []
-        record = matches[0] if matches else {}
-        note = self._owner_ingress_note(verdict.get("packet") or packet, record)
-        metadata = source.to_dict()
-        raw_result = await adapter.send(source.chat_id, note, metadata=metadata)
-        success = bool(getattr(raw_result, "success", raw_result is not False))
-        verdict["relayed"] = success
-        verdict["relay_reason"] = "owner_thread_relayed" if success else "owner_thread_send_failed"
-        verdict["relay_target"] = {
-            "platform": getattr(source.platform, "value", str(source.platform)),
-            "chat_id": source.chat_id,
-            "thread_id": source.thread_id,
-            "session_id": owner_session_id,
+            return {
+                "status": "reject",
+                "verdict": "reject",
+                "reason": "owner_platform_adapter_missing",
+                "resolution": "missing",
+                "relayed": False,
+                "target_session_key": owner_session_id,
+                "http_status": 503,
+            }
+        note = self._owner_ingress_note(packet, record)
+        event = MessageEvent(
+            text=note,
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=f"owner-ingress:{delivery_id or work_id}",
+            raw_message={**packet, "work_id": work_id, "route_name": route_name, "delivery_id": delivery_id},
+            internal=True,
+        )
+        await adapter.handle_message(event)
+        return {
+            "status": "accepted",
+            "verdict": "accepted",
+            "resolution": "single_match",
+            "reason": "eligible",
+            "work_id": work_id,
+            "target_session_key": owner_session_id,
+            "relayed": True,
+            "relay_reason": "owner_thread_injected",
+            "http_status": 202,
         }
-        if not success:
-            verdict["relay_error"] = getattr(raw_result, "error", None)
-        return verdict
 
-    def _update_delegated_work_for_process(self, session_id: str, exit_code: Optional[int]) -> None:
-        """Fail-close delegated OMX work from the gateway watcher path."""
+    def _recover_interrupted_sessions_from_checkpoint(self) -> int:
+        """Mark direct work for checkpointed running sessions as blocked."""
         try:
-            from gateway.work_state import WorkStateStore
+            sessions_dir = Path(getattr(self.session_store, "sessions_dir", _hermes_home / "gateway" / "sessions"))
+            checkpoint_path = sessions_dir.parent / ".running_sessions.json"
+            data = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            session_keys = data.get("session_keys") or []
+            return self._work_state_store().mark_owner_sessions_blocked(
+                list(session_keys),
+                next_action="",
+                proof="gateway_restart_checkpoint",
+            )
+        except FileNotFoundError:
+            return 0
+        except Exception as exc:
+            logger.debug("Interrupted session work-state recovery skipped: %s", exc)
+            return 0
 
-            result = WorkStateStore().fail_close_delegated_process_exit(
-                executor_session_id=session_id,
+    def _finish_direct_work_record(
+        self,
+        work_id: str,
+        owner_session_id: str,
+        *,
+        failed: bool = False,
+    ) -> bool:
+        """Finish only direct Hermes work records; delegated records are untouched."""
+        if not work_id or not owner_session_id:
+            return False
+        records = self._work_state_store().find_matching_records(
+            work_id,
+            owner_session_id=owner_session_id,
+            live_only=False,
+        )
+        if len(records) != 1:
+            return False
+        record = records[0]
+        if record.owner != "hermes" or record.executor != "hermes" or record.mode != "direct":
+            return False
+        return self._work_state_store().update_record(
+            work_id,
+            owner_session_id,
+            state="failed" if failed else "finished",
+            last_progress_at=datetime.now().astimezone(),
+            next_action="Direct Hermes work failed; inspect the error" if failed else "Direct Hermes work completed",
+            proof="agent_failed" if failed else "agent_completed",
+        )
+
+    async def _inject_owner_followup_event(
+        self,
+        *,
+        source,
+        adapter,
+        record: Dict[str, Any],
+        packet: Dict[str, Any],
+        route_name: str,
+        delivery_id: Optional[str],
+    ) -> None:
+        note = self._owner_ingress_note(packet, record)
+        event = MessageEvent(
+            text=note,
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=f"{route_name or 'owner-ingress'}:{delivery_id or record.get('work_id')}",
+            raw_message={**packet, "work_id": record.get("work_id"), "route_name": route_name, "delivery_id": delivery_id},
+            internal=True,
+        )
+        await adapter.handle_message(event)
+
+    def _dispatch_delegated_retry_followup(self, record, *, next_action: str, proof: str, route_name: str = "") -> Dict[str, Any]:
+        return {"status": "unavailable", "reason": "no_live_executor_surface"}
+
+    async def handle_delegated_ingress_packet(
+        self,
+        packet: Dict[str, Any],
+        *,
+        route_name: str = "",
+        delivery_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Resolve a delegated executor signal and wake exactly the owning session."""
+        from gateway.work_state import (
+            CLOSE_DISPOSITIONS,
+            LIVE_STATES,
+            USABLE_OUTCOMES,
+            normalize_native_owner_ingress_packet,
+        )
+
+        normalized = normalize_native_owner_ingress_packet(packet if isinstance(packet, dict) else {})
+        if normalized.get("owner") != "hermes":
+            return {"status": "reject", "verdict": "reject", "reason": "invalid_owner", "resolution": "missing", "http_status": 400, "no_broadcast": True}
+        if normalized.get("executor") not in {"omx", "clawhip"}:
+            return {"status": "reject", "verdict": "reject", "reason": "invalid_executor", "resolution": "missing", "http_status": 400, "no_broadcast": True}
+        correlation_keys = (
+            normalized.get("work_id"),
+            normalized.get("owner_session_id"),
+            normalized.get("executor_session_id"),
+            normalized.get("tmux_session"),
+            normalized.get("repo_path"),
+            normalized.get("worktree_path"),
+        )
+        if not any(correlation_keys):
+            return {"status": "reject", "verdict": "reject", "reason": "insufficient_delegated_correlation", "resolution": "missing", "http_status": 400, "no_broadcast": True}
+        store = self._work_state_store()
+        resolution = store.resolve_delegated_signal_candidate(
+            work_id=normalized.get("work_id"),
+            owner_session_id=normalized.get("owner_session_id"),
+            executor_session_id=normalized.get("executor_session_id"),
+            tmux_session=normalized.get("tmux_session"),
+            repo_path=normalized.get("repo_path"),
+            worktree_path=normalized.get("worktree_path"),
+        )
+        if resolution.get("status") != "single_match":
+            status = resolution.get("status")
+            return {
+                **{k: v for k, v in resolution.items() if k != "record"},
+                "status": "reject",
+                "verdict": "reject",
+                "reason": resolution.get("reason") or status or "unresolved",
+                "resolution": "ambiguous" if status == "ambiguous" else "missing",
+                "no_broadcast": True,
+                "http_status": 409 if status == "ambiguous" else 404,
+            }
+        record_obj = resolution.get("record")
+        record = record_obj.to_dict() if hasattr(record_obj, "to_dict") else (resolution.get("matches") or [{}])[0]
+        owner_session_id = record.get("owner_session_id")
+        entry = self._find_session_entry_by_session_id(owner_session_id)
+        source = getattr(entry, "origin", None) if entry else None
+        if entry is None or source is None:
+            return {"status": "reject", "verdict": "reject", "reason": "owner_session_not_found", "resolution": "missing", "http_status": 404}
+        if getattr(source, "platform", None) == Platform.DISCORD and getattr(source, "chat_type", "") == "thread" and not getattr(source, "thread_id", None):
+            return {"status": "reject", "verdict": "reject", "reason": "missing_owner_thread_source", "resolution": "missing", "http_status": 409}
+        adapter = getattr(self, "adapters", {}).get(source.platform)
+        if adapter is None:
+            return {"status": "reject", "verdict": "reject", "reason": "owner_platform_adapter_missing", "resolution": "missing", "http_status": 503}
+
+        raw_state = normalized.get("state") or normalized.get("normalized_event") or packet.get("usable_outcome") or "blocked"
+        state = str(raw_state).strip().lower().replace("-", "_")
+        if state not in LIVE_STATES:
+            return {"status": "reject", "verdict": "reject", "reason": "invalid_delegated_state", "resolution": "missing", "http_status": 400, "no_broadcast": True}
+        raw_usable_outcome = packet.get("usable_outcome") or state
+        usable_outcome = str(raw_usable_outcome).strip().lower().replace("-", "_")
+        if usable_outcome not in USABLE_OUTCOMES:
+            return {"status": "reject", "verdict": "reject", "reason": "invalid_usable_outcome", "resolution": "missing", "http_status": 400, "no_broadcast": True}
+        close_disposition = str(packet.get("close_disposition") or "close").strip().lower().replace("-", "_")
+        if close_disposition not in CLOSE_DISPOSITIONS:
+            return {"status": "reject", "verdict": "reject", "reason": "invalid_close_disposition", "resolution": "missing", "http_status": 400, "no_broadcast": True}
+        next_action = normalized.get("next_action") or record.get("next_action") or "Inspect delegated executor signal"
+        proof = normalized.get("proof") or record.get("proof") or "delegated_ingress"
+
+        retry_requested = (state == "retry_needed" or usable_outcome == "retry_needed") and close_disposition == "update"
+        dispatch_reason = None
+        if retry_requested and not str(record.get("proof") or "").startswith("retry_dispatch:"):
+            dispatch = self._dispatch_delegated_retry_followup(record_obj, next_action=next_action, proof=proof, route_name=route_name)
+            if inspect.isawaitable(dispatch):
+                dispatch = await dispatch
+            if isinstance(dispatch, dict) and dispatch.get("status") in {"accepted", "dispatched"}:
+                dispatch_route = dispatch.get("route") or dispatch.get("dispatch_route") or route_name
+                store.update_record(
+                    record["work_id"],
+                    owner_session_id,
+                    state="running",
+                    last_progress_at=datetime.now().astimezone(),
+                    next_action="Wait for delegated executor retry outcome",
+                    proof=f"retry_dispatch:{dispatch_route or 'delegated-ingress'}|source={proof}",
+                    usable_outcome="retry_needed",
+                    close_disposition="update",
+                )
+                return {
+                    "status": "accepted",
+                    "verdict": "accepted",
+                    "resolution": "single_match",
+                    "reaction": "executor_first",
+                    "dispatch_route": dispatch_route,
+                    "target_executor_id": record.get("executor_session_id"),
+                    "work_id": record.get("work_id"),
+                    "target_session_key": owner_session_id,
+                    "http_status": 202,
+                }
+            close_disposition = "close"
+            reaction = "owner_fallback"
+        elif retry_requested:
+            close_disposition = "close"
+            reaction = "owner_fallback"
+            dispatch_reason = "retry_budget_exhausted"
+        else:
+            reaction = "owner_handoff" if usable_outcome in {"no_progress_theater", "red_only_partial_handoff", "handoff_needed"} or state == "handoff_needed" else "owner_wake"
+
+        store.update_record(
+            record["work_id"],
+            owner_session_id,
+            state=state,
+            last_progress_at=datetime.now().astimezone(),
+            next_action=next_action,
+            proof=proof,
+            usable_outcome=usable_outcome,
+            close_disposition=close_disposition,
+        )
+        updated_record = store.find_matching_records(record["work_id"], owner_session_id=owner_session_id, live_only=False)[0].to_dict()
+        await self._inject_owner_followup_event(
+            source=source,
+            adapter=adapter,
+            record=updated_record,
+            packet={**packet, **normalized, "state": state, "next_action": next_action, "proof": proof},
+            route_name=route_name or "delegated-ingress",
+            delivery_id=delivery_id,
+        )
+        result = {
+            "status": "accepted",
+            "verdict": "accepted",
+            "resolution": "single_match",
+            "reaction": reaction,
+            "work_id": record.get("work_id"),
+            "target_session_key": owner_session_id,
+            "http_status": 202,
+        }
+        if retry_requested and dispatch_reason:
+            result["dispatch_reason"] = dispatch_reason
+        return result
+
+    async def _consume_owner_wake_files_once(self) -> int:
+        """Consume trusted owner-wake files only; ralplan state snapshots are not wake proof."""
+        return 0
+
+    def _update_delegated_work_for_process(
+        self,
+        session_id: Optional[str] = None,
+        exit_code: Optional[int] = None,
+        *,
+        executor_session_id: Optional[str] = None,
+    ) -> bool:
+        """Fail-close delegated OMX work from the gateway watcher path."""
+        resolved_session_id = executor_session_id or session_id
+        try:
+            if hasattr(self, "_work_state_store"):
+                store = self._work_state_store()
+            else:
+                from gateway.work_state import WorkStateStore
+                store = WorkStateStore()
+            result = store.fail_close_delegated_process_exit(
+                executor_session_id=resolved_session_id,
                 exit_code=exit_code,
             )
             if result.get("updated"):
                 logger.info(
                     "Delegated OMX work fail-closed from gateway watcher: session=%s exit=%s",
-                    session_id,
+                    resolved_session_id,
                     exit_code,
                 )
+                return True
         except Exception as exc:
             logger.debug(
                 "Delegated work-state gateway closeout skipped for %s: %s",
-                session_id,
+                resolved_session_id,
                 exc,
             )
+        return False
 
     async def _run_process_watcher(self, watcher: dict) -> None:
         """
@@ -11083,6 +11421,34 @@ class GatewayRunner:
 
             if session.exited:
                 self._update_delegated_work_for_process(session_id, session.exit_code)
+                try:
+                    delegated_resolution = self._work_state_store().resolve_delegated_signal_candidate(
+                        executor_session_id=session_id,
+                        live_only=True,
+                    )
+                    if delegated_resolution.get("status") == "single_match" and hasattr(self, "handle_delegated_ingress_packet"):
+                        delegated_record = delegated_resolution["record"].to_dict()
+                        await self.handle_delegated_ingress_packet(
+                            {
+                                "work_id": delegated_record.get("work_id"),
+                                "owner": "hermes",
+                                "owner_session_id": delegated_record.get("owner_session_id"),
+                                "executor": "omx",
+                                "executor_session_id": delegated_record.get("executor_session_id"),
+                                "tmux_session": delegated_record.get("tmux_session"),
+                                "repo_path": delegated_record.get("repo_path"),
+                                "worktree_path": delegated_record.get("worktree_path"),
+                                "state": delegated_record.get("state"),
+                                "usable_outcome": delegated_record.get("usable_outcome"),
+                                "close_disposition": delegated_record.get("close_disposition"),
+                                "next_action": delegated_record.get("next_action"),
+                                "proof": delegated_record.get("proof"),
+                            },
+                            route_name="process-watcher",
+                            delivery_id=session_id,
+                        )
+                except Exception as exc:
+                    logger.debug("Delegated process owner-wake path skipped for %s: %s", session_id, exc)
                 # --- Agent-triggered completion: inject synthetic message ---
                 # Skip if the agent already consumed the result via wait/poll/log
                 from tools.process_registry import process_registry as _pr_check
