@@ -40,7 +40,10 @@ ACTION_ONE_SHOT = "one_shot"
 READ_ONLY_ACTIONS = {ACTION_STATUS, ACTION_DRY_RUN}
 
 AUTOPILOT_CLOSEOUT_MODE = "autopilot"
+KANBAN_CLOSEOUT_MODE = "kanban"
 AUTOPILOT_PR_CLOSEOUT_REQUIRED_REASON = "autopilot_pr_cleanup_evidence_required"
+KANBAN_WORKER_DONE_REVIEW_REQUIRED_REASON = "kanban_worker_done_review_evidence_required"
+KANBAN_REVIEW_READY_FINAL_CLOSE_REQUIRED_REASON = "kanban_review_ready_final_close_required"
 _DAILYCHINGU_REPO_NAMES = frozenset({"dailychingu", "daily-chingu", "dc"})
 _RELEASE_ONLY_BASES = frozenset({"prod", "production"})
 _PR_LESS_CLOSEOUT_EXCEPTIONS = frozenset({
@@ -92,6 +95,135 @@ def _truthy_evidence(value: Any) -> bool:
         return False
     text = str(value).strip().lower()
     return text in {"1", "true", "yes", "y", "ok", "passed", "pass", "clean", "done", "verified"}
+
+
+def _nested_mapping(source: Mapping[str, Any], *keys: str) -> dict[str, Any]:
+    for key in keys:
+        value = source.get(key)
+        if isinstance(value, Mapping):
+            return dict(value)
+    return {}
+
+
+def _normalize_token(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _kanban_run_payload(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    payload = _nested_mapping(evidence, "kanban_run", "task_run", "run")
+    if not payload:
+        payload = dict(evidence)
+    return payload
+
+
+def _kanban_task_payload(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    return _nested_mapping(evidence, "kanban_task", "task")
+
+
+def _kanban_worker_done(evidence: Mapping[str, Any]) -> tuple[bool, list[str]]:
+    run = _kanban_run_payload(evidence)
+    task = _kanban_task_payload(evidence)
+    run_status = _normalize_token(run.get("status") or evidence.get("task_run_status"))
+    run_outcome = _normalize_token(run.get("outcome") or evidence.get("task_run_outcome"))
+    task_status = _normalize_token(task.get("status") or evidence.get("kanban_task_status"))
+    missing: list[str] = []
+    done = False
+    if run_status in {"done", "released"} and run_outcome in {"completed", "complete", "success", "succeeded"}:
+        done = True
+    elif task_status == "done" and run_outcome in {"completed", "complete", "success", "succeeded"}:
+        done = True
+    if not run_status:
+        missing.append("task_run.status")
+    if not run_outcome:
+        missing.append("task_run.outcome")
+    return done, missing
+
+
+def evaluate_kanban_closeout_gate(
+    *,
+    evidence: Optional[Mapping[str, Any]] = None,
+    repo_name: Optional[str] = None,
+    remote_default_branch: Optional[str] = None,
+    repo_policy: Optional[Mapping[str, Any]] = None,
+    expected_repo_full_name: Optional[str] = None,
+    expected_work_id: Optional[str] = None,
+    release_approved: bool = False,
+    final_close_approved: bool = False,
+) -> dict[str, Any]:
+    """Map Kanban worker completion to review-ready/closed without false Done.
+
+    Kanban worker completion is only a run-ledger fact.  Review readiness still
+    requires the same PR/evidence/cleanup gate as Linear AUTOPILOT closeout, and
+    final ``closed`` requires an explicit caller-side close approval.  This helper
+    never mutates Linear or treats ``tasks.status=done`` as project Done.
+    """
+
+    closeout = dict(evidence or {})
+    nested_closeout = closeout.get("review_closeout") or closeout.get("closeout")
+    if isinstance(nested_closeout, Mapping):
+        closeout = {**dict(nested_closeout), **{k: v for k, v in closeout.items() if k not in {"review_closeout", "closeout"}}}
+
+    worker_done, worker_missing = _kanban_worker_done(closeout)
+    result: dict[str, Any] = {
+        "allowed": False,
+        "status": "blocked",
+        "phase": "worker_done" if worker_done else "worker_pending",
+        "mode": KANBAN_CLOSEOUT_MODE,
+        "worker_done": worker_done,
+        "review_ready": False,
+        "closed": False,
+        "linear_done_mutated": False,
+        "kanban_done_project_done": False,
+        "missing": list(worker_missing),
+        "violations": [],
+    }
+    if not worker_done:
+        result["reason"] = "kanban_worker_completion_required"
+        return result
+
+    pr_gate = evaluate_autopilot_pr_closeout_gate(
+        evidence=closeout,
+        repo_name=repo_name or closeout.get("repo_name"),
+        remote_default_branch=remote_default_branch or closeout.get("remote_default_branch"),
+        repo_policy=repo_policy,
+        expected_repo_full_name=expected_repo_full_name,
+        expected_work_id=expected_work_id,
+        release_approved=release_approved,
+    )
+    result["closeout_gate"] = pr_gate
+    if not pr_gate.get("allowed"):
+        result.update(
+            {
+                "reason": KANBAN_WORKER_DONE_REVIEW_REQUIRED_REASON,
+                "missing": list(dict.fromkeys(result["missing"] + list(pr_gate.get("missing") or []))),
+                "violations": list(pr_gate.get("violations") or []),
+            }
+        )
+        return result
+
+    result.update(
+        {
+            "status": "review_ready",
+            "phase": "review_ready",
+            "reason": KANBAN_REVIEW_READY_FINAL_CLOSE_REQUIRED_REASON,
+            "review_ready": True,
+            "missing": [],
+            "violations": [],
+        }
+    )
+    if not final_close_approved:
+        return result
+
+    result.update(
+        {
+            "allowed": True,
+            "status": "closed",
+            "phase": "closed",
+            "reason": "kanban_final_close_approved_after_review_ready",
+            "closed": True,
+        }
+    )
+    return result
 
 
 def evaluate_autopilot_pr_closeout_gate(
@@ -1115,6 +1247,14 @@ _EXECUTOR_RESULT_CLOSEOUT_KEYS = frozenset({
     "cleanup_proof",
     "linear_evidence_comment_id",
     "linear_comment_id",
+    "kanban_run",
+    "task_run",
+    "run",
+    "kanban_task",
+    "task",
+    "task_run_status",
+    "task_run_outcome",
+    "kanban_task_status",
 })
 _EXECUTOR_RESULT_CONTINUE_STATUSES = frozenset({
     "continue",
