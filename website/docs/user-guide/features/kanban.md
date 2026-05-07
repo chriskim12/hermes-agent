@@ -239,10 +239,29 @@ hermes dashboard        # "Kanban" tab appears in the nav, after "Skills"
 
 Visually the target is the familiar Linear / Fusion layout: dark theme, column headers with counts, coloured status dots, pill chips for priority and tenant. The plugin reads only theme CSS vars (`--color-*`, `--radius`, `--font-mono`, ...), so it reskins automatically with whichever dashboard theme is active.
 
+### Review queues and projection boundaries
+
+Kanban's dashboard is an operations surface, not a product/project closeout authority by itself. When you use it as a work ledger below an external tracker such as Linear, keep the human review queues explicit:
+
+| Queue | Primary signal | Human question it answers | Closeout implication |
+|---|---|---|---|
+| `active` | task `running`, live run, recent heartbeat, worker log | "What is executing right now, by which profile, in which workspace?" | no closeout authority |
+| `blocked` | task `blocked` or worker block comment/result | "What external input or approval is required?" | must not auto-retry until unblocked |
+| `stale` / `reclaim` | stale claim, missing heartbeat, crashed or timed-out worker | "Which task needs recovery before more work starts?" | recover/retry/escalate; do not mark done from stale state |
+| `failed` | run `failed`, `crashed`, `timed_out`, or `gave_up` | "Which attempt failed and where is the evidence?" | fail closed until a reviewer inspects logs and artifacts |
+| `worker_done` | task `done` or run outcome `completed` | "What did the worker produce?" | evidence only; not final project Done |
+| `review_ready` | governance adapter verified PR/checks/evidence/cleanup | "What can Chris or a reviewer approve now?" | ready for review, not implicitly closed |
+| `closed` | explicit final approval after review-ready | "What has been accepted as complete?" | final close state for the governing system |
+
+For external ledgers, project only concise, idempotent summaries back out of Kanban: task id, source id, run id, commit/PR URL, focused checks, cleanup status, risk notes, and the current queue classification. Keep verbose worker logs, retries, raw run metadata, and transient heartbeats inside Kanban. A projection may say "review-ready" or "worker_done"; it must not turn Kanban `done` into Linear/project Done unless a separate closeout adapter verifies the required evidence and a final close action is authorized.
+
+Security boundary: the dashboard is intended for localhost/Tailscale-style trusted access. Do not expose the Kanban dashboard or plugin API publicly without a separate auth/reverse-proxy design, because task bodies, comments, workspace paths, and mutation routes are operationally sensitive.
+
 ### Architecture
 
 The GUI is strictly a **read-through-the-DB + write-through-kanban_db** layer with no domain logic of its own:
 
+<!-- ascii-guard-ignore -->
 ```
 ┌────────────────────────┐      WebSocket (tails task_events)
 │   React SPA (plugin)   │ ◀──────────────────────────────────┐
@@ -262,6 +281,7 @@ The GUI is strictly a **read-through-the-DB + write-through-kanban_db** layer wi
 │  (WAL, shared)         │
 └────────────────────────┘
 ```
+<!-- ascii-guard-ignore-end -->
 
 ### REST surface
 
