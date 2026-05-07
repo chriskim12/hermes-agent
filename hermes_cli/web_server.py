@@ -2903,10 +2903,13 @@ def _ws_client_is_allowed(ws: "WebSocket") -> bool:
 
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
 # and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
-# the chat tab generates on mount; entries auto-evict when the last subscriber
-# drops AND the publisher has disconnected.
-_event_channels: dict[str, set] = {}
-_event_lock = asyncio.Lock()
+# the chat tab generates on mount; each entry is an asyncio.Queue plus the event
+# loop that owns it.  Publishers enqueue frames through the subscriber loop so
+# broadcasts work even when Starlette's TestClient runs pub/sub sockets on
+# different threads/loops.
+_EventSubscriber = tuple[asyncio.Queue[str], asyncio.AbstractEventLoop]
+_event_channels: dict[str, set[_EventSubscriber]] = {}
+_event_lock = threading.RLock()
 
 
 def _resolve_chat_argv(
@@ -2959,15 +2962,15 @@ def _build_sidecar_url(channel: str) -> Optional[str]:
 
 async def _broadcast_event(channel: str, payload: str) -> None:
     """Fan out one publisher frame to every subscriber on `channel`."""
-    async with _event_lock:
+    with _event_lock:
         subs = list(_event_channels.get(channel, ()))
 
-    for sub in subs:
+    for queue, loop in subs:
         try:
-            await sub.send_text(payload)
+            if loop.is_closed():
+                continue
+            loop.call_soon_threadsafe(queue.put_nowait, payload)
         except Exception:
-            # Subscriber went away mid-send; the /api/events finally clause
-            # will remove it from the registry on its next iteration.
             pass
 
 
@@ -3170,23 +3173,24 @@ async def events_ws(ws: WebSocket) -> None:
 
     await ws.accept()
 
-    async with _event_lock:
-        _event_channels.setdefault(channel, set()).add(ws)
+    queue: asyncio.Queue[str] = asyncio.Queue()
+    subscriber = (queue, asyncio.get_running_loop())
+    with _event_lock:
+        _event_channels.setdefault(channel, set()).add(subscriber)
 
     try:
         while True:
-            # Subscribers don't speak — the receive() just blocks until
-            # disconnect so the connection stays open as long as the
-            # browser holds it.
-            await ws.receive_text()
+            await ws.send_text(await queue.get())
     except WebSocketDisconnect:
         pass
+    except Exception:
+        pass
     finally:
-        async with _event_lock:
+        with _event_lock:
             subs = _event_channels.get(channel)
 
             if subs is not None:
-                subs.discard(ws)
+                subs.discard(subscriber)
 
                 if not subs:
                     _event_channels.pop(channel, None)

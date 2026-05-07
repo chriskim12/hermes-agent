@@ -909,6 +909,7 @@ def build_skills_system_prompt(
                 else:
                     index_lines.append(f"    - {name}")
 
+        section_tag = "available_skill_categories" if compact_mode else "available_skills"
         result = (
             "## Skills (mandatory)\n"
             "Before replying, scan the skills below. If a skill matches or is even partially relevant "
@@ -926,14 +927,15 @@ def build_skills_system_prompt(
             "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
             "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
             "`hermes setup`) so you don't have to guess or invent workarounds.\n"
+            "Use skills_list to inspect available_skills and skill_view(name) to load a relevant skill. "
             "If a skill has issues, fix it with skill_manage(action='patch').\n"
             "After difficult/iterative tasks, offer to save as a skill. "
             "If a skill you loaded was missing steps, had wrong commands, or needed "
             "pitfalls you discovered, update it before finishing.\n"
             "\n"
-            "<available_skills>\n"
+            "<" + section_tag + ">\n"
             + "\n".join(index_lines) + "\n"
-            "</available_skills>\n"
+            "</" + section_tag + ">\n"
             "\n"
             "Only proceed without loading a skill if genuinely none are relevant to the task."
         )

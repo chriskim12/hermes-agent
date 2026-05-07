@@ -145,7 +145,7 @@ _CMDPOS = (
 
 HARDLINE_PATTERNS = [
     # rm recursive targeting the root filesystem or protected roots
-    (r'\brm\s+(-[^\s]*\s+)*(/|/\*|/ \*)(\s|$)', "recursive delete of root filesystem"),
+    (r'\brm\s+(-[^\s]*\s+)*(?:/(?:\s|$)|/\*(?:\s|$)|/ \*)', "recursive delete of root filesystem"),
     (r'\brm\s+(-[^\s]*\s+)*(/home|/home/\*|/root|/root/\*|/etc|/etc/\*|/usr|/usr/\*|/var|/var/\*|/bin|/bin/\*|/sbin|/sbin/\*|/boot|/boot/\*|/lib|/lib/\*)(\s|$)', "recursive delete of system directory"),
     (r'\brm\s+(-[^\s]*\s+)*(~|\$HOME)(/?|/\*)?(\s|$)', "recursive delete of home directory"),
     # Filesystem format
@@ -939,8 +939,11 @@ def check_all_command_guards(command: str, env_type: str,
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
     if not is_cli and not is_gateway and not is_ask:
-        # Cron sessions: respect cron_mode config
-        if os.getenv("HERMES_CRON_SESSION"):
+        # Cron sessions: respect cron_mode config. ACP/embedded callers may
+        # pass a direct approval_callback while inheriting HERMES_CRON_SESSION
+        # from the parent process; in that case this is not an unattended cron
+        # approval surface, so preserve the historical non-interactive shortcut.
+        if os.getenv("HERMES_CRON_SESSION") and approval_callback is None:
             if _get_cron_approval_mode() == "deny":
                 # Run detection to get a description for the block message
                 is_dangerous, _pk, description = detect_dangerous_command(command)

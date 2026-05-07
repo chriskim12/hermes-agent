@@ -1382,13 +1382,16 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     changed = False
     active_sources: Set[str] = set()
 
-    # Prefer ~/.hermes/.env over os.environ — the user's config file is the
-    # authoritative source for Hermes credentials. Stale env vars from parent
-    # processes (Codex CLI, test scripts, etc.) should not override deliberate
-    # changes to the .env file.
+    # Generic providers follow get_env_value() precedence: exported env first,
+    # then ~/.hermes/.env. OpenRouter keeps the older credential-pool contract
+    # where a freshly rotated ~/.hermes/.env key wins over a stale inherited
+    # shell export during pool seeding.
+    def _get_env_prefer_os(key: str) -> str:
+        val = os.environ.get(key) or load_env().get(key) or ""
+        return val.strip()
+
     def _get_env_prefer_dotenv(key: str) -> str:
-        env_file = load_env()
-        val = env_file.get(key) or os.environ.get(key) or ""
+        val = load_env().get(key) or os.environ.get(key) or ""
         return val.strip()
 
     # Honour user suppression — `hermes auth remove <provider> <N>` for an
@@ -1402,7 +1405,8 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         def _is_source_suppressed(_p, _s):  # type: ignore[misc]
             return False
     if provider == "openrouter":
-        # Prefer ~/.hermes/.env over os.environ
+        # Prefer ~/.hermes/.env for OpenRouter pool seeding so a freshly
+        # rotated dotenv key is not shadowed by a stale parent-shell export.
         token = _get_env_prefer_dotenv("OPENROUTER_API_KEY")
         if token:
             source = "env:OPENROUTER_API_KEY"
@@ -1429,7 +1433,7 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
 
     env_url = ""
     if pconfig.base_url_env_var:
-        env_url = _get_env_prefer_dotenv(pconfig.base_url_env_var).rstrip("/")
+        env_url = _get_env_prefer_os(pconfig.base_url_env_var).rstrip("/")
 
     env_vars = list(pconfig.api_key_env_vars)
     if provider == "anthropic":
@@ -1440,8 +1444,8 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         ]
 
     for env_var in env_vars:
-        # Prefer ~/.hermes/.env over os.environ
-        token = _get_env_prefer_dotenv(env_var)
+        # Read exported env first, falling back to ~/.hermes/.env
+        token = _get_env_prefer_os(env_var)
         if not token:
             continue
         source = f"env:{env_var}"

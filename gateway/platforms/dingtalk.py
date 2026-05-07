@@ -34,6 +34,7 @@ import re
 import traceback
 import uuid
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set
 
 try:
@@ -81,11 +82,20 @@ try:
 except ImportError:
     CARD_SDK_AVAILABLE = False
     dingtalk_card_client = None
-    dingtalk_card_models = None
     dingtalk_robot_client = None
     dingtalk_robot_models = None
     open_api_models = None
-    tea_util_models = None
+
+    class _DingTalkModelFallback(SimpleNamespace):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+
+    class _DingTalkFallbackModels:
+        def __getattr__(self, _name: str):
+            return _DingTalkModelFallback
+
+    dingtalk_card_models = _DingTalkFallbackModels()  # type: ignore[assignment]
+    tea_util_models = SimpleNamespace(RuntimeOptions=_DingTalkModelFallback)  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator

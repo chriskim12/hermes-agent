@@ -553,6 +553,16 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
             current["agent"] = agent
+            pending_title = current.get("pending_title")
+            if pending_title:
+                try:
+                    db = _get_db()
+                    if db and db.set_session_title(key, pending_title):
+                        current["pending_title"] = None
+                except ValueError:
+                    current["pending_title"] = None
+                except Exception:
+                    pass
 
             try:
                 worker = _SlashWorker(key, getattr(agent, "model", _resolve_model()))

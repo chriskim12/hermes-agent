@@ -5434,6 +5434,46 @@ class GatewayRunner:
             group_sessions_per_user=_group_sessions_per_user,
             thread_sessions_per_user=_thread_sessions_per_user,
         )
+
+        if (
+            source.platform == Platform.DISCORD
+            and source.chat_type == "thread"
+            and source.thread_id
+        ):
+            _linear_match = re.search(
+                r"\b([A-Z][A-Z0-9]+-\d+)\b\s*(진행해|진행|계속)\s*$",
+                message_text.strip(),
+            )
+            if _linear_match:
+                _issue_id = _linear_match.group(1)
+                try:
+                    from agent.skill_commands import build_skill_invocation_message, get_skill_commands
+                    _cmds = get_skill_commands()
+                    if "/linear-task-operator" not in _cmds:
+                        return (
+                            f"[Linear card execution ingress for {_issue_id}]\n"
+                            "Fail-closed result: blocked. Router skill unavailable; ordinary conversation handling is unsafe for execution cues.\n"
+                            f"Original user message: {message_text}"
+                        )
+                    _instruction = (
+                        f"Linear card execution ingress for {_issue_id}.\n"
+                        "Before broad repo reads or mutation, perform live Linear card preflight, load/use omx-card-execution-routing, "
+                        "declare the execution routing verdict, and preserve Hermes closeout authority.\n"
+                        f"Original user message: {message_text}"
+                    )
+                    _loaded = build_skill_invocation_message(
+                        "/linear-task-operator",
+                        user_instruction=_instruction,
+                    )
+                    if _loaded:
+                        return _loaded
+                except Exception as exc:
+                    return (
+                        f"[Linear card execution ingress for {_issue_id}]\n"
+                        f"Fail-closed result: blocked. Router skill unavailable: {exc}.\n"
+                        f"Original user message: {message_text}"
+                    )
+
         if _is_shared_multi_user and source.user_name:
             message_text = f"[{source.user_name}] {message_text}"
 
@@ -8328,6 +8368,67 @@ class GatewayRunner:
         )
 
         await adapter.handle_message(event)
+
+    def _current_turn_agent_messages(self, agent_messages: list, history_len: int = 0) -> list:
+        """Return messages for the current generated turn only."""
+        if history_len and history_len > 0:
+            return agent_messages[history_len:]
+        for idx in range(len(agent_messages) - 1, -1, -1):
+            if agent_messages[idx].get("role") == "user":
+                return agent_messages[idx:]
+        return agent_messages
+
+    def _generated_tts_key(self, event: MessageEvent) -> str:
+        return self._voice_key(event.source.platform, event.source.chat_id)
+
+    def _record_generated_tts_use(self, event: MessageEvent, now: float | None = None) -> None:
+        if not hasattr(self, "_generated_tts_last_sent"):
+            self._generated_tts_last_sent = {}
+        import time as _time
+        self._generated_tts_last_sent[self._generated_tts_key(event)] = float(now if now is not None else _time.time())
+
+    def _generated_tts_in_cooldown(self, event: MessageEvent, now: float | None = None) -> bool:
+        import time as _time
+        last = getattr(self, "_generated_tts_last_sent", {}).get(self._generated_tts_key(event))
+        if last is None:
+            return False
+        current = float(now if now is not None else _time.time())
+        return (current - last) < 120.0
+
+    def _should_send_generated_tts_reply(
+        self,
+        event: MessageEvent,
+        response: str,
+        agent_messages: list,
+    ) -> bool:
+        """Decide whether a short generated Discord-thread status reply may get TTS."""
+        if not response or response.startswith("Error:"):
+            return False
+        if event.source.platform.value != "discord" or not event.source.thread_id:
+            return False
+        if self._generated_tts_in_cooldown(event):
+            return False
+
+        technical_terms = (
+            "log", "logs", "env", "config", "gateway", "restart", "traceback",
+            "stack", "exception", "token", "secret", "database", "migration",
+        )
+        lowered = response.lower()
+        if any(term in lowered for term in technical_terms):
+            return False
+
+        for msg in agent_messages:
+            if msg.get("role") != "assistant":
+                continue
+            content = str(msg.get("content") or "")
+            if "[[audio_as_voice]]" in content and "MEDIA:" in content:
+                return False
+            for tc in (msg.get("tool_calls") or []):
+                name = (tc.get("function") or {}).get("name")
+                if name in {"text_to_speech", "yuuka_voice_reply"}:
+                    return False
+        return True
+
 
     def _should_send_voice_reply(
         self,

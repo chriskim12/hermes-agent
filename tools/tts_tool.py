@@ -327,10 +327,14 @@ BUILTIN_TTS_PROVIDERS = frozenset({
     "xai",
     "mistral",
     "gemini",
+    "fish",
     "neutts",
     "kittentts",
     "piper",
 })
+# Backward-compatible alias retained for older call sites/tests while
+# BUILTIN_TTS_PROVIDERS remains the canonical built-in-provider set.
+SUPPORTED_TTS_PROVIDERS = BUILTIN_TTS_PROVIDERS
 
 DEFAULT_COMMAND_TTS_TIMEOUT_SECONDS = 120
 DEFAULT_COMMAND_TTS_OUTPUT_FORMAT = "mp3"
@@ -1760,14 +1764,13 @@ def text_to_speech_tool(
 
     tts_config = _load_tts_config()
     provider = _get_provider(tts_config)
-    if provider not in SUPPORTED_TTS_PROVIDERS:
-        return tool_error(f"Unsupported TTS provider: {provider}", success=False)
-
     # User-declared command provider (type: command under tts.providers.<name>)
     # resolves BEFORE the built-in dispatch. Built-in names short-circuit here
     # so a user's ``tts.providers.openai.command`` can't override the real
     # OpenAI handler.
     command_provider_config = _resolve_command_provider_config(provider, tts_config)
+    if provider not in SUPPORTED_TTS_PROVIDERS and not command_provider_config:
+        return tool_error(f"Unsupported TTS provider: {provider}", success=False)
 
     # Truncate very long text with a warning. The cap is per-provider
     # (OpenAI 4096, xAI 15k, MiniMax 10k, ElevenLabs model-aware, etc.).
