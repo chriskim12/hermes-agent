@@ -22,6 +22,7 @@ from gateway.autopilot import (
     classify_linear_target,
     classify_work_state_target,
     evaluate_autopilot_pr_closeout_gate,
+    evaluate_kanban_closeout_gate,
     handle_autopilot_command,
     handle_autopilot_runtime_command,
     ingest_autopilot_executor_result,
@@ -2018,6 +2019,75 @@ def test_autopilot_closeout_gate_blocks_linear_done_without_pr_and_cleanup_evide
     assert "branch_pushed" in gate["missing"]
     assert "cleanup_done" in gate["missing"]
     assert "cleanup_proof" in gate["missing"]
+
+
+def test_kanban_closeout_gate_keeps_worker_done_separate_from_review_ready():
+    gate = evaluate_kanban_closeout_gate(
+        evidence={
+            "kanban_task": {"status": "done"},
+            "task_run": {"status": "done", "outcome": "completed"},
+            "commit": "1af1c992b4fe",
+        },
+        repo_name="hermes-agent",
+        remote_default_branch="main",
+        expected_repo_full_name="chriskim12/hermes-agent",
+    )
+
+    assert gate["allowed"] is False
+    assert gate["status"] == "blocked"
+    assert gate["phase"] == "worker_done"
+    assert gate["worker_done"] is True
+    assert gate["review_ready"] is False
+    assert gate["closed"] is False
+    assert gate["linear_done_mutated"] is False
+    assert gate["kanban_done_project_done"] is False
+    assert gate["reason"] == "kanban_worker_done_review_evidence_required"
+    assert "pr_url" in gate["missing"]
+    assert "cleanup_proof" in gate["missing"]
+
+
+def test_kanban_closeout_gate_marks_review_ready_only_after_pr_evidence():
+    gate = evaluate_kanban_closeout_gate(
+        evidence={
+            "task_run": {"status": "done", "outcome": "completed"},
+            "review_closeout": _valid_pr_closeout_evidence(),
+        },
+        repo_name="hermes-agent",
+        remote_default_branch="main",
+        expected_repo_full_name="chriskim12/hermes-agent",
+    )
+
+    assert gate["allowed"] is False
+    assert gate["status"] == "review_ready"
+    assert gate["phase"] == "review_ready"
+    assert gate["worker_done"] is True
+    assert gate["review_ready"] is True
+    assert gate["closed"] is False
+    assert gate["linear_done_mutated"] is False
+    assert gate["kanban_done_project_done"] is False
+    assert gate["reason"] == "kanban_review_ready_final_close_required"
+    assert gate["closeout_gate"]["allowed"] is True
+
+
+def test_kanban_closeout_gate_requires_explicit_final_close_after_review_ready():
+    gate = evaluate_kanban_closeout_gate(
+        evidence={
+            "task_run": {"status": "done", "outcome": "completed"},
+            "review_closeout": _valid_pr_closeout_evidence(),
+        },
+        repo_name="hermes-agent",
+        remote_default_branch="main",
+        expected_repo_full_name="chriskim12/hermes-agent",
+        final_close_approved=True,
+    )
+
+    assert gate["allowed"] is True
+    assert gate["status"] == "closed"
+    assert gate["phase"] == "closed"
+    assert gate["worker_done"] is True
+    assert gate["review_ready"] is True
+    assert gate["closed"] is True
+    assert gate["linear_done_mutated"] is False
 
 
 def test_autopilot_closeout_gate_allows_only_recorded_pr_less_exception():
