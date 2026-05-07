@@ -262,6 +262,7 @@ Browse, search, install, and manage skills from online registries, `skills.sh`, 
 
 ### Common commands
 
+<!-- ascii-guard-ignore -->
 ```bash
 hermes skills browse                              # Browse all hub skills (official first)
 hermes skills browse --source official            # Browse only official optional skills
@@ -286,6 +287,7 @@ hermes skills publish skills/my-skill --to github --repo owner/repo
 hermes skills snapshot export setup.json          # Export skill config
 hermes skills tap add myorg/skills-repo           # Add a custom GitHub source
 ```
+<!-- ascii-guard-ignore-end -->
 
 ### Supported hub sources
 
