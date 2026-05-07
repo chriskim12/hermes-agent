@@ -58,6 +58,7 @@ _PENDING_CLOSEOUT_MARKERS = frozenset({
 })
 _PR_URL_RE = re.compile(r"^https://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/pull/\d+/?$")
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
+_BRANCH_SAFE_RE = re.compile(r"[^A-Za-z0-9._/-]+")
 
 
 def resolve_autopilot_integration_branch(
@@ -1462,6 +1463,7 @@ def autopilot_controller_tick(
             "selected_issue": dry_run.get("selected_issue"),
             "would_create_work_state": dry_run.get("would_create_work_state"),
             "would_goal_contract": dry_run.get("would_goal_contract"),
+            "would_kanban_payload": dry_run.get("would_kanban_payload"),
             "linear_done_mutated": False,
             "next_card_started": False,
         }
@@ -1570,12 +1572,272 @@ def _would_work_state(candidate: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _kanban_policy(repo_policy: Optional[Mapping[str, Any]]) -> Mapping[str, Any]:
+    if not isinstance(repo_policy, Mapping):
+        return {}
+    nested = repo_policy.get("kanban")
+    return nested if isinstance(nested, Mapping) else {}
+
+
+def _kanban_payload_dry_run_enabled(repo_policy: Optional[Mapping[str, Any]]) -> bool:
+    if not isinstance(repo_policy, Mapping):
+        return False
+    nested = _kanban_policy(repo_policy)
+    return any(
+        _truthy_evidence(value)
+        for value in (
+            repo_policy.get("kanban_payload_dry_run"),
+            repo_policy.get("enable_kanban_payload_dry_run"),
+            nested.get("payload_dry_run"),
+            nested.get("dry_run"),
+        )
+    )
+
+
+def _first_policy_value(
+    repo_policy: Optional[Mapping[str, Any]],
+    keys: Iterable[str],
+    *,
+    nested_keys: Iterable[str] = (),
+) -> Optional[Any]:
+    nested = _kanban_policy(repo_policy)
+    for key in nested_keys:
+        value = nested.get(key)
+        if value not in (None, ""):
+            return value
+    if isinstance(repo_policy, Mapping):
+        for key in keys:
+            value = repo_policy.get(key)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def _repo_name_from_full_name(repo_full_name: Optional[str]) -> Optional[str]:
+    value = str(repo_full_name or "").strip()
+    if not value:
+        return None
+    return value.rstrip("/").split("/")[-1] or None
+
+
+def _worktree_branch_intent(issue: Mapping[str, Any], repo_policy: Optional[Mapping[str, Any]]) -> str:
+    identifier = str(issue.get("identifier") or "").strip().upper()
+    title = str(issue.get("title") or "").strip().lower()
+    slug = _BRANCH_SAFE_RE.sub("-", title.replace(" ", "-")).strip("-/")[:48]
+    fallback = f"autopilot/{identifier.lower()}" + (f"-{slug}" if slug else "")
+    template = _first_policy_value(
+        repo_policy,
+        ("worktree_branch_template", "branch_template"),
+        nested_keys=("worktree_branch_template", "branch_template"),
+    )
+    if not template:
+        return fallback
+    try:
+        branch = str(template).format(identifier=identifier, issue=identifier, title_slug=slug)
+    except Exception:
+        return fallback
+    branch = _BRANCH_SAFE_RE.sub("-", branch).strip("-/")
+    return branch or fallback
+
+
+def _skill_hints(repo_policy: Optional[Mapping[str, Any]]) -> list[str]:
+    raw = _first_policy_value(repo_policy, ("skills",), nested_keys=("skills",))
+    if isinstance(raw, str):
+        return [part.strip() for part in raw.split(",") if part.strip()]
+    if isinstance(raw, (list, tuple, set)):
+        return [str(part).strip() for part in raw if str(part).strip()]
+    return []
+
+
+def _linear_comments_snapshot(issue: Mapping[str, Any]) -> list[dict[str, Any]]:
+    comments = issue.get("comments")
+    nodes = comments.get("nodes") if isinstance(comments, Mapping) else []
+    if not isinstance(nodes, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for comment in nodes[:5]:
+        if not isinstance(comment, Mapping):
+            continue
+        result.append(
+            {
+                "body": str(comment.get("body") or "")[:500],
+                "created_at": comment.get("createdAt") or comment.get("created_at"),
+            }
+        )
+    return result
+
+
+def _resolve_kanban_tenant(issue: Mapping[str, Any], repo_policy: Optional[Mapping[str, Any]]) -> Optional[str]:
+    explicit = _first_policy_value(repo_policy, ("tenant",), nested_keys=("tenant",))
+    if explicit:
+        return str(explicit).strip()
+    try:
+        from hermes_cli.linear_kanban_shadow import tenant_for_linear_project
+
+        return tenant_for_linear_project(_project_name(issue))
+    except Exception:
+        return None
+
+
+def _would_kanban_payload(
+    issue: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    *,
+    goal_contract: Mapping[str, Any],
+    repo_policy: Optional[Mapping[str, Any]],
+    expected_repo_full_name: Optional[str],
+) -> dict[str, Any]:
+    identifier = str(issue.get("identifier") or "").strip().upper()
+    source_card = {
+        "identifier": identifier,
+        "title": issue.get("title") or "",
+        "url": issue.get("url"),
+        "state": (issue.get("state") or {}) if isinstance(issue.get("state"), Mapping) else {},
+        "parent_identifier": candidate.get("parent_id"),
+        "project": _project_name(issue),
+    }
+    repo_full_name = str(
+        expected_repo_full_name
+        or _first_policy_value(repo_policy, ("github_repo", "repo_full_name", "repo"))
+        or ""
+    ).strip()
+    executor = str(
+        _first_policy_value(repo_policy, ("executor",), nested_keys=("executor",))
+        or ""
+    ).strip()
+    tenant = _resolve_kanban_tenant(issue, repo_policy)
+    missing: list[str] = []
+    if not isinstance(repo_policy, Mapping) or not repo_policy:
+        missing.append("policy")
+    if not repo_full_name:
+        missing.append("repo_full_name")
+    if not _has_done_when(issue):
+        missing.append("done_when")
+    if not executor:
+        missing.append("executor")
+    if not tenant:
+        missing.append("tenant")
+    idempotency_key = f"linear:{identifier}" if identifier else ""
+    base_branch = resolve_autopilot_integration_branch(
+        repo_name=_repo_name_from_full_name(repo_full_name),
+        repo_policy=repo_policy,
+    )
+    worktree_branch = _worktree_branch_intent(issue, repo_policy)
+    profile = _first_policy_value(repo_policy, ("profile",), nested_keys=("profile",))
+    skills = _skill_hints(repo_policy)
+    body_source_payload = {
+        "source": "linear",
+        "identifier": identifier,
+        "url": issue.get("url"),
+        "idempotency_key": idempotency_key,
+        "tenant": tenant,
+        "autopilot": {
+            "mode": "dry_run_admission",
+            "linear_is_ssot": True,
+            "executor_dispatch": "forbidden_in_dry_run",
+            "kanban_done_projection": "forbidden",
+        },
+        "repo_intent": {
+            "repo_full_name": repo_full_name or None,
+            "base_branch": base_branch,
+            "worktree_branch": worktree_branch,
+        },
+        "goal_contract": {
+            "summary": goal_contract.get("summary"),
+            "mode": goal_contract.get("mode"),
+        },
+    }
+    body = "\n".join(
+        [
+            f"Autopilot Kanban dry-run for Linear `{identifier}`.",
+            "",
+            "Linear remains the source of truth. This payload is preview-only: "
+            "do not dispatch an executor, mutate Linear, or project Kanban Done back to Linear.",
+            "",
+            "```json source_payload",
+            json.dumps(body_source_payload, indent=2, sort_keys=True, ensure_ascii=False),
+            "```",
+        ]
+    )
+    payload: dict[str, Any] = {
+        "status": "would_create" if not missing else "blocked",
+        "reason": "kanban_payload_contract_ready"
+        if not missing
+        else "kanban_payload_contract_missing_required_fields",
+        "dry_run": True,
+        "missing": missing,
+        "source_card": source_card,
+        "goal_contract": {
+            "summary": goal_contract.get("summary"),
+            "mode": goal_contract.get("mode"),
+        },
+        "repo_intent": {
+            "repo_full_name": repo_full_name or None,
+            "base_branch": base_branch,
+            "worktree_branch": worktree_branch,
+        },
+        "execution_hints": {
+            "executor": executor or None,
+            "profile": str(profile).strip() if profile else None,
+            "skills": skills,
+        },
+        "task": {
+            "title": f"{identifier} — {issue.get('title') or ''}".strip(),
+            "body": body,
+            "tenant": tenant,
+            "idempotency_key": idempotency_key,
+            "workspace_kind": "worktree",
+            "status": "triage",
+            "assignee": None,
+            "skills": skills,
+        },
+        "dependencies": [
+            {
+                "source": "linear_parent",
+                "identifier": candidate.get("parent_id"),
+            }
+        ]
+        if candidate.get("parent_id")
+        else [],
+        "comments": _linear_comments_snapshot(issue),
+        "events": [
+            {
+                "kind": "autopilot_kanban_payload_dry_run",
+                "payload": {
+                    "source": "linear",
+                    "identifier": identifier,
+                    "idempotency_key": idempotency_key,
+                },
+            }
+        ],
+        "task_runs_metadata": {
+            "source": "linear_autopilot",
+            "linear_identifier": identifier,
+            "idempotency_key": idempotency_key,
+            "repo_full_name": repo_full_name or None,
+            "base_branch": base_branch,
+            "worktree_branch": worktree_branch,
+            "executor": executor or None,
+            "profile": str(profile).strip() if profile else None,
+        },
+        "side_effects": {
+            "kanban_task_written": False,
+            "executor_spawned": False,
+            "linear_done_mutated": False,
+            "kanban_done_projected_to_linear": False,
+        },
+    }
+    return payload
+
+
 def _finish_dry_run(
     issues: list[Mapping[str, Any]],
     *,
     active_work_ids: set[str],
     parent_override: Optional[str] = None,
     no_eligible_reason: str = "no_eligible_execution_ready_issue",
+    repo_policy: Optional[Mapping[str, Any]] = None,
+    expected_repo_full_name: Optional[str] = None,
 ) -> dict[str, Any]:
     sorted_issues = sorted(issues, key=_issue_identifier_sort_key)
     candidates = [
@@ -1589,15 +1851,43 @@ def _finish_dry_run(
     groups = _group_candidates(candidates)
     for issue, candidate in zip(sorted_issues, candidates):
         if candidate.get("eligible"):
-            return {
+            goal_contract = _would_goal_contract(issue)
+            if _kanban_payload_dry_run_enabled(repo_policy):
+                kanban_payload = _would_kanban_payload(
+                    issue,
+                    candidate,
+                    goal_contract=goal_contract,
+                    repo_policy=repo_policy,
+                    expected_repo_full_name=expected_repo_full_name,
+                )
+                if kanban_payload.get("status") != "would_create":
+                    return {
+                        "status": "blocked",
+                        "reason": str(
+                            kanban_payload.get("reason")
+                            or "kanban_payload_contract_missing_required_fields"
+                        ),
+                        "selected_issue": _selected_issue_payload(issue),
+                        "would_create_work_state": None,
+                        "would_goal_contract": goal_contract,
+                        "would_kanban_payload": kanban_payload,
+                        "candidates": candidates,
+                        "groups": groups,
+                    }
+            else:
+                kanban_payload = None
+            payload = {
                 "status": "would_run",
                 "reason": "dry_run_selected_execution_ready_issue",
                 "selected_issue": _selected_issue_payload(issue),
                 "would_create_work_state": _would_work_state(candidate),
-                "would_goal_contract": _would_goal_contract(issue),
+                "would_goal_contract": goal_contract,
                 "candidates": candidates,
                 "groups": groups,
             }
+            if kanban_payload is not None:
+                payload["would_kanban_payload"] = kanban_payload
+            return payload
     return {
         "status": "blocked",
         "reason": no_eligible_reason,
@@ -1666,7 +1956,12 @@ def evaluate_dry_run_admission(
                 linear_reason=queue.get("reason") or queue.get("status"),
             )
         issues = queue.get("issues") if isinstance(queue.get("issues"), list) else []
-        return _finish_dry_run(issues, active_work_ids=active_ids)
+        return _finish_dry_run(
+            issues,
+            active_work_ids=active_ids,
+            repo_policy=repo_policy,
+            expected_repo_full_name=expected_repo_full_name,
+        )
 
     if enforce_closeout_gate:
         closeout_snapshot = _autopilot_closeout_snapshot(
@@ -1712,8 +2007,15 @@ def evaluate_dry_run_admission(
             active_work_ids=active_ids,
             parent_override=str(classified.get("identifier") or command.target_id),
             no_eligible_reason="no_eligible_child",
+            repo_policy=repo_policy,
+            expected_repo_full_name=expected_repo_full_name,
         )
-    return _finish_dry_run([target_payload], active_work_ids=active_ids)
+    return _finish_dry_run(
+        [target_payload],
+        active_work_ids=active_ids,
+        repo_policy=repo_policy,
+        expected_repo_full_name=expected_repo_full_name,
+    )
 
 
 def _admission_decision(
@@ -1859,6 +2161,15 @@ def _format_result_message(decision: Mapping[str, Any]) -> str:
             lines.append(f"Would-contract: {would_goal.get('summary')}")
         else:
             lines.append("Would-contract: none")
+        would_kanban = dry_run.get("would_kanban_payload") or {}
+        if would_kanban:
+            task = would_kanban.get("task") or {}
+            lines.append(
+                "Would-kanban: "
+                f"{would_kanban.get('status')} "
+                f"{task.get('idempotency_key') or '-'} "
+                f"tenant={task.get('tenant') or '-'}"
+            )
         if dry_run.get("status") == "would_run":
             lines.append("Controller would: run after admission materializes the lock/goal contract.")
         elif dry_run.get("status") == "paused":
@@ -2095,6 +2406,12 @@ def run_autopilot_once(
         }
     work_state_store.upsert(record)
 
+    executor_dry_run = dict(dry_run)
+    # CH-410's Kanban payload is a preview/admission contract only. Do not pass
+    # it into the live executor-spawner path, where an integration could mistake
+    # the preview for authority to create a Kanban task or dispatch from it.
+    executor_dry_run.pop("would_kanban_payload", None)
+
     try:
         spawn_result = executor_spawner(
             goal_contract=goal_contract,
@@ -2102,7 +2419,7 @@ def run_autopilot_once(
             owner_session_id=owner_session,
             selected_issue=selected_issue,
             actor=actor,
-            dry_run=dry_run,
+            dry_run=executor_dry_run,
         )
     except Exception as exc:  # fail closed and leave an auditable blocked record
         blocked_reason = f"executor_spawn_failed:{type(exc).__name__}:{exc}"

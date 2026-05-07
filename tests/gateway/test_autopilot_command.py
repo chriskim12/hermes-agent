@@ -508,6 +508,172 @@ def test_dry_run_enabled_queue_selects_one_eligible_task_with_would_artifacts(tm
     spawner.assert_not_called()
 
 
+def test_targeted_dry_run_opt_in_includes_kanban_payload_contract(tmp_path):
+    store = _state_store(tmp_path)
+    work_state = _FakeWorkStateStore()
+    spawner = MagicMock()
+    issue = _issue(
+        "CH-410",
+        parent={"identifier": "CH-173", "title": "parent", "state": {"name": "Backlog", "type": "backlog"}},
+    )
+    issue["comments"] = {"nodes": [{"body": "latest context", "createdAt": "2026-05-07T00:00:00Z"}]}
+    linear = _FakeLinearClient({"CH-410": issue})
+
+    result = handle_autopilot_command(
+        "dry-run CH-410",
+        state_store=store,
+        work_state_store=work_state,
+        linear_client=linear,
+        executor_spawner=spawner,
+        repo_policy={
+            "kanban_payload_dry_run": True,
+            "github_repo": "chriskim12/hermes-agent",
+            "integration_branch": "develop",
+            "executor": "kanban-dispatcher",
+            "tenant": "hermes",
+            "profile": "coder",
+            "skills": ["kanban-worker", "linear"],
+        },
+    )
+
+    dry_run = result.decision["dry_run"]
+    payload = dry_run["would_kanban_payload"]
+    assert dry_run["status"] == "would_run"
+    assert payload["status"] == "would_create"
+    assert payload["source_card"]["identifier"] == "CH-410"
+    assert payload["goal_contract"] == {
+        "summary": "Execute Linear CH-410: CH-410 title",
+        "mode": "single-card",
+    }
+    assert payload["repo_intent"]["repo_full_name"] == "chriskim12/hermes-agent"
+    assert payload["repo_intent"]["base_branch"] == "develop"
+    assert payload["repo_intent"]["worktree_branch"].startswith("autopilot/ch-410")
+    assert payload["execution_hints"] == {
+        "executor": "kanban-dispatcher",
+        "profile": "coder",
+        "skills": ["kanban-worker", "linear"],
+    }
+    assert payload["task"]["tenant"] == "hermes"
+    assert payload["task"]["idempotency_key"] == "linear:CH-410"
+    assert "```json source_payload" in payload["task"]["body"]
+    assert "metadata" not in payload["task"]
+    assert payload["dependencies"] == [{"source": "linear_parent", "identifier": "CH-173"}]
+    assert payload["comments"] == [{"body": "latest context", "created_at": "2026-05-07T00:00:00Z"}]
+    assert payload["events"][0]["kind"] == "autopilot_kanban_payload_dry_run"
+    assert payload["task_runs_metadata"]["idempotency_key"] == "linear:CH-410"
+    assert payload["side_effects"] == {
+        "kanban_task_written": False,
+        "executor_spawned": False,
+        "linear_done_mutated": False,
+        "kanban_done_projected_to_linear": False,
+    }
+    assert work_state.upsert_calls == []
+    spawner.assert_not_called()
+
+
+def test_kanban_enabled_flag_alone_does_not_opt_into_payload_dry_run(tmp_path):
+    store = _state_store(tmp_path)
+    issue = _issue("CH-410")
+    linear = _FakeLinearClient({"CH-410": issue})
+
+    result = handle_autopilot_command(
+        "dry-run CH-410",
+        state_store=store,
+        work_state_store=_FakeWorkStateStore(),
+        linear_client=linear,
+        repo_policy={"kanban": {"enabled": True}, "tenant": "hermes"},
+    )
+
+    dry_run = result.decision["dry_run"]
+    assert dry_run["status"] == "would_run"
+    assert "would_kanban_payload" not in dry_run
+
+
+def test_nested_payload_dry_run_flag_is_explicit_opt_in(tmp_path):
+    store = _state_store(tmp_path)
+    issue = _issue("CH-410")
+    linear = _FakeLinearClient({"CH-410": issue})
+
+    result = handle_autopilot_command(
+        "dry-run CH-410",
+        state_store=store,
+        work_state_store=_FakeWorkStateStore(),
+        linear_client=linear,
+        repo_policy={
+            "kanban": {"payload_dry_run": True, "executor": "kanban-dispatcher", "tenant": "hermes"},
+            "github_repo": "chriskim12/hermes-agent",
+        },
+    )
+
+    dry_run = result.decision["dry_run"]
+    assert dry_run["status"] == "would_run"
+    assert dry_run["would_kanban_payload"]["task"]["idempotency_key"] == "linear:CH-410"
+
+
+def test_kanban_payload_contract_missing_repo_or_executor_fails_closed(tmp_path):
+    store = _state_store(tmp_path)
+    issue = _issue("CH-410")
+    linear = _FakeLinearClient({"CH-410": issue})
+
+    result = handle_autopilot_command(
+        "dry-run CH-410",
+        state_store=store,
+        work_state_store=_FakeWorkStateStore(),
+        linear_client=linear,
+        repo_policy={"kanban_payload_dry_run": True, "tenant": "hermes"},
+    )
+
+    dry_run = result.decision["dry_run"]
+    payload = dry_run["would_kanban_payload"]
+    assert dry_run["status"] == "blocked"
+    assert dry_run["reason"] == "kanban_payload_contract_missing_required_fields"
+    assert dry_run["would_create_work_state"] is None
+    assert payload["status"] == "blocked"
+    assert payload["missing"] == ["repo_full_name", "executor"]
+    assert payload["side_effects"]["kanban_task_written"] is False
+    assert result.decision["side_effects"]["executor_spawned"] is False
+
+
+def test_kanban_payload_contract_missing_done_when_uses_existing_fail_closed_admission(tmp_path):
+    store = _state_store(tmp_path)
+    issue = _issue("CH-410", description="## Verification\n- focused tests pass")
+    linear = _FakeLinearClient({}, queue=[issue])
+
+    result = handle_autopilot_command(
+        "dry-run",
+        state_store=store,
+        work_state_store=_FakeWorkStateStore(),
+        linear_client=linear,
+        repo_policy={
+            "kanban_payload_dry_run": True,
+            "github_repo": "chriskim12/hermes-agent",
+            "executor": "kanban-dispatcher",
+            "tenant": "hermes",
+        },
+    )
+
+    dry_run = result.decision["dry_run"]
+    assert dry_run["status"] == "paused"
+    assert dry_run["reason"] == "controller_disabled_noop"
+    store.set_enabled(True, actor="tester")
+    result = handle_autopilot_command(
+        "dry-run",
+        state_store=store,
+        work_state_store=_FakeWorkStateStore(),
+        linear_client=linear,
+        repo_policy={
+            "kanban_payload_dry_run": True,
+            "github_repo": "chriskim12/hermes-agent",
+            "executor": "kanban-dispatcher",
+            "tenant": "hermes",
+        },
+    )
+    dry_run = result.decision["dry_run"]
+    assert dry_run["status"] == "blocked"
+    assert dry_run["reason"] == "no_eligible_execution_ready_issue"
+    assert dry_run["candidates"][0]["reason"] == "missing_done_when"
+
+
 def test_dry_run_multiple_eligible_tasks_uses_deterministic_identifier_order(tmp_path):
     store = _state_store(tmp_path)
     store.set_enabled(True, actor="tester")
@@ -1015,6 +1181,33 @@ def test_run_autopilot_once_materializes_one_task_lock_contract_and_executor(tmp
     assert spawn_kwargs["goal_contract"].startswith("/goal")
 
 
+def test_run_autopilot_once_does_not_pass_kanban_preview_to_executor(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    work_state = _FakeWorkStateStore()
+    linear = _FakeLinearClient({}, queue=[_issue("CH-410")])
+    spawner = MagicMock(return_value={"session_id": "exec-410", "proof": "spawned"})
+
+    result = run_autopilot_once(
+        state_store=store,
+        work_state_store=work_state,
+        linear_client=linear,
+        executor_spawner=spawner,
+        owner_session_id="owner-410",
+        repo_policy={
+            "kanban_payload_dry_run": True,
+            "github_repo": "chriskim12/hermes-agent",
+            "executor": "kanban-dispatcher",
+            "tenant": "hermes",
+        },
+    )
+
+    assert result["status"] == "started"
+    assert result["dry_run"]["would_kanban_payload"]["task"]["idempotency_key"] == "linear:CH-410"
+    spawn_kwargs = spawner.call_args.kwargs
+    assert "would_kanban_payload" not in spawn_kwargs["dry_run"]
+
+
 def test_run_autopilot_once_refuses_when_controller_off_without_queue_scan(tmp_path):
     store = _state_store(tmp_path)
     work_state = _FakeWorkStateStore()
@@ -1329,11 +1522,19 @@ def test_controller_tick_selects_next_only_after_verified_pr_closeout(tmp_path):
         work_state_store=work_state,
         linear_client=linear,
         expected_repo_full_name="chriskim12/hermes-agent",
+        repo_policy={
+            "kanban_payload_dry_run": True,
+            "github_repo": "chriskim12/hermes-agent",
+            "integration_branch": "main",
+            "executor": "kanban-dispatcher",
+            "tenant": "hermes",
+        },
     )
 
     assert decision["decision"] == "next_card_selection"
     assert decision["selected_issue"]["identifier"] == "CH-406"
     assert decision["would_create_work_state"]["work_id"] == "CH-406"
+    assert decision["would_kanban_payload"]["task"]["idempotency_key"] == "linear:CH-406"
     assert decision["linear_done_mutated"] is False
     assert decision["next_card_started"] is False
     assert linear.queue_calls == [{"team_key": "CH", "state_name": "Execution Ready", "limit": 100}]
