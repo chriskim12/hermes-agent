@@ -257,6 +257,27 @@ For external ledgers, project only concise, idempotent summaries back out of Kan
 
 Security boundary: the dashboard is intended for localhost/Tailscale-style trusted access. Do not expose the Kanban dashboard or plugin API publicly without a separate auth/reverse-proxy design, because task bodies, comments, workspace paths, and mutation routes are operationally sensitive.
 
+### Linear retirement gates and drift audits
+
+Lowering Linear from source of truth to projection is a per-domain governance decision, not a board setting. Treat the Kanban ledger as eligible only when a named domain has sustained evidence across all of these gates:
+
+| Gate | Required evidence | Fail-closed condition |
+|---|---|---|
+| Semantic coverage | Every Linear-backed invariant for the domain has a Kanban owner: native field/status, run metadata, governance adapter, or projection contract | Any unmapped invariant keeps Linear authoritative |
+| Shadow idempotency | Re-running the bridge for the same source card returns the same Kanban task and rejects source mismatches | Duplicate or ambiguous source mapping blocks the flip |
+| Closeout parity | `worker_done`, `review_ready`, and `closed` remain separate and final closeout verifies PR/checks/evidence/cleanup at least as strictly as the Linear-era gate | Kanban `done` can close a project item by itself |
+| Review usability | Blocked, stale/reclaim, failed, active, worker_done, review_ready, and closed queues are inspectable without compacted chat context | Chris cannot answer what is blocked, stale, or review-ready from live surfaces |
+| Projection stability | Linear, Discord, wiki, and GitHub summaries are concise, idempotent, authority-labeled, and secret-safe | Projection spam, stale snapshots, or authority ambiguity appears |
+| Drift audit | Linear, Kanban, work_state, GitHub, and durable wiki/Discord references agree for a sampled domain over multiple runs | Any unresolved mismatch, missing evidence, or stale owner remains |
+
+Decision states:
+
+- **Linear remains authority** — default. Use this when any gate is missing, evidence is fresh but not sustained, or the domain still depends on Linear-only semantics.
+- **Linear becomes projection** — allowed only for a named domain after passing every gate and after an explicit human approval reference is recorded. Linear may receive idempotent summaries, but Kanban/governance is the operating ledger for that domain.
+- **Linear retired for the domain** — the strictest state. Requires the projection state to survive drift audits, incident recovery, closeout review, and reference stability without losing evidence. Historical `CH-###` references must remain resolvable.
+
+A drift audit must compare at least: source ids and parent/child links, current queue/review state, run/work_state correlation, PR/check status, closeout comments, cleanup evidence, Discord/wiki references, and secret/redaction hygiene. Do not flip a domain during the audit; record the proposed decision and require explicit approval before changing authority.
+
 ### Architecture
 
 The GUI is strictly a **read-through-the-DB + write-through-kanban_db** layer with no domain logic of its own:
