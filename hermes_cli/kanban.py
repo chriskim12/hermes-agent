@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import linear_kanban_shadow as linear_shadow
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +204,29 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "kanban-worker skill. Example: "
                                "--skill translation --skill github-code-review")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    # --- shadow-linear ---
+    p_shadow_linear = sub.add_parser(
+        "shadow-linear",
+        help="Create an idempotent Linear issue shadow task (no dispatch)",
+    )
+    p_shadow_linear.add_argument("identifier", help="Linear issue identifier, e.g. CH-409")
+    p_shadow_linear.add_argument(
+        "--tenant",
+        default=None,
+        help="Override tenant namespace (default: project-derived, e.g. Brain OS -> brain-os)",
+    )
+    p_shadow_linear.add_argument(
+        "--created-by",
+        default="linear-shadow-bridge",
+        help="Author recorded on the Kanban task",
+    )
+    p_shadow_linear.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch/map the issue and report the task payload without writing Kanban",
+    )
+    p_shadow_linear.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- list ---
     p_list = sub.add_parser("list", aliases=["ls"], help="List tasks")
@@ -458,6 +482,7 @@ def kanban_command(args: argparse.Namespace) -> int:
     handlers = {
         "init":     _cmd_init,
         "create":   _cmd_create,
+        "shadow-linear": _cmd_shadow_linear,
         "list":     _cmd_list,
         "ls":       _cmd_list,
         "show":     _cmd_show,
@@ -641,6 +666,33 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    return 0
+
+
+def _cmd_shadow_linear(args: argparse.Namespace) -> int:
+    try:
+        issue = linear_shadow.fetch_linear_issue(args.identifier)
+        with kb.connect() as conn:
+            result = linear_shadow.shadow_issue_to_kanban(
+                conn,
+                issue,
+                tenant=args.tenant,
+                created_by=args.created_by,
+                dry_run=bool(getattr(args, "dry_run", False)),
+            )
+    except Exception as exc:
+        print(f"kanban: shadow-linear: {exc}", file=sys.stderr)
+        return 1
+
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    action = "Would create" if result.get("dry_run") else ("Created" if result.get("created") else "Reused")
+    print(
+        f"{action} {result['task_id'] or '(new task)'} "
+        f"[{result['tenant']}] {result['idempotency_key']} "
+        f"({result['status']})"
+    )
     return 0
 
 
