@@ -307,6 +307,7 @@ class TestBuiltinDiscovery:
             "tools.kanban_tools",
             "tools.memory_tool",
             "tools.mixture_of_agents_tool",
+            "tools.omx_ralph_session_surface",
             "tools.process_registry",
             "tools.rl_training_tool",
             "tools.send_message_tool",

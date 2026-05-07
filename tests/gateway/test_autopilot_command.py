@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -18,8 +19,11 @@ from gateway.autopilot import (
     AutopilotParseError,
     AutopilotStateStore,
     classify_linear_target,
+    evaluate_autopilot_pr_closeout_gate,
     handle_autopilot_command,
+    handle_autopilot_runtime_command,
     parse_autopilot_args,
+    resolve_autopilot_integration_branch,
     run_autopilot_once,
 )
 from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -824,6 +828,9 @@ def test_run_autopilot_once_materializes_one_task_lock_contract_and_executor(tmp
     assert record.state == "running"
     assert record.executor_session_id == "exec-1"
     assert record.proof == "spawned"
+    assert record.close_authority == "autopilot_pr_closeout_gate"
+    assert record.cleanup_required is True
+    assert record.cleanup_proof == "pending_autopilot_pr_closeout_cleanup"
     assert "Execute Linear CH-401" in record.objective
     spawner.assert_called_once()
     spawn_kwargs = spawner.call_args.kwargs
@@ -915,6 +922,113 @@ def test_run_autopilot_once_off_after_run_blocks_next_start(tmp_path):
     assert spawner.call_count == 1
 
 
+def test_runtime_command_targeted_one_shot_materializes_lock_goal_and_executor(tmp_path):
+    store = _state_store(tmp_path)
+    work_state = _FakeWorkStateStore()
+    linear = _FakeLinearClient({"CH-401": _issue("CH-401")}, queue=[_issue("CH-401")])
+    spawner = MagicMock(return_value={"session_id": "exec-401", "proof": "queued"})
+
+    result = handle_autopilot_runtime_command(
+        "CH-401",
+        state_store=store,
+        work_state_store=work_state,
+        linear_client=linear,
+        executor_spawner=spawner,
+        actor="tester",
+        owner_session_id="owner-401",
+    )
+
+    assert result.ok is True
+    assert result.decision["side_effects"] == {
+        "state_written": False,
+        "work_state_written": True,
+        "executor_spawned": True,
+        "linear_done_mutated": False,
+    }
+    assert result.decision["materialization"]["work_id"] == "CH-401"
+    assert work_state.records[0].state == "running"
+    assert work_state.records[0].executor_session_id == "exec-401"
+    spawner.assert_called_once()
+    assert spawner.call_args.kwargs["goal_contract"].startswith("/goal")
+    assert "Mode: execution" in result.message
+
+
+def test_runtime_command_on_records_intent_then_runs_one_queue_candidate(tmp_path):
+    store = _state_store(tmp_path)
+    work_state = _FakeWorkStateStore()
+    linear = _FakeLinearClient({}, queue=[_issue("CH-401"), _issue("CH-402")])
+    spawner = MagicMock(return_value={"session_id": "exec-queue", "proof": "queued"})
+
+    result = handle_autopilot_runtime_command(
+        "ON",
+        state_store=store,
+        work_state_store=work_state,
+        linear_client=linear,
+        executor_spawner=spawner,
+        actor="tester",
+        owner_session_id="owner-on",
+    )
+
+    assert store.status()["enabled"] is True
+    assert result.ok is True
+    assert result.decision["side_effects"]["state_written"] is True
+    assert result.decision["materialization"]["selected_issue"]["identifier"] == "CH-401"
+    assert [record.work_id for record in work_state.records] == ["CH-401"]
+    assert spawner.call_count == 1
+
+
+def test_runtime_command_reports_target_candidate_blocker(tmp_path):
+    store = _state_store(tmp_path)
+    work_state = _FakeWorkStateStore()
+    linear = _FakeLinearClient(
+        {"CH-401": _issue("CH-401", description="## Verification\n- focused tests pass")},
+        queue=[_issue("CH-401", description="## Verification\n- focused tests pass")],
+    )
+    spawner = MagicMock()
+
+    result = handle_autopilot_runtime_command(
+        "CH-401",
+        state_store=store,
+        work_state_store=work_state,
+        linear_client=linear,
+        executor_spawner=spawner,
+        actor="tester",
+        owner_session_id="owner-401",
+    )
+
+    assert result.ok is False
+    assert "Decision: blocked (no_eligible_execution_ready_issue)." in result.message
+    assert "Admission candidate: CH-401 eligible=false reason=missing_done_when" in result.message
+    assert "Blocked/no-op reason: no_eligible_execution_ready_issue" in result.message
+    assert work_state.records == []
+    spawner.assert_not_called()
+
+
+
+def test_runtime_command_keeps_status_and_dry_run_read_only(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    work_state = _FakeWorkStateStore()
+    linear = _FakeLinearClient({}, queue=[_issue("CH-401")])
+    spawner = MagicMock()
+
+    result = handle_autopilot_runtime_command(
+        "dry-run",
+        state_store=store,
+        work_state_store=work_state,
+        linear_client=linear,
+        executor_spawner=spawner,
+        actor="tester",
+    )
+
+    assert result.ok is True
+    assert result.command.action == ACTION_DRY_RUN
+    assert result.decision["side_effects"]["executor_spawned"] is False
+    assert work_state.records == []
+    spawner.assert_not_called()
+
+
+
 def test_command_registry_exposes_autopilot_to_gateway_surfaces():
     from hermes_cli.commands import (
         is_gateway_known_command,
@@ -953,7 +1067,10 @@ def _make_runner():
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
     )
-    runner.adapters = {Platform.TELEGRAM: MagicMock(send=AsyncMock())}
+    adapter = MagicMock(send=AsyncMock())
+    adapter._pending_messages = {}
+    adapter.handle_message = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: adapter}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
     runner.session_store.get_or_create_session.return_value = SessionEntry(
@@ -990,6 +1107,7 @@ def _make_runner():
     runner._send_voice_reply = AsyncMock()
     runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
     runner._emit_gateway_run_progress = AsyncMock()
+    runner._background_tasks = set()
     return runner
 
 
@@ -997,11 +1115,11 @@ def _make_runner():
 async def test_gateway_autopilot_bypasses_running_agent_without_interrupt(monkeypatch):
     calls = []
 
-    def _fake_handle(raw_args, *, actor=None):
+    def _fake_handle(raw_args, *, actor=None, **kwargs):
         calls.append({"raw_args": raw_args, "actor": actor})
         return SimpleNamespace(message="autopilot handled")
 
-    monkeypatch.setattr("gateway.autopilot.handle_autopilot_command", _fake_handle)
+    monkeypatch.setattr("gateway.autopilot.handle_autopilot_runtime_command", _fake_handle)
     runner = _make_runner()
     session_key = build_session_key(_make_source())
     running_agent = SimpleNamespace(interrupt=MagicMock())
@@ -1014,6 +1132,50 @@ async def test_gateway_autopilot_bypasses_running_agent_without_interrupt(monkey
     assert calls == [{"raw_args": "status CH-385", "actor": "tester"}]
     running_agent.interrupt.assert_not_called()
     assert runner._pending_messages == {}
+
+
+@pytest.mark.asyncio
+async def test_gateway_autopilot_target_dispatches_generated_goal_contract_when_session_idle(monkeypatch):
+    fake_work_state = _FakeWorkStateStore()
+
+    class _StoreFactory:
+        def __call__(self):
+            return fake_work_state
+
+    class _LinearFactory:
+        def __call__(self):
+            return _FakeLinearClient({"CH-401": _issue("CH-401")}, queue=[_issue("CH-401")])
+
+    monkeypatch.setattr("gateway.work_state.WorkStateStore", _StoreFactory())
+    monkeypatch.setattr("gateway.autopilot.EnvLinearIssueClient", _LinearFactory())
+    runner = _make_runner()
+    goal_sets = []
+
+    class _FakeGoalManager:
+        def set(self, goal):
+            goal_sets.append(goal)
+            return SimpleNamespace(goal=goal)
+
+    runner._get_goal_manager_for_event = lambda _event: (_FakeGoalManager(), runner.session_store.get_or_create_session.return_value)
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter._pending_messages = {}
+    event = _make_event("/autopilot CH-401")
+
+    result = await runner._handle_autopilot_command(event)
+
+    assert "Decision: started" in result
+    assert "work_state lock: CH-401" in result
+    assert fake_work_state.records[0].work_id == "CH-401"
+    assert fake_work_state.records[0].state == "running"
+    assert fake_work_state.records[0].executor_session_id == "sess-1"
+    await asyncio.sleep(0)
+    adapter.handle_message.assert_awaited_once()
+    dispatched = adapter.handle_message.await_args.args[0]
+    assert not dispatched.text.startswith("/goal")
+    assert goal_sets == [dispatched.text]
+    assert "CH-401" in dispatched.text
+    assert dispatched.source == event.source
+    assert adapter._pending_messages == {}
 
 
 def test_cli_autopilot_dispatch_uses_same_controller(monkeypatch):
@@ -1035,3 +1197,124 @@ def test_cli_autopilot_dispatch_uses_same_controller(monkeypatch):
     assert cli.process_command("/autopilot dry-run CH-385") is True
     assert calls == [{"raw_args": "dry-run CH-385", "actor": "local-cli"}]
     assert captured == ["cli autopilot handled"]
+
+
+def _valid_pr_closeout_evidence(**overrides):
+    evidence = {
+        "commit": "1af1c992b4fe",
+        "remote_branch": "feature/CH-309-env-authority-coverage",
+        "branch_pushed": True,
+        "pr_created": True,
+        "pr_verified": True,
+        "pr_url": "https://github.com/chriskim12/hermes-agent/pull/173",
+        "pr_base": "main",
+        "pr_head": "feature/CH-309-env-authority-coverage",
+        "checks_passed": True,
+        "cleanup_done": True,
+        "cleanup_proof": "task_owned_worktree_removed",
+        "linear_evidence_comment_id": "comment-123",
+    }
+    evidence.update(overrides)
+    return evidence
+
+
+def test_autopilot_closeout_gate_blocks_linear_done_without_pr_and_cleanup_evidence():
+    gate = evaluate_autopilot_pr_closeout_gate(
+        evidence={"commit": "1af1c992b4fe"},
+        repo_name="hermes-agent",
+        remote_default_branch="main",
+    )
+
+    assert gate["allowed"] is False
+    assert gate["status"] == "blocked"
+    assert gate["linear_done_mutated"] is False
+    assert gate["expected_integration_branch"] == "main"
+    assert "pr_url" in gate["missing"]
+    assert "branch_pushed" in gate["missing"]
+    assert "cleanup_done" in gate["missing"]
+    assert "cleanup_proof" in gate["missing"]
+
+
+def test_autopilot_closeout_gate_allows_verified_pr_and_cleanup_to_integration_branch():
+    gate = evaluate_autopilot_pr_closeout_gate(
+        evidence=_valid_pr_closeout_evidence(),
+        repo_name="hermes-agent",
+        remote_default_branch="main",
+    )
+
+    assert gate == {
+        "allowed": True,
+        "status": "allowed",
+        "reason": "autopilot_pr_cleanup_evidence_satisfied",
+        "mode": "autopilot",
+        "requires_pr": True,
+        "expected_integration_branch": "main",
+        "linear_done_mutated": False,
+        "missing": [],
+        "violations": [],
+    }
+
+
+def test_autopilot_closeout_gate_uses_dailychingu_develop_not_main():
+    assert resolve_autopilot_integration_branch(repo_name="DailyChingu", remote_default_branch="main") == "develop"
+
+    gate = evaluate_autopilot_pr_closeout_gate(
+        evidence=_valid_pr_closeout_evidence(pr_base="main"),
+        repo_name="DailyChingu",
+        remote_default_branch="main",
+    )
+
+    assert gate["allowed"] is False
+    assert gate["expected_integration_branch"] == "develop"
+    assert "wrong_pr_base:expected=develop:actual=main" in gate["violations"]
+
+    allowed = evaluate_autopilot_pr_closeout_gate(
+        evidence=_valid_pr_closeout_evidence(pr_base="develop"),
+        repo_name="DailyChingu",
+        remote_default_branch="main",
+    )
+    assert allowed["allowed"] is True
+
+
+def test_autopilot_closeout_gate_rejects_pr_head_branch_mismatch_and_bad_url():
+    gate = evaluate_autopilot_pr_closeout_gate(
+        evidence=_valid_pr_closeout_evidence(
+            pr_url="https://example.com/not-a-github-pr",
+            pr_head="different-branch",
+        ),
+        repo_name="hermes-agent",
+        remote_default_branch="main",
+    )
+
+    assert gate["allowed"] is False
+    assert "pr_url_not_github_pull_url" in gate["violations"]
+    assert "pr_head_remote_branch_mismatch" in gate["violations"]
+
+def test_autopilot_closeout_gate_dailychingu_develop_cannot_be_overridden_by_policy():
+    gate = evaluate_autopilot_pr_closeout_gate(
+        evidence=_valid_pr_closeout_evidence(pr_base="main"),
+        repo_name="DailyChingu",
+        remote_default_branch="main",
+        repo_policy={"integration_branch": "main"},
+    )
+
+    assert gate["allowed"] is False
+    assert gate["expected_integration_branch"] == "develop"
+    assert "wrong_pr_base:expected=develop:actual=main" in gate["violations"]
+
+
+def test_autopilot_closeout_gate_rejects_pr_url_for_wrong_repo():
+    gate = evaluate_autopilot_pr_closeout_gate(
+        evidence=_valid_pr_closeout_evidence(
+            pr_url="https://github.com/someone-else/hermes-agent/pull/173"
+        ),
+        repo_name="hermes-agent",
+        remote_default_branch="main",
+        expected_repo_full_name="chriskim12/hermes-agent",
+    )
+
+    assert gate["allowed"] is False
+    assert (
+        "pr_url_repo_mismatch:expected=chriskim12/hermes-agent:actual=someone-else/hermes-agent"
+        in gate["violations"]
+    )

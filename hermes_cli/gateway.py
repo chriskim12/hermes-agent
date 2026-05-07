@@ -1632,7 +1632,10 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
     # SIGKILL on the cgroup — otherwise bash/sleep tool-call children left
     # by a force-interrupted agent get reaped by systemd instead of us
     # (#8202). 30s of headroom covers the worst case we've observed.
-    _drain_timeout = int(_get_restart_drain_timeout() or 0)
+    # Unit generation must be deterministic and not depend on the caller's live
+    # profile config; otherwise tests/builds inherit host gateway settings. The
+    # running gateway still reads profile/env drain timeout at restart time.
+    _drain_timeout = 60
     restart_timeout = max(60, _drain_timeout) + 30
 
     if system:

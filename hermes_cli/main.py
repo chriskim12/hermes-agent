@@ -6698,20 +6698,23 @@ def cmd_update(args):
         return
 
     gateway_mode = getattr(args, "gateway", False)
+    input_is_tty = bool(sys.stdin.isatty() and sys.stdout.isatty())
 
     # Protect against mid-update terminal disconnects (SIGHUP) and tolerate
     # writes to a closed stdout.  No-op in gateway mode.  See
     # _install_hangup_protection for rationale.
     _update_io_state = _install_hangup_protection(gateway_mode=gateway_mode)
     try:
-        _cmd_update_impl(args, gateway_mode=gateway_mode)
+        _cmd_update_impl(args, gateway_mode=gateway_mode, input_is_tty=input_is_tty)
     finally:
         _finalize_update_output(_update_io_state)
 
 
-def _cmd_update_impl(args, gateway_mode: bool):
+def _cmd_update_impl(args, gateway_mode: bool, input_is_tty: bool | None = None):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
+    if input_is_tty is None:
+        input_is_tty = bool(sys.stdin.isatty() and sys.stdout.isatty())
     # In gateway mode, use file-based IPC for prompts instead of stdin
     gw_input_fn = (
         (lambda prompt, default="": _gateway_prompt(prompt, default))
@@ -6841,7 +6844,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         prompt_for_restore = (
             auto_stash_ref is not None
             and not assume_yes
-            and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty()))
+            and (gateway_mode or input_is_tty)
         )
 
         # Check if there are updates
@@ -7113,7 +7116,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     .strip()
                     .lower()
                 )
-            elif not (sys.stdin.isatty() and sys.stdout.isatty()):
+            elif not input_is_tty:
                 print("  ℹ Non-interactive session — skipping config migration prompt.")
                 print(
                     "    Run 'hermes config migrate' later to apply any new config/env options."
@@ -7516,7 +7519,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         os.kill(pid, _signal.SIGTERM)
                     except (ProcessLookupError, PermissionError):
                         pass
-                killed_pids.add(pid)
                 relaunched_profiles.append(proc.profile)
 
             for pid in manual_pids:
@@ -7528,14 +7530,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 except (ProcessLookupError, PermissionError):
                     pass
 
-            if restarted_services or killed_pids:
+            if restarted_services or killed_pids or relaunched_profiles:
                 print()
                 for svc in restarted_services:
                     print(f"  ✓ Restarted {svc}")
                 if relaunched_profiles:
                     names = ", ".join(relaunched_profiles)
                     print(f"  ✓ Restarting manual gateway profile(s): {names}")
-                unmapped_count = len(killed_pids) - len(relaunched_profiles)
+                unmapped_count = max(0, len(killed_pids) - len(relaunched_profiles))
                 if unmapped_count:
                     print(f"  → Stopped {unmapped_count} manual gateway process(es)")
                     print("    Restart manually: hermes gateway run")
@@ -7558,29 +7560,34 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # any remaining pre-update PIDs so the watcher / service
             # manager can relaunch with fresh code.
             try:
-                _time.sleep(3.0)
-                _service_pids_after = _get_service_pids()
-                _surviving = find_gateway_pids(
-                    exclude_pids=_service_pids_after, all_profiles=True,
-                )
-                # Scope to PIDs we already tried to kill during this
-                # update (killed_pids).  Anything new is a gateway that
-                # started AFTER our restart attempt — respecting user
-                # intent, we don't kill those.
-                _stuck = [pid for pid in _surviving if pid in killed_pids]
-                if _stuck:
-                    print()
-                    print(
-                        f"  ⚠ {len(_stuck)} gateway process(es) ignored SIGTERM — force-killing"
+                if restarted_services:
+                    _time.sleep(3.0)
+                    _service_pids_after = _get_service_pids()
+                    _surviving = find_gateway_pids(
+                        exclude_pids=_service_pids_after, all_profiles=True,
                     )
-                    for pid in _stuck:
-                        try:
-                            os.kill(pid, _signal.SIGKILL)
-                        except (ProcessLookupError, PermissionError):
-                            pass
-                    # Give the OS a beat to reap the processes so the
-                    # watchers see them exit and respawn.
-                    _time.sleep(1.5)
+                    # Scope the hard-kill sweep to PIDs already targeted by a
+                    # managed restart. Launchd/manual profile restarts rely on
+                    # their drain/SIGTERM path above; do not add a second,
+                    # immediate SIGKILL there.
+                    _manual_pid_set = set(manual_pids)
+                    _stuck = [
+                        pid for pid in _surviving
+                        if pid in killed_pids and pid not in _manual_pid_set
+                    ]
+                    if _stuck:
+                        print()
+                        print(
+                            f"  ⚠ {len(_stuck)} gateway process(es) ignored SIGTERM — force-killing"
+                        )
+                        for pid in _stuck:
+                            try:
+                                os.kill(pid, _signal.SIGKILL)
+                            except (ProcessLookupError, PermissionError):
+                                pass
+                        # Give the OS a beat to reap the processes so the
+                        # watchers see them exit and respawn.
+                        _time.sleep(1.5)
             except Exception as _sweep_exc:
                 logger.debug("Post-restart survivor sweep failed: %s", _sweep_exc)
 

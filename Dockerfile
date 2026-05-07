@@ -36,6 +36,7 @@ WORKDIR /opt/hermes
 COPY package.json package-lock.json ./
 COPY web/package.json web/package-lock.json web/
 COPY ui-tui/package.json ui-tui/package-lock.json ui-tui/
+COPY ui-tui/packages/hermes-ink/package.json ui-tui/packages/hermes-ink/package-lock.json ui-tui/packages/hermes-ink/
 COPY ui-tui/packages/hermes-ink/ ui-tui/packages/hermes-ink/
 
 # `npm_config_install_links=false` forces npm to install `file:` deps as
@@ -61,7 +62,14 @@ COPY --chown=hermes:hermes . .
 
 # Build browser dashboard and terminal UI assets.
 RUN cd web && npm run build && \
-    cd ../ui-tui && npm run build
+    cd ../ui-tui && npm run build && \
+    rm -rf node_modules/@hermes/ink && \
+    mkdir -p node_modules/@hermes && \
+    cp -R packages/hermes-ink node_modules/@hermes/ink && \
+    rm -rf packages/hermes-ink/node_modules && \
+    npm install --omit=dev --prefix node_modules/@hermes/ink --prefer-offline --no-audit && \
+    rm -rf node_modules/@hermes/ink/node_modules/react && \
+    node -e "await import('@hermes/ink')"
 
 # ---------- Permissions ----------
 # Make install dir world-readable so any HERMES_UID can read it at runtime.

@@ -76,6 +76,14 @@ def load_state() -> Dict[str, Any]:
     return _default_state()
 
 
+def _cleanup_state_tmp_files(parent: Path) -> None:
+    for tmp in parent.glob(".curator_state_*.tmp"):
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def save_state(data: Dict[str, Any]) -> None:
     path = _state_file()
     try:
@@ -87,6 +95,7 @@ def save_state(data: Dict[str, Any]) -> None:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, path)
+            _cleanup_state_tmp_files(path.parent)
         except BaseException:
             try:
                 os.unlink(tmp)

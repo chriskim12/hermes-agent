@@ -196,16 +196,6 @@ class HermesACPAgent(acp.Agent):
             "description": "Compress conversation context",
         },
         {
-            "name": "steer",
-            "description": "Inject guidance into the currently running agent turn",
-            "input_hint": "guidance for the active turn",
-        },
-        {
-            "name": "queue",
-            "description": "Queue a prompt to run after the current turn finishes",
-            "input_hint": "prompt to run next",
-        },
-        {
             "name": "version",
             "description": "Show Hermes version",
         },

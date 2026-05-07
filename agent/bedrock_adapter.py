@@ -31,10 +31,67 @@ import json
 import logging
 import os
 import re
+import sys
+import types
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+try:
+    import botocore.session  # type: ignore[import-not-found]
+except ImportError:
+    # Keep optional Bedrock support importable without botocore/boto3. Tests and
+    # callers may patch botocore.session.get_session to exercise region routing;
+    # provide a tiny patchable module stub instead of making the optional
+    # dependency mandatory for the whole CLI.
+    _botocore_module = types.ModuleType("botocore")
+    _botocore_module.__path__ = []  # type: ignore[attr-defined]
+    _botocore_session_module = types.ModuleType("botocore.session")
+    _botocore_exceptions_module = types.ModuleType("botocore.exceptions")
+
+    class _BotocoreStubError(Exception):
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+            super().__init__(*args or (kwargs.get("message") or kwargs.get("endpoint_url") or "botocore error",))
+
+    class BotoCoreError(_BotocoreStubError):
+        pass
+
+    class HTTPClientError(BotoCoreError):
+        pass
+
+    class ConnectionError(HTTPClientError):
+        pass
+
+    class ConnectionClosedError(ConnectionError):
+        pass
+
+    class EndpointConnectionError(ConnectionError):
+        pass
+
+    class ReadTimeoutError(HTTPClientError):
+        pass
+
+    class ClientError(BotoCoreError):
+        def __init__(self, error_response=None, operation_name=None, *args, **kwargs):
+            self.response = error_response or {}
+            self.operation_name = operation_name
+            super().__init__(*args or (self.response.get("Error", {}).get("Message") or "client error",), **kwargs)
+
+    for _cls in (BotoCoreError, HTTPClientError, ConnectionError, ConnectionClosedError, EndpointConnectionError, ReadTimeoutError, ClientError):
+        _cls.__module__ = "botocore.exceptions"
+        setattr(_botocore_exceptions_module, _cls.__name__, _cls)
+
+    def _missing_botocore_session():
+        raise ImportError("botocore is required for AWS Bedrock credential discovery")
+
+    _botocore_session_module.get_session = _missing_botocore_session  # type: ignore[attr-defined]
+    _botocore_module.session = _botocore_session_module  # type: ignore[attr-defined]
+    _botocore_module.exceptions = _botocore_exceptions_module  # type: ignore[attr-defined]
+    sys.modules.setdefault("botocore", _botocore_module)
+    sys.modules.setdefault("botocore.session", _botocore_session_module)
+    sys.modules.setdefault("botocore.exceptions", _botocore_exceptions_module)
 
 # ---------------------------------------------------------------------------
 # Lazy boto3 import — only loaded when the Bedrock provider is actually used.

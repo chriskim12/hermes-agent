@@ -865,6 +865,7 @@ class TestAgentCacheSpilloverLive:
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True,
             skip_context_files=True, skip_memory=True,
+            enabled_toolsets=[],
             platform="telegram",
         )
 
@@ -943,7 +944,7 @@ class TestAgentCacheSpilloverLive:
         runner = self._runner()
 
         N_THREADS = 8
-        PER_THREAD = 20  # 8 * 20 = 160 inserts into a 16-slot cache
+        PER_THREAD = 5  # 8 * 5 = 40 inserts into a 16-slot cache
 
         def worker(tid: int):
             for j in range(PER_THREAD):

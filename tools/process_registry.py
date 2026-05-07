@@ -75,6 +75,21 @@ WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
 
 
+def format_uptime_short(seconds: int | float | None) -> str:
+    """Format a short human-readable process uptime string."""
+    total = max(0, int(seconds or 0))
+    if total < 60:
+        return f"{total}s"
+    minutes, sec = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m{sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h{minutes:02d}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d{hours:02d}h"
+
+
 @dataclass
 class ProcessSession:
     """A tracked background process with output buffering."""
@@ -289,11 +304,17 @@ class ProcessRegistry:
 
         self.completion_queue.put({
             "session_id": session.id,
+            "session_key": session.session_key,
             "command": session.command,
             "type": "watch_match",
             "pattern": matched_pattern,
             "output": output,
             "suppressed": suppressed,
+            "platform": session.watcher_platform,
+            "chat_id": session.watcher_chat_id,
+            "user_id": session.watcher_user_id,
+            "user_name": session.watcher_user_name,
+            "thread_id": session.watcher_thread_id,
         })
 
     def _global_watch_admit(self, now: float) -> bool:
@@ -1259,6 +1280,11 @@ class ProcessRegistry:
 
     def _prune_if_needed(self):
         """Remove oldest finished sessions if over MAX_PROCESSES. Must hold _lock."""
+        # Keep completion-consumed bookkeeping bounded to sessions we still track.
+        self._completion_consumed.intersection_update(
+            set(self._running.keys()) | set(self._finished.keys())
+        )
+
         # First prune expired finished sessions
         now = time.time()
         expired = [
@@ -1267,12 +1293,14 @@ class ProcessRegistry:
         ]
         for sid in expired:
             del self._finished[sid]
+            self._completion_consumed.discard(sid)
 
         # If still over limit, remove oldest finished
         total = len(self._running) + len(self._finished)
         if total >= MAX_PROCESSES and self._finished:
             oldest_id = min(self._finished, key=lambda sid: self._finished[sid].started_at)
             del self._finished[oldest_id]
+            self._completion_consumed.discard(oldest_id)
 
     # ----- Checkpoint (crash recovery) -----
 

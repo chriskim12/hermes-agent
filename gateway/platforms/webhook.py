@@ -115,6 +115,11 @@ class WebhookAdapter(BasePlatformAdapter):
         # Validate routes at startup — secret is required per route
         for name, route in self._routes.items():
             secret = route.get("secret", self._global_secret)
+            if route.get("deliver_only") and route.get("deliver", "log") == "log":
+                raise ValueError(
+                    f"[webhook] Route '{name}' has deliver_only=true but deliver is 'log'. "
+                    "Set a real delivery target."
+                )
             if not secret:
                 raise ValueError(
                     f"[webhook] Route '{name}' has no HMAC secret. "
@@ -179,6 +184,21 @@ class WebhookAdapter(BasePlatformAdapter):
         deliver_type = delivery.get("deliver", "log")
 
         if deliver_type == "log":
+            logger.info("[webhook] Response for %s: %s", chat_id, content[:200])
+            return SendResult(success=True)
+
+        try:
+            return await self._direct_deliver(content, delivery)
+        except Exception as e:
+            logger.error("[webhook] Delivery error: %s", e)
+            return SendResult(success=False, error=str(e))
+
+    async def _direct_deliver(self, content: str, delivery: dict) -> SendResult:
+        """Deliver rendered webhook content without invoking the agent."""
+        deliver_type = delivery.get("deliver", "log")
+
+        if deliver_type == "log":
+            chat_id = delivery.get("chat_id", "webhook")
             logger.info("[webhook] Response for %s: %s", chat_id, content[:200])
             return SendResult(success=True)
 
@@ -292,16 +312,6 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"error": "Payload too large"}, status=413
             )
 
-        # ── Rate limiting ────────────────────────────────────────
-        now = time.time()
-        window = self._rate_counts.setdefault(route_name, [])
-        window[:] = [t for t in window if now - t < 60]
-        if len(window) >= self._rate_limit:
-            return web.json_response(
-                {"error": "Rate limit exceeded"}, status=429
-            )
-        window.append(now)
-
         # Read body
         try:
             raw_body = await request.read()
@@ -319,6 +329,18 @@ class WebhookAdapter(BasePlatformAdapter):
                 return web.json_response(
                     {"error": "Invalid signature"}, status=401
                 )
+
+        # ── Rate limiting ────────────────────────────────────────
+        # Count only authenticated requests; invalid signatures must not burn
+        # quota or attackers can rate-limit legitimate webhook deliveries.
+        now = time.time()
+        window = self._rate_counts.setdefault(route_name, [])
+        window[:] = [t for t in window if now - t < 60]
+        if len(window) >= self._rate_limit:
+            return web.json_response(
+                {"error": "Rate limit exceeded"}, status=429
+            )
+        window.append(now)
 
         # Parse payload
         try:
@@ -530,6 +552,20 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
         self._prune_delivery_info(now)
+
+        if route_config.get("deliver_only"):
+            result = await self.send(session_chat_id, prompt)
+            if not result.success:
+                return web.json_response({"error": "Delivery failed"}, status=502)
+            return web.json_response(
+                {
+                    "status": "delivered",
+                    "route": route_name,
+                    "target": deliver_config["deliver"],
+                    "delivery_id": delivery_id,
+                },
+                status=200,
+            )
 
         # Build source and event
         source = self.build_source(

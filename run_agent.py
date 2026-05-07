@@ -9381,12 +9381,19 @@ class AIAgent:
         body = ("\n" + indent).join(out_lines)
         return f"{indent}{label}{body}"
 
+    def _ensure_tool_guardrails(self) -> None:
+        """Initialize guardrails for tests or deserialized agents that bypass __init__."""
+        if getattr(self, "_tool_guardrails", None) is None:
+            self._tool_guardrails = ToolCallGuardrailController()
+
     def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute multiple tool calls concurrently using a thread pool.
 
         Results are collected in the original tool-call order and appended to
         messages so the API sees them in the expected sequence.
         """
+        if getattr(self, "_tool_guardrails", None) is None:
+            self._tool_guardrails = ToolCallGuardrailController()
         tool_calls = assistant_message.tool_calls
         num_tools = len(tool_calls)
 
@@ -9553,14 +9560,24 @@ class AIAgent:
                     pass
             start = time.time()
             try:
-                result = self._invoke_tool(
-                    function_name,
-                    function_args,
-                    effective_task_id,
-                    tool_call.id,
-                    messages=messages,
-                    pre_tool_block_checked=True,
-                )
+                try:
+                    result = self._invoke_tool(
+                        function_name,
+                        function_args,
+                        effective_task_id,
+                        tool_call.id,
+                        messages=messages,
+                        pre_tool_block_checked=True,
+                    )
+                except TypeError as invoke_type_error:
+                    if "unexpected keyword argument" not in str(invoke_type_error):
+                        raise
+                    result = self._invoke_tool(
+                        function_name,
+                        function_args,
+                        effective_task_id,
+                        tool_call.id,
+                    )
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -9678,7 +9695,7 @@ class AIAgent:
             else:
                 function_name, function_args, function_result, tool_duration, is_error, blocked = r
 
-                if not blocked:
+                if not blocked and hasattr(self, "_append_guardrail_observation"):
                     function_result = self._append_guardrail_observation(
                         function_name,
                         function_args,

@@ -663,6 +663,7 @@ class HonchoClientConfig:
 
 
 _honcho_client: Honcho | None = None
+_honcho_client_key: tuple | None = None
 
 
 def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
@@ -671,13 +672,21 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
     When no config is provided, attempts to load ~/.honcho/config.json
     first, falling back to environment variables.
     """
-    global _honcho_client
-
-    if _honcho_client is not None:
-        return _honcho_client
+    global _honcho_client, _honcho_client_key
 
     if config is None:
         config = HonchoClientConfig.from_global_config()
+
+    config_key = (
+        config.api_key,
+        config.host,
+        config.base_url,
+        config.workspace_id,
+        config.environment,
+        config.timeout,
+    )
+    if _honcho_client is not None and _honcho_client_key == config_key:
+        return _honcho_client
 
     if not config.api_key and not config.base_url:
         raise ValueError(
@@ -756,11 +765,13 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
         kwargs["timeout"] = resolved_timeout
 
     _honcho_client = Honcho(**kwargs)
+    _honcho_client_key = config_key
 
     return _honcho_client
 
 
 def reset_honcho_client() -> None:
     """Reset the Honcho client singleton (useful for testing)."""
-    global _honcho_client
+    global _honcho_client, _honcho_client_key
     _honcho_client = None
+    _honcho_client_key = None
