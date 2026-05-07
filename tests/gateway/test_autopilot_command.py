@@ -129,6 +129,32 @@ def _state_store(tmp_path):
     return AutopilotStateStore(tmp_path / "autopilot-state.json")
 
 
+def _autopilot_work_record(identifier="CH-401", **overrides):
+    from gateway.work_state import WorkRecord
+
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    values = {
+        "work_id": identifier,
+        "title": f"{identifier} title",
+        "objective": f"Execute Linear {identifier}",
+        "owner": "hermes",
+        "executor": "hermes",
+        "mode": "autopilot",
+        "owner_session_id": f"autopilot:{identifier}",
+        "state": "completed",
+        "started_at": now,
+        "last_progress_at": now,
+        "next_action": "Await review-ready PR evidence",
+        "proof": "executor_completed",
+        "close_authority": "autopilot_pr_closeout_gate",
+        "cleanup_required": True,
+        "cleanup_proof": "pending_autopilot_pr_closeout_cleanup",
+        "review_closeout": {"status": "pending", "work_id": identifier},
+    }
+    values.update(overrides)
+    return WorkRecord(**values)
+
+
 @pytest.mark.parametrize(
     "raw,expected_action,expected_target",
     [
@@ -575,6 +601,134 @@ def test_dry_run_active_work_state_lock_blocks_candidate(tmp_path):
     ]
 
 
+def test_autopilot_queue_blocks_next_card_without_prior_pr_cleanup_evidence(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    prior = _autopilot_work_record("CH-401")
+    work_state = _FakeWorkStateStore([prior])
+    linear = _FakeLinearClient({}, queue=[_issue("CH-402")])
+
+    result = handle_autopilot_command(
+        "dry-run",
+        state_store=store,
+        work_state_store=work_state,
+        linear_client=linear,
+    )
+
+    dry_run = result.decision["dry_run"]
+    assert dry_run["status"] == "blocked"
+    assert dry_run["reason"] == "autopilot_closeout_review_gate_blocked"
+    assert dry_run["selected_issue"] is None
+    assert dry_run["closeout_gate"]["blocked_count"] == 1
+    assert dry_run["closeout_gate"]["blocked_cards"][0]["work_id"] == "CH-401"
+    assert "pr_url" in dry_run["closeout_gate"]["blocked_cards"][0]["missing"]
+    assert "cleanup_proof_pending" in dry_run["closeout_gate"]["blocked_cards"][0]["violations"]
+    assert linear.queue_calls == []
+
+
+def test_autopilot_queue_continuation_allows_valid_prior_pr_cleanup_evidence(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    prior = _autopilot_work_record(
+        "CH-401",
+        cleanup_proof="task_owned_worktree_removed",
+        review_closeout=_valid_pr_closeout_evidence(
+            work_id="CH-401",
+            remote_branch="yuuka/CH-401-title",
+            task_branch="yuuka/CH-401-title",
+            pr_head="yuuka/CH-401-title",
+            task_worktree_path="/repo/hermes-agent/.worktrees/ch-401-title",
+            cleanup_proof="task_owned_worktree_removed",
+        ),
+    )
+    work_state = _FakeWorkStateStore([prior])
+    linear = _FakeLinearClient({}, queue=[_issue("CH-402")])
+    spawner = MagicMock(return_value={"session_id": "exec-402", "proof": "spawned"})
+
+    result = run_autopilot_once(
+        state_store=store,
+        work_state_store=work_state,
+        linear_client=linear,
+        executor_spawner=spawner,
+        actor="tester",
+        owner_session_id="owner-402",
+        expected_repo_full_name="chriskim12/hermes-agent",
+    )
+
+    assert result["status"] == "started"
+    assert result["work_id"] == "CH-402"
+    assert result["executor_spawned"] is True
+    assert linear.queue_calls == [{"team_key": "CH", "state_name": "Execution Ready", "limit": 100}]
+    assert [record.work_id for record in work_state.records] == ["CH-401", "CH-402"]
+
+
+def test_autopilot_queue_continuation_blocks_valid_prior_pr_without_expected_repo_context(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    prior = _autopilot_work_record(
+        "CH-401",
+        cleanup_proof="task_owned_worktree_removed",
+        review_closeout=_valid_pr_closeout_evidence(
+            work_id="CH-401",
+            remote_branch="yuuka/CH-401-title",
+            task_branch="yuuka/CH-401-title",
+            pr_head="yuuka/CH-401-title",
+            task_worktree_path="/repo/hermes-agent/.worktrees/ch-401-title",
+            cleanup_proof="task_owned_worktree_removed",
+            trusted_repo_verified=True,
+        ),
+    )
+    work_state = _FakeWorkStateStore([prior])
+    linear = _FakeLinearClient({}, queue=[_issue("CH-402")])
+    spawner = MagicMock()
+
+    result = run_autopilot_once(
+        state_store=store,
+        work_state_store=work_state,
+        linear_client=linear,
+        executor_spawner=spawner,
+        actor="tester",
+        owner_session_id="owner-402",
+    )
+
+    assert result["status"] == "blocked"
+    assert result["reason"] == "autopilot_closeout_review_gate_blocked"
+    assert result["dry_run"]["closeout_gate"]["blocked_cards"][0]["work_id"] == "CH-401"
+    assert "trusted_expected_repo_full_name" in result["dry_run"]["closeout_gate"]["blocked_cards"][0]["missing"]
+    assert result["work_state_written"] is False
+    assert result["executor_spawned"] is False
+    assert linear.queue_calls == []
+    spawner.assert_not_called()
+
+
+def test_targeted_run_autopilot_once_blocks_next_card_without_prior_pr_cleanup_evidence(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    prior = _autopilot_work_record("CH-401")
+    work_state = _FakeWorkStateStore([prior])
+    linear = _FakeLinearClient({"CH-402": _issue("CH-402")})
+    spawner = MagicMock()
+
+    result = run_autopilot_once(
+        state_store=store,
+        work_state_store=work_state,
+        linear_client=linear,
+        executor_spawner=spawner,
+        actor="tester",
+        owner_session_id="owner-402",
+        target_id="CH-402",
+    )
+
+    assert result["status"] == "blocked"
+    assert result["reason"] == "autopilot_closeout_review_gate_blocked"
+    assert result["work_state_written"] is False
+    assert result["executor_spawned"] is False
+    assert result["dry_run"]["selected_issue"] is None
+    assert result["dry_run"]["closeout_gate"]["blocked_cards"][0]["work_id"] == "CH-401"
+    assert linear.calls == []
+    spawner.assert_not_called()
+
+
 def test_dry_run_unavailable_work_state_fails_closed_before_selection(tmp_path):
     store = _state_store(tmp_path)
     store.set_enabled(True, actor="tester")
@@ -799,7 +953,15 @@ def test_run_autopilot_once_materializes_one_task_lock_contract_and_executor(tmp
     store.set_enabled(True, actor="tester")
     work_state = _FakeWorkStateStore()
     linear = _FakeLinearClient({}, queue=[_issue("CH-401")])
-    spawner = MagicMock(return_value={"session_id": "exec-1", "proof": "spawned"})
+    spawner = MagicMock(
+        return_value={
+            "session_id": "exec-1",
+            "proof": "spawned",
+            "repo_path": "/repo/hermes-agent",
+            "worktree_path": "/repo/hermes-agent/.worktrees/ch-401-title",
+            "task_branch": "yuuka/CH-401-title",
+        }
+    )
     now = datetime(2026, 5, 5, 5, 0, tzinfo=timezone.utc)
 
     result = run_autopilot_once(
@@ -827,10 +989,16 @@ def test_run_autopilot_once_materializes_one_task_lock_contract_and_executor(tmp
     assert record.mode == "autopilot"
     assert record.state == "running"
     assert record.executor_session_id == "exec-1"
+    assert record.repo_path == "/repo/hermes-agent"
+    assert record.worktree_path == "/repo/hermes-agent/.worktrees/ch-401-title"
+    assert record.task_branch == "yuuka/CH-401-title"
     assert record.proof == "spawned"
     assert record.close_authority == "autopilot_pr_closeout_gate"
     assert record.cleanup_required is True
     assert record.cleanup_proof == "pending_autopilot_pr_closeout_cleanup"
+    assert record.review_closeout["status"] == "pending_review_artifacts"
+    assert record.review_closeout["task_worktree_path"] == "/repo/hermes-agent/.worktrees/ch-401-title"
+    assert record.review_closeout["task_branch"] == "yuuka/CH-401-title"
     assert "Execute Linear CH-401" in record.objective
     spawner.assert_called_once()
     spawn_kwargs = spawner.call_args.kwargs
@@ -1202,14 +1370,20 @@ def test_cli_autopilot_dispatch_uses_same_controller(monkeypatch):
 def _valid_pr_closeout_evidence(**overrides):
     evidence = {
         "commit": "1af1c992b4fe",
+        "repo_full_name": "chriskim12/hermes-agent",
         "remote_branch": "feature/CH-309-env-authority-coverage",
+        "task_branch": "feature/CH-309-env-authority-coverage",
+        "task_worktree_path": "/tmp/hermes-agent/.worktrees/ch-309-env-authority-coverage",
         "branch_pushed": True,
         "pr_created": True,
+        "repo_verified": True,
         "pr_verified": True,
+        "sha_verified": True,
         "pr_url": "https://github.com/chriskim12/hermes-agent/pull/173",
         "pr_base": "main",
         "pr_head": "feature/CH-309-env-authority-coverage",
         "checks_passed": True,
+        "verification_result": "focused tests passed",
         "cleanup_done": True,
         "cleanup_proof": "task_owned_worktree_removed",
         "linear_evidence_comment_id": "comment-123",
@@ -1235,11 +1409,44 @@ def test_autopilot_closeout_gate_blocks_linear_done_without_pr_and_cleanup_evide
     assert "cleanup_proof" in gate["missing"]
 
 
+def test_autopilot_closeout_gate_allows_only_recorded_pr_less_exception():
+    blocked = evaluate_autopilot_pr_closeout_gate(
+        evidence={"direct_landing_exception": "explicit_direct_landing_approval"},
+        repo_name="hermes-agent",
+        remote_default_branch="main",
+    )
+
+    assert blocked["allowed"] is False
+    assert blocked["requires_pr"] is False
+    assert "direct_landing_approval_id" in blocked["missing"]
+    assert "exception_proof" in blocked["missing"]
+
+    allowed = evaluate_autopilot_pr_closeout_gate(
+        evidence={
+            "direct_landing_exception": "explicit_direct_landing_approval",
+            "commit": "1af1c992b4fe",
+            "direct_landing_approval_id": "approval-123",
+            "exception_proof": "human approved direct landing in Linear comment",
+            "verification_result": "read-only policy exception verified",
+            "cleanup_done": True,
+            "cleanup_proof": "task_owned_branch_removed",
+            "linear_evidence_comment_id": "comment-123",
+        },
+        repo_name="hermes-agent",
+        remote_default_branch="main",
+    )
+
+    assert allowed["allowed"] is True
+    assert allowed["reason"] == "autopilot_pr_less_closeout_exception_satisfied"
+    assert allowed["requires_pr"] is False
+
+
 def test_autopilot_closeout_gate_allows_verified_pr_and_cleanup_to_integration_branch():
     gate = evaluate_autopilot_pr_closeout_gate(
         evidence=_valid_pr_closeout_evidence(),
         repo_name="hermes-agent",
         remote_default_branch="main",
+        expected_repo_full_name="chriskim12/hermes-agent",
     )
 
     assert gate == {
@@ -1255,6 +1462,19 @@ def test_autopilot_closeout_gate_allows_verified_pr_and_cleanup_to_integration_b
     }
 
 
+def test_autopilot_closeout_gate_allows_repo_policy_expected_repo():
+    gate = evaluate_autopilot_pr_closeout_gate(
+        evidence=_valid_pr_closeout_evidence(),
+        repo_name="hermes-agent",
+        remote_default_branch="main",
+        repo_policy={"github_repo": "chriskim12/hermes-agent"},
+    )
+
+    assert gate["allowed"] is True
+    assert gate["missing"] == []
+    assert gate["violations"] == []
+
+
 def test_autopilot_closeout_gate_uses_dailychingu_develop_not_main():
     assert resolve_autopilot_integration_branch(repo_name="DailyChingu", remote_default_branch="main") == "develop"
 
@@ -1262,6 +1482,7 @@ def test_autopilot_closeout_gate_uses_dailychingu_develop_not_main():
         evidence=_valid_pr_closeout_evidence(pr_base="main"),
         repo_name="DailyChingu",
         remote_default_branch="main",
+        expected_repo_full_name="chriskim12/hermes-agent",
     )
 
     assert gate["allowed"] is False
@@ -1272,6 +1493,7 @@ def test_autopilot_closeout_gate_uses_dailychingu_develop_not_main():
         evidence=_valid_pr_closeout_evidence(pr_base="develop"),
         repo_name="DailyChingu",
         remote_default_branch="main",
+        expected_repo_full_name="chriskim12/hermes-agent",
     )
     assert allowed["allowed"] is True
 
@@ -1290,12 +1512,44 @@ def test_autopilot_closeout_gate_rejects_pr_head_branch_mismatch_and_bad_url():
     assert "pr_url_not_github_pull_url" in gate["violations"]
     assert "pr_head_remote_branch_mismatch" in gate["violations"]
 
+
+def test_autopilot_closeout_gate_fails_closed_without_trusted_expected_repo():
+    gate = evaluate_autopilot_pr_closeout_gate(
+        evidence=_valid_pr_closeout_evidence(
+            repo_full_name="evil/hermes-agent",
+            pr_url="https://github.com/evil/hermes-agent/pull/173",
+        ),
+        repo_name="hermes-agent",
+        remote_default_branch="main",
+    )
+
+    assert gate["allowed"] is False
+    assert "trusted_expected_repo_full_name" in gate["missing"]
+
+
+def test_autopilot_closeout_gate_rejects_self_certified_trusted_repo_without_expected_repo():
+    gate = evaluate_autopilot_pr_closeout_gate(
+        evidence=_valid_pr_closeout_evidence(
+            repo_full_name="evil/hermes-agent",
+            pr_url="https://github.com/evil/hermes-agent/pull/173",
+            trusted_repo_verified=True,
+        ),
+        repo_name="hermes-agent",
+        remote_default_branch="main",
+    )
+
+    assert gate["allowed"] is False
+    assert "trusted_expected_repo_full_name" in gate["missing"]
+    assert gate["violations"] == []
+
+
 def test_autopilot_closeout_gate_dailychingu_develop_cannot_be_overridden_by_policy():
     gate = evaluate_autopilot_pr_closeout_gate(
         evidence=_valid_pr_closeout_evidence(pr_base="main"),
         repo_name="DailyChingu",
         remote_default_branch="main",
         repo_policy={"integration_branch": "main"},
+        expected_repo_full_name="chriskim12/hermes-agent",
     )
 
     assert gate["allowed"] is False

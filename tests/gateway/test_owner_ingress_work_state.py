@@ -87,6 +87,42 @@ def _make_runner(tmp_path):
     return runner, store, work_state_store
 
 
+def test_work_state_persists_autopilot_review_closeout_and_task_branch(tmp_path):
+    path = tmp_path / "work_state.json"
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    writer = WorkStateStore(path)
+    writer.upsert(
+        WorkRecord(
+            work_id="CH-401",
+            title="CH-401 title",
+            objective="Execute Linear CH-401",
+            owner="hermes",
+            executor="hermes",
+            mode="autopilot",
+            owner_session_id="autopilot:CH-401",
+            state="running",
+            started_at=now,
+            last_progress_at=now,
+            next_action="Await executor evidence",
+            task_branch="yuuka/CH-401-title",
+            review_closeout={
+                "status": "pending_review_artifacts",
+                "task_branch": "yuuka/CH-401-title",
+                "task_worktree_path": "/repo/hermes-agent/.worktrees/ch-401-title",
+            },
+        )
+    )
+
+    [record] = WorkStateStore(path).list_records()
+
+    assert record.task_branch == "yuuka/CH-401-title"
+    assert record.review_closeout == {
+        "status": "pending_review_artifacts",
+        "task_branch": "yuuka/CH-401-title",
+        "task_worktree_path": "/repo/hermes-agent/.worktrees/ch-401-title",
+    }
+
+
 @pytest.mark.asyncio
 async def test_owner_ingress_route_injects_internal_event_for_single_live_work(tmp_path):
     runner, store, work_state_store = _make_runner(tmp_path)

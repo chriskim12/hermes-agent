@@ -1376,6 +1376,7 @@ class WorkRecord:
     tmux_session: Optional[str] = None
     repo_path: Optional[str] = None
     worktree_path: Optional[str] = None
+    task_branch: Optional[str] = None
     escalation_target: Optional[str] = None
     proof: Optional[str] = None
     usable_outcome: Optional[str] = None
@@ -1393,6 +1394,7 @@ class WorkRecord:
     blocked_reason: Optional[str] = None
     cleanup_required: bool = False
     cleanup_proof: Optional[str] = None
+    review_closeout: Optional[Dict[str, Any]] = None
     reroute_recommendation: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1431,6 +1433,7 @@ class WorkRecord:
             tmux_session=data.get("tmux_session"),
             repo_path=data.get("repo_path"),
             worktree_path=data.get("worktree_path"),
+            task_branch=data.get("task_branch"),
             escalation_target=data.get("escalation_target"),
             proof=data.get("proof"),
             usable_outcome=data.get("usable_outcome"),
@@ -1452,6 +1455,11 @@ class WorkRecord:
             blocked_reason=data.get("blocked_reason"),
             cleanup_required=bool(data.get("cleanup_required", False)),
             cleanup_proof=data.get("cleanup_proof"),
+            review_closeout=(
+                dict(data.get("review_closeout"))
+                if isinstance(data.get("review_closeout"), dict)
+                else None
+            ),
             reroute_recommendation=data.get("reroute_recommendation"),
         )
 

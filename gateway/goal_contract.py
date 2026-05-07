@@ -248,7 +248,8 @@ Verification:
 Closeout rules:
 - Post Linear evidence with commit/ref, tests, review result if required, live proof, and explicit non-actions.
 - Clean task-owned worktree/branch residue before Done when repo policy requires it.
-- Move Linear to Done only after evidence and state verification.
+- For implementation/code cards, default Linear closeout to review-ready/In Review after evidence is posted; do not move Done before human review/merge unless an explicit repo policy or recorded approval says direct landing is allowed.
+- Move Linear to Done only after evidence, state verification, and the applicable human review/merge policy are satisfied.
 
 Stop conditions:
 - Stop on approval gate, contradictory live Linear state, ambiguous work_state/session correlation, failing safety check, or exhausted turn budget.
