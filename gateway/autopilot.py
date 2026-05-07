@@ -782,6 +782,19 @@ def classify_work_state_target(target_id: str, work_state_store: Any = None) -> 
         if resolution.get("status") == "single_match" and record is not None:
             decision = classify_delegated_omx_supervisor_action(record).to_dict()
             result["supervisor_decision"] = decision
+            try:
+                from hermes_cli.kanban_work_state import project_work_state_to_kanban_run
+
+                result["kanban_run_projection"] = project_work_state_to_kanban_run(
+                    record,
+                    resolution=resolution,
+                    source="autopilot_work_state_target",
+                )
+            except Exception as exc:
+                result["kanban_run_projection"] = {
+                    "status": "fail_closed",
+                    "reason": f"kanban_run_projection_unavailable:{type(exc).__name__}",
+                }
         return result
     except Exception as exc:
         return {
