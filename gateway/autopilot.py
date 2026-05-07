@@ -18,7 +18,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Protocol
+from typing import Any, Callable, Iterable, Mapping, Optional, Protocol
 
 from hermes_constants import get_hermes_home
 from gateway.goal_contract import GoalContractError, generate_goal_contract
@@ -1065,6 +1065,410 @@ def _autopilot_closeout_snapshot(
             "blocked_count": 0,
             "review_ready_count": 0,
         }
+
+
+_EXECUTOR_RESULT_CLOSEOUT_KEYS = frozenset({
+    "commit",
+    "ref",
+    "repo_full_name",
+    "repo",
+    "repo_name",
+    "remote_default_branch",
+    "remote_branch",
+    "branch",
+    "task_branch",
+    "local_branch",
+    "task_worktree_path",
+    "worktree_path",
+    "branch_pushed",
+    "pr_created",
+    "repo_verified",
+    "pr_verified",
+    "sha_verified",
+    "repo_head_sha_verified",
+    "pr_url",
+    "pull_request_url",
+    "pr_base",
+    "base_branch",
+    "pr_head",
+    "head_branch",
+    "checks_passed",
+    "checks_result",
+    "test_result",
+    "verification_result",
+    "cleanup_done",
+    "cleanup_status",
+    "cleanup_proof",
+    "linear_evidence_comment_id",
+    "linear_comment_id",
+})
+_EXECUTOR_RESULT_CONTINUE_STATUSES = frozenset({
+    "continue",
+    "continuation",
+    "needs_continuation",
+    "same_card_continuation",
+    "in_progress",
+    "running",
+    "progress",
+})
+_EXECUTOR_RESULT_FINISHED_STATUSES = frozenset({
+    "executor_finished",
+    "completed",
+    "complete",
+    "done",
+    "finished",
+    "succeeded",
+    "success",
+    "passed",
+})
+_EXECUTOR_RESULT_BLOCKED_STATUSES = frozenset({
+    "blocked",
+    "failed",
+    "failure",
+    "error",
+    "stale",
+    "handoff_needed",
+    "retry_needed",
+})
+
+
+def _normalize_executor_result_status(executor_result: Mapping[str, Any]) -> str:
+    raw = (
+        executor_result.get("controller_event")
+        or executor_result.get("autopilot_event")
+        or executor_result.get("usable_outcome")
+        or executor_result.get("outcome")
+        or executor_result.get("status")
+        or executor_result.get("state")
+        or ""
+    )
+    normalized = str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in _EXECUTOR_RESULT_FINISHED_STATUSES:
+        return "executor_finished"
+    if normalized in _EXECUTOR_RESULT_CONTINUE_STATUSES:
+        return "same_card_continuation"
+    if normalized in _EXECUTOR_RESULT_BLOCKED_STATUSES:
+        return "blocked"
+    if _truthy_evidence(executor_result.get("completed") or executor_result.get("done")):
+        return "executor_finished"
+    return "blocked" if normalized else "same_card_continuation"
+
+
+def _result_closeout_evidence(executor_result: Mapping[str, Any]) -> dict[str, Any]:
+    closeout: dict[str, Any] = {}
+    nested = executor_result.get("review_closeout") or executor_result.get("closeout")
+    if isinstance(nested, Mapping):
+        closeout.update(dict(nested))
+    for key in _EXECUTOR_RESULT_CLOSEOUT_KEYS:
+        if key in executor_result and executor_result.get(key) is not None:
+            closeout[key] = executor_result.get(key)
+    return closeout
+
+
+def _iter_autopilot_records(records: Iterable[Any]) -> list[Any]:
+    return [record for record in records if _is_autopilot_closeout_record(record)]
+
+
+def _record_identity_matches(record: Any, work_id: str, owner_session_id: Optional[str]) -> bool:
+    if str(getattr(record, "work_id", "") or "").strip() != work_id:
+        return False
+    if owner_session_id is None:
+        return True
+    return str(getattr(record, "owner_session_id", "") or "").strip() == str(owner_session_id)
+
+
+def ingest_autopilot_executor_result(
+    *,
+    work_state_store: Any,
+    work_id: str,
+    executor_result: Mapping[str, Any],
+    owner_session_id: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Store an executor result as controller input, never as controller completion.
+
+    The executor is allowed to report facts.  It is not allowed to choose AUTOPILOT
+    continuation, Linear Done, next-card admission, or direct landing.  Those are
+    decided by ``autopilot_controller_tick`` from the persisted event plus trusted
+    closeout gates.
+    """
+
+    if work_state_store is None or not hasattr(work_state_store, "list_records"):
+        return {
+            "status": "blocked",
+            "reason": "work_state_store_missing_fail_closed",
+            "work_id": work_id,
+            "linear_done_mutated": False,
+            "next_card_started": False,
+        }
+    normalized_work_id = str(work_id or "").strip()
+    if not normalized_work_id:
+        return {
+            "status": "blocked",
+            "reason": "work_id_missing_fail_closed",
+            "work_id": None,
+            "linear_done_mutated": False,
+            "next_card_started": False,
+        }
+    if not isinstance(executor_result, Mapping):
+        return {
+            "status": "blocked",
+            "reason": "executor_result_invalid_payload_fail_closed",
+            "work_id": normalized_work_id,
+            "linear_done_mutated": False,
+            "next_card_started": False,
+        }
+    payload = dict(executor_result)
+    try:
+        all_records = work_state_store.list_records()
+    except Exception as exc:
+        return {
+            "status": "blocked",
+            "reason": f"work_state_unavailable:{type(exc).__name__}",
+            "work_id": normalized_work_id,
+            "linear_done_mutated": False,
+            "next_card_started": False,
+        }
+    try:
+        matches = [
+            record
+            for record in _iter_autopilot_records(all_records)
+            if _record_identity_matches(record, normalized_work_id, owner_session_id)
+        ]
+    except Exception as exc:
+        return {
+            "status": "blocked",
+            "reason": f"work_state_unavailable:{type(exc).__name__}",
+            "work_id": normalized_work_id,
+            "linear_done_mutated": False,
+            "next_card_started": False,
+        }
+    if len(matches) != 1:
+        return {
+            "status": "blocked",
+            "reason": "work_state_record_not_single_match",
+            "work_id": normalized_work_id,
+            "matches_count": len(matches),
+            "linear_done_mutated": False,
+            "next_card_started": False,
+        }
+    record = matches[0]
+    event_at = now or _utcnow()
+    controller_event = _normalize_executor_result_status(payload)
+    closeout = dict(getattr(record, "review_closeout", None) or {})
+    closeout.update(_result_closeout_evidence(payload))
+    closeout["executor_event"] = {
+        "status": controller_event,
+        "raw_status": payload.get("status") or payload.get("outcome") or payload.get("state"),
+        "proof": payload.get("proof") or payload.get("summary") or payload.get("message"),
+        "next_action": bound_autopilot_next_action(
+            payload.get("next_action"),
+            fallback="Run deterministic AUTOPILOT controller tick for same-card decision.",
+        ),
+        "received_at": event_at.isoformat(),
+        "linear_done_mutated": False,
+        "next_card_started": False,
+    }
+    updates: dict[str, Any] = {
+        "review_closeout": closeout,
+        "last_progress_at": event_at,
+    }
+    if not hasattr(work_state_store, "update_record"):
+        return {
+            "status": "blocked",
+            "reason": "work_state_update_missing_fail_closed",
+            "work_id": normalized_work_id,
+            "controller_event": controller_event,
+            "linear_done_mutated": False,
+            "next_card_started": False,
+        }
+    try:
+        updated = work_state_store.update_record(
+            normalized_work_id,
+            str(getattr(record, "owner_session_id", "") or ""),
+            **updates,
+        )
+    except Exception as exc:
+        return {
+            "status": "blocked",
+            "reason": f"work_state_update_failed:{type(exc).__name__}",
+            "work_id": normalized_work_id,
+            "controller_event": controller_event,
+            "linear_done_mutated": False,
+            "next_card_started": False,
+        }
+    if updated is False:
+        return {
+            "status": "blocked",
+            "reason": "work_state_update_failed_fail_closed",
+            "work_id": normalized_work_id,
+            "controller_event": controller_event,
+            "linear_done_mutated": False,
+            "next_card_started": False,
+        }
+    return {
+        "status": "ingested",
+        "reason": "executor_result_recorded_as_controller_event",
+        "work_id": normalized_work_id,
+        "controller_event": controller_event,
+        "linear_done_mutated": False,
+        "next_card_started": False,
+    }
+
+
+def bound_autopilot_next_action(value: Any, *, fallback: str) -> str:
+    text = " ".join(str(value or "").split()) or fallback
+    return text if len(text) <= 200 else text[:197].rstrip() + "..."
+
+
+def _executor_event(record: Any) -> Optional[Mapping[str, Any]]:
+    closeout = getattr(record, "review_closeout", None)
+    if not isinstance(closeout, Mapping):
+        return None
+    event = closeout.get("executor_event")
+    return event if isinstance(event, Mapping) else None
+
+
+def _executor_event_status(record: Any) -> Optional[str]:
+    event = _executor_event(record)
+    if isinstance(event, Mapping):
+        return str(event.get("status") or "").strip() or None
+    return None
+
+
+def _controller_tick_blocked(reason: str, **extra: Any) -> dict[str, Any]:
+    payload = {
+        "status": "blocked",
+        "decision": "blocked",
+        "reason": reason,
+        "linear_done_mutated": False,
+        "next_card_started": False,
+    }
+    payload.update(extra)
+    return payload
+
+
+def autopilot_controller_tick(
+    *,
+    state: Mapping[str, Any],
+    work_state_store: Any,
+    linear_client: LinearIssueClient,
+    target_work_id: Optional[str] = None,
+    repo_policy: Optional[Mapping[str, Any]] = None,
+    expected_repo_full_name: Optional[str] = None,
+) -> dict[str, Any]:
+    """Deterministically decide AUTOPILOT's next controller action.
+
+    This is intentionally pure-controller policy: no executor result can directly
+    mark Linear Done, launch another card, or bless direct landing.  The tick
+    chooses one of: same-card continuation, closeout verification, next-card
+    selection, or blocked.
+    """
+
+    if work_state_store is None or not hasattr(work_state_store, "list_records"):
+        return _controller_tick_blocked("work_state_store_missing_fail_closed")
+    try:
+        records = _iter_autopilot_records(work_state_store.list_records())
+    except Exception as exc:
+        return _controller_tick_blocked(f"work_state_unavailable:{type(exc).__name__}")
+    target = str(target_work_id or "").strip().upper()
+    if target:
+        records = [record for record in records if str(getattr(record, "work_id", "") or "").upper() == target]
+        if not records:
+            return _controller_tick_blocked("target_work_state_not_found", target_work_id=target)
+
+    if not records:
+        return _controller_tick_blocked("executor_result_missing_fail_closed")
+
+    for record in sorted(records, key=lambda item: str(getattr(item, "work_id", "") or "")):
+        work_id = getattr(record, "work_id", None)
+        event = _executor_event(record) or {}
+        event_status = _executor_event_status(record)
+        record_state = str(getattr(record, "state", "") or "")
+        if not event_status:
+            if record_state in {"created", "running", "stale", "retry_needed", "handoff_needed"}:
+                return {
+                    "status": "would_continue",
+                    "decision": "same_card_continuation",
+                    "reason": "awaiting_executor_result_same_card",
+                    "work_id": work_id,
+                    "next_action": event.get("next_action") or getattr(record, "next_action", None),
+                    "linear_done_mutated": False,
+                    "next_card_started": False,
+                }
+            return _controller_tick_blocked(
+                "executor_result_missing_fail_closed",
+                work_id=work_id,
+                state=record_state,
+            )
+        if event_status == "same_card_continuation":
+            return {
+                "status": "would_continue",
+                "decision": "same_card_continuation",
+                "reason": "executor_result_requires_same_card_continuation",
+                "work_id": work_id,
+                "next_action": event.get("next_action") or getattr(record, "next_action", None),
+                "linear_done_mutated": False,
+                "next_card_started": False,
+            }
+        if event_status == "blocked":
+            return _controller_tick_blocked(
+                "executor_result_blocked_same_card",
+                work_id=work_id,
+                next_action=event.get("next_action") or getattr(record, "next_action", None),
+            )
+        if event_status == "executor_finished":
+            evidence = _record_review_closeout_evidence(record)
+            gate = evaluate_autopilot_pr_closeout_gate(
+                evidence=evidence,
+                repo_name=evidence.get("repo_name"),
+                repo_policy=repo_policy,
+                expected_repo_full_name=expected_repo_full_name,
+                expected_work_id=str(work_id or ""),
+            )
+            if not gate.get("allowed"):
+                return {
+                    "status": "blocked",
+                    "decision": "closeout_verification",
+                    "reason": "autopilot_closeout_review_gate_blocked",
+                    "work_id": work_id,
+                    "closeout_gate": gate,
+                    "linear_done_mutated": False,
+                    "next_card_started": False,
+                }
+            continue
+        return _controller_tick_blocked(
+            "executor_event_unknown_fail_closed",
+            work_id=work_id,
+            executor_event=event_status,
+            state=record_state,
+        )
+
+    command = AutopilotCommand(action=ACTION_DRY_RUN, raw_args="dry-run")
+    dry_run = evaluate_dry_run_admission(
+        command=command,
+        state=state,
+        linear_client=linear_client,
+        work_state_store=work_state_store,
+        enforce_closeout_gate=True,
+        repo_policy=repo_policy,
+        expected_repo_full_name=expected_repo_full_name,
+    )
+    if dry_run.get("status") == "would_run":
+        return {
+            "status": "would_select_next_card",
+            "decision": "next_card_selection",
+            "reason": "prior_closeout_verified_select_next_admitted_card",
+            "selected_issue": dry_run.get("selected_issue"),
+            "would_create_work_state": dry_run.get("would_create_work_state"),
+            "would_goal_contract": dry_run.get("would_goal_contract"),
+            "linear_done_mutated": False,
+            "next_card_started": False,
+        }
+    return _controller_tick_blocked(
+        str(dry_run.get("reason") or "no_next_card_selected"),
+        dry_run=dry_run,
+    )
 
 
 def _candidate_from_issue(

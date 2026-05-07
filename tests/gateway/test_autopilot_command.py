@@ -18,10 +18,12 @@ from gateway.autopilot import (
     ACTION_STATUS,
     AutopilotParseError,
     AutopilotStateStore,
+    autopilot_controller_tick,
     classify_linear_target,
     evaluate_autopilot_pr_closeout_gate,
     handle_autopilot_command,
     handle_autopilot_runtime_command,
+    ingest_autopilot_executor_result,
     parse_autopilot_args,
     resolve_autopilot_integration_branch,
     run_autopilot_once,
@@ -632,14 +634,17 @@ def test_autopilot_queue_continuation_allows_valid_prior_pr_cleanup_evidence(tmp
     prior = _autopilot_work_record(
         "CH-401",
         cleanup_proof="task_owned_worktree_removed",
-        review_closeout=_valid_pr_closeout_evidence(
-            work_id="CH-401",
-            remote_branch="yuuka/CH-401-title",
-            task_branch="yuuka/CH-401-title",
-            pr_head="yuuka/CH-401-title",
-            task_worktree_path="/repo/hermes-agent/.worktrees/ch-401-title",
-            cleanup_proof="task_owned_worktree_removed",
-        ),
+        review_closeout={
+            **_valid_pr_closeout_evidence(
+                work_id="CH-401",
+                remote_branch="yuuka/CH-401-title",
+                task_branch="yuuka/CH-401-title",
+                pr_head="yuuka/CH-401-title",
+                task_worktree_path="/repo/hermes-agent/.worktrees/ch-401-title",
+                cleanup_proof="task_owned_worktree_removed",
+            ),
+            "executor_event": {"status": "executor_finished", "proof": "executor result ingested"},
+        },
     )
     work_state = _FakeWorkStateStore([prior])
     linear = _FakeLinearClient({}, queue=[_issue("CH-402")])
@@ -668,15 +673,18 @@ def test_autopilot_queue_continuation_blocks_valid_prior_pr_without_expected_rep
     prior = _autopilot_work_record(
         "CH-401",
         cleanup_proof="task_owned_worktree_removed",
-        review_closeout=_valid_pr_closeout_evidence(
-            work_id="CH-401",
-            remote_branch="yuuka/CH-401-title",
-            task_branch="yuuka/CH-401-title",
-            pr_head="yuuka/CH-401-title",
-            task_worktree_path="/repo/hermes-agent/.worktrees/ch-401-title",
-            cleanup_proof="task_owned_worktree_removed",
-            trusted_repo_verified=True,
-        ),
+        review_closeout={
+            **_valid_pr_closeout_evidence(
+                work_id="CH-401",
+                remote_branch="yuuka/CH-401-title",
+                task_branch="yuuka/CH-401-title",
+                pr_head="yuuka/CH-401-title",
+                task_worktree_path="/repo/hermes-agent/.worktrees/ch-401-title",
+                cleanup_proof="task_owned_worktree_removed",
+                trusted_repo_verified=True,
+            ),
+            "executor_event": {"status": "executor_finished", "proof": "executor result ingested"},
+        },
     )
     work_state = _FakeWorkStateStore([prior])
     linear = _FakeLinearClient({}, queue=[_issue("CH-402")])
@@ -1194,6 +1202,373 @@ def test_runtime_command_keeps_status_and_dry_run_read_only(tmp_path):
     assert result.decision["side_effects"]["executor_spawned"] is False
     assert work_state.records == []
     spawner.assert_not_called()
+
+
+def test_executor_result_ingest_records_controller_event_not_completion_authority(tmp_path):
+    now = datetime(2026, 5, 6, 9, 0, tzinfo=timezone.utc)
+    record = _autopilot_work_record("CH-405", state="running", cleanup_required=True)
+    work_state = _FakeWorkStateStore([record])
+
+    result = ingest_autopilot_executor_result(
+        work_state_store=work_state,
+        work_id="CH-405",
+        owner_session_id="autopilot:CH-405",
+        executor_result={
+            "status": "succeeded",
+            "proof": "executor exited 0 and claims done",
+            "repo_full_name": "chriskim12/hermes-agent",
+            "commit": "1af1c992b4fe",
+        },
+        now=now,
+    )
+
+    assert result == {
+        "status": "ingested",
+        "reason": "executor_result_recorded_as_controller_event",
+        "work_id": "CH-405",
+        "controller_event": "executor_finished",
+        "linear_done_mutated": False,
+        "next_card_started": False,
+    }
+    assert work_state.records[0].state == "running"
+    assert work_state.records[0].close_disposition is None
+    assert work_state.records[0].review_closeout["executor_event"]["status"] == "executor_finished"
+    assert work_state.records[0].review_closeout["executor_event"]["linear_done_mutated"] is False
+    assert work_state.records[0].review_closeout["executor_event"]["next_card_started"] is False
+    assert work_state.records[0].review_closeout["repo_full_name"] == "chriskim12/hermes-agent"
+    assert work_state.records[0].review_closeout["commit"] == "1af1c992b4fe"
+
+
+def test_controller_tick_continues_same_card_when_executor_requests_continuation(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    record = _autopilot_work_record("CH-405", state="running")
+    work_state = _FakeWorkStateStore([record])
+    linear = _FakeLinearClient({}, queue=[_issue("CH-406")])
+
+    ingest_autopilot_executor_result(
+        work_state_store=work_state,
+        work_id="CH-405",
+        executor_result={
+            "status": "needs_continuation",
+            "next_action": "Keep working CH-405 closeout gate implementation",
+            "proof": "tests still red",
+        },
+    )
+    decision = autopilot_controller_tick(
+        state=store.status(),
+        work_state_store=work_state,
+        linear_client=linear,
+        expected_repo_full_name="chriskim12/hermes-agent",
+    )
+
+    assert decision["decision"] == "same_card_continuation"
+    assert decision["work_id"] == "CH-405"
+    assert decision["linear_done_mutated"] is False
+    assert decision["next_card_started"] is False
+    assert linear.queue_calls == []
+
+
+def test_controller_tick_finished_executor_requires_closeout_verification_not_next_card(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    record = _autopilot_work_record("CH-405", state="running")
+    work_state = _FakeWorkStateStore([record])
+    linear = _FakeLinearClient({}, queue=[_issue("CH-406")])
+
+    ingest_autopilot_executor_result(
+        work_state_store=work_state,
+        work_id="CH-405",
+        executor_result={"status": "succeeded", "proof": "executor done, no PR evidence"},
+    )
+    decision = autopilot_controller_tick(
+        state=store.status(),
+        work_state_store=work_state,
+        linear_client=linear,
+        expected_repo_full_name="chriskim12/hermes-agent",
+    )
+
+    assert decision["decision"] == "closeout_verification"
+    assert decision["reason"] == "autopilot_closeout_review_gate_blocked"
+    assert decision["work_id"] == "CH-405"
+    assert "pr_url" in decision["closeout_gate"]["missing"]
+    assert decision["linear_done_mutated"] is False
+    assert decision["next_card_started"] is False
+    assert linear.queue_calls == []
+
+
+def test_controller_tick_selects_next_only_after_verified_pr_closeout(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    prior = _autopilot_work_record(
+        "CH-405",
+        state="running",
+        cleanup_proof="task_owned_worktree_removed",
+        review_closeout={"status": "pending", "work_id": "CH-405"},
+    )
+    work_state = _FakeWorkStateStore([prior])
+    linear = _FakeLinearClient({}, queue=[_issue("CH-406")])
+
+    ingest_autopilot_executor_result(
+        work_state_store=work_state,
+        work_id="CH-405",
+        executor_result={
+            "status": "succeeded",
+            "proof": "executor done with verified PR",
+            "review_closeout": _valid_pr_closeout_evidence(
+                work_id="CH-405",
+                remote_branch="yuuka/CH-405-autopilot-controller-tick",
+                task_branch="yuuka/CH-405-autopilot-controller-tick",
+                pr_head="yuuka/CH-405-autopilot-controller-tick",
+                task_worktree_path="/repo/hermes-agent/.worktrees/CH-405-autopilot-controller-tick",
+            ),
+        },
+    )
+    decision = autopilot_controller_tick(
+        state=store.status(),
+        work_state_store=work_state,
+        linear_client=linear,
+        expected_repo_full_name="chriskim12/hermes-agent",
+    )
+
+    assert decision["decision"] == "next_card_selection"
+    assert decision["selected_issue"]["identifier"] == "CH-406"
+    assert decision["would_create_work_state"]["work_id"] == "CH-406"
+    assert decision["linear_done_mutated"] is False
+    assert decision["next_card_started"] is False
+    assert linear.queue_calls == [{"team_key": "CH", "state_name": "Execution Ready", "limit": 100}]
+
+
+
+def test_controller_tick_never_selects_next_without_executor_event_even_with_pr_closeout(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    prior = _autopilot_work_record(
+        "CH-405",
+        state="completed",
+        cleanup_proof="task_owned_worktree_removed",
+        review_closeout=_valid_pr_closeout_evidence(
+            work_id="CH-405",
+            remote_branch="yuuka/CH-405-autopilot-controller-tick",
+            task_branch="yuuka/CH-405-autopilot-controller-tick",
+            pr_head="yuuka/CH-405-autopilot-controller-tick",
+            task_worktree_path="/repo/hermes-agent/.worktrees/CH-405-autopilot-controller-tick",
+        ),
+    )
+    work_state = _FakeWorkStateStore([prior])
+    linear = _FakeLinearClient({}, queue=[_issue("CH-406")])
+
+    decision = autopilot_controller_tick(
+        state=store.status(),
+        work_state_store=work_state,
+        linear_client=linear,
+        expected_repo_full_name="chriskim12/hermes-agent",
+    )
+
+    assert decision["decision"] == "blocked"
+    assert decision["reason"] == "executor_result_missing_fail_closed"
+    assert decision["work_id"] == "CH-405"
+    assert decision["linear_done_mutated"] is False
+    assert decision["next_card_started"] is False
+    assert linear.queue_calls == []
+
+
+
+def test_controller_tick_keeps_active_same_card_awaiting_executor_event(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    prior = _autopilot_work_record("CH-405", state="running")
+    work_state = _FakeWorkStateStore([prior])
+    linear = _FakeLinearClient({}, queue=[_issue("CH-406")])
+
+    decision = autopilot_controller_tick(
+        state=store.status(),
+        work_state_store=work_state,
+        linear_client=linear,
+        expected_repo_full_name="chriskim12/hermes-agent",
+    )
+
+    assert decision["decision"] == "same_card_continuation"
+    assert decision["reason"] == "awaiting_executor_result_same_card"
+    assert decision["work_id"] == "CH-405"
+    assert decision["linear_done_mutated"] is False
+    assert decision["next_card_started"] is False
+    assert linear.queue_calls == []
+
+
+
+def test_executor_result_ingest_fails_closed_when_work_state_unavailable():
+    class BrokenWorkState:
+        def list_records(self):
+            raise RuntimeError("store offline")
+
+    result = ingest_autopilot_executor_result(
+        work_state_store=BrokenWorkState(),
+        work_id="CH-405",
+        executor_result={"status": "succeeded", "proof": "executor done"},
+    )
+
+    assert result == {
+        "status": "blocked",
+        "reason": "work_state_unavailable:RuntimeError",
+        "work_id": "CH-405",
+        "linear_done_mutated": False,
+        "next_card_started": False,
+    }
+
+
+
+def test_executor_result_ingest_rejects_non_mapping_payload_fail_closed():
+    record = _autopilot_work_record("CH-405", state="running")
+    work_state = _FakeWorkStateStore([record])
+
+    result = ingest_autopilot_executor_result(
+        work_state_store=work_state,
+        work_id="CH-405",
+        executor_result=["not", "a", "mapping"],
+    )
+
+    assert result == {
+        "status": "blocked",
+        "reason": "executor_result_invalid_payload_fail_closed",
+        "work_id": "CH-405",
+        "linear_done_mutated": False,
+        "next_card_started": False,
+    }
+    assert work_state.update_calls == []
+
+
+
+def test_executor_result_ingest_accepts_canonical_executor_finished_event():
+    record = _autopilot_work_record("CH-405", state="running")
+    work_state = _FakeWorkStateStore([record])
+
+    result = ingest_autopilot_executor_result(
+        work_state_store=work_state,
+        work_id="CH-405",
+        executor_result={"controller_event": "executor_finished", "proof": "executor complete"},
+    )
+
+    assert result["status"] == "ingested"
+    assert result["controller_event"] == "executor_finished"
+    assert work_state.records[0].state == "running"
+    assert work_state.records[0].review_closeout["executor_event"]["status"] == "executor_finished"
+
+
+
+def test_executor_result_ingest_fails_closed_when_update_record_returns_false():
+    class RejectingWorkState(_FakeWorkStateStore):
+        def update_record(self, work_id: str, owner_session_id: str, **updates):
+            self.update_calls.append(
+                {"work_id": work_id, "owner_session_id": owner_session_id, "updates": updates}
+            )
+            return False
+
+    record = _autopilot_work_record("CH-405", state="running")
+    work_state = RejectingWorkState([record])
+
+    result = ingest_autopilot_executor_result(
+        work_state_store=work_state,
+        work_id="CH-405",
+        executor_result={"status": "succeeded", "proof": "executor done"},
+    )
+
+    assert result == {
+        "status": "blocked",
+        "reason": "work_state_update_failed_fail_closed",
+        "work_id": "CH-405",
+        "controller_event": "executor_finished",
+        "linear_done_mutated": False,
+        "next_card_started": False,
+    }
+    assert work_state.records[0].state == "running"
+
+
+
+def test_controller_tick_blocks_empty_prior_state_instead_of_selecting_next(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    work_state = _FakeWorkStateStore([])
+    linear = _FakeLinearClient({}, queue=[_issue("CH-406")])
+
+    decision = autopilot_controller_tick(
+        state=store.status(),
+        work_state_store=work_state,
+        linear_client=linear,
+        expected_repo_full_name="chriskim12/hermes-agent",
+    )
+
+    assert decision["decision"] == "blocked"
+    assert decision["reason"] == "executor_result_missing_fail_closed"
+    assert decision["linear_done_mutated"] is False
+    assert decision["next_card_started"] is False
+    assert linear.queue_calls == []
+
+
+
+def test_controller_tick_blocks_unknown_executor_event_instead_of_selecting_next(tmp_path):
+    store = _state_store(tmp_path)
+    store.set_enabled(True, actor="tester")
+    prior = _autopilot_work_record(
+        "CH-405",
+        state="completed",
+        cleanup_proof="task_owned_worktree_removed",
+        review_closeout={
+            **_valid_pr_closeout_evidence(
+                work_id="CH-405",
+                remote_branch="yuuka/CH-405-autopilot-controller-tick",
+                task_branch="yuuka/CH-405-autopilot-controller-tick",
+                pr_head="yuuka/CH-405-autopilot-controller-tick",
+                task_worktree_path="/repo/hermes-agent/.worktrees/CH-405-autopilot-controller-tick",
+            ),
+            "executor_event": {"status": "nonsense"},
+        },
+    )
+    work_state = _FakeWorkStateStore([prior])
+    linear = _FakeLinearClient({}, queue=[_issue("CH-406")])
+
+    decision = autopilot_controller_tick(
+        state=store.status(),
+        work_state_store=work_state,
+        linear_client=linear,
+        expected_repo_full_name="chriskim12/hermes-agent",
+    )
+
+    assert decision["decision"] == "blocked"
+    assert decision["reason"] == "executor_event_unknown_fail_closed"
+    assert decision["executor_event"] == "nonsense"
+    assert decision["linear_done_mutated"] is False
+    assert decision["next_card_started"] is False
+    assert linear.queue_calls == []
+
+
+
+def test_executor_result_ingest_requires_persistent_update_record():
+    class ReadOnlyWorkState:
+        def __init__(self, records):
+            self.records = records
+
+        def list_records(self):
+            return self.records
+
+    record = _autopilot_work_record("CH-405", state="running")
+    work_state = ReadOnlyWorkState([record])
+
+    result = ingest_autopilot_executor_result(
+        work_state_store=work_state,
+        work_id="CH-405",
+        executor_result={"status": "succeeded", "proof": "executor done"},
+    )
+
+    assert result == {
+        "status": "blocked",
+        "reason": "work_state_update_missing_fail_closed",
+        "work_id": "CH-405",
+        "controller_event": "executor_finished",
+        "linear_done_mutated": False,
+        "next_card_started": False,
+    }
+    assert "executor_event" not in record.review_closeout
 
 
 
