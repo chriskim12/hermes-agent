@@ -43,6 +43,19 @@ AUTOPILOT_CLOSEOUT_MODE = "autopilot"
 AUTOPILOT_PR_CLOSEOUT_REQUIRED_REASON = "autopilot_pr_cleanup_evidence_required"
 _DAILYCHINGU_REPO_NAMES = frozenset({"dailychingu", "daily-chingu", "dc"})
 _RELEASE_ONLY_BASES = frozenset({"prod", "production"})
+_PR_LESS_CLOSEOUT_EXCEPTIONS = frozenset({
+    "read_only_no_code_audit",
+    "evidence_only_linear_cleanup",
+    "explicit_direct_landing_approval",
+    "recorded_stacked_pr_contract",
+})
+_PENDING_CLOSEOUT_MARKERS = frozenset({
+    "pending",
+    "pending_autopilot_pr_closeout_cleanup",
+    "todo",
+    "tbd",
+    "none",
+})
 _PR_URL_RE = re.compile(r"^https://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/pull/\d+/?$")
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
 
@@ -88,6 +101,7 @@ def evaluate_autopilot_pr_closeout_gate(
     remote_default_branch: Optional[str] = None,
     repo_policy: Optional[Mapping[str, Any]] = None,
     expected_repo_full_name: Optional[str] = None,
+    expected_work_id: Optional[str] = None,
     release_approved: bool = False,
 ) -> dict[str, Any]:
     """Fail closed unless AUTOPILOT closeout has PR and cleanup evidence.
@@ -99,6 +113,9 @@ def evaluate_autopilot_pr_closeout_gate(
     """
 
     closeout = dict(evidence or {})
+    nested_closeout = closeout.get("review_closeout")
+    if isinstance(nested_closeout, Mapping):
+        closeout = {**dict(nested_closeout), **{k: v for k, v in closeout.items() if k != "review_closeout"}}
     normalized_mode = str(mode or "").strip().lower()
     policy = repo_policy or {}
     expected_base = resolve_autopilot_integration_branch(
@@ -106,8 +123,12 @@ def evaluate_autopilot_pr_closeout_gate(
         remote_default_branch=remote_default_branch or closeout.get("remote_default_branch"),
         repo_policy=policy,
     )
+    evidence_repo = str(closeout.get("repo_full_name") or closeout.get("repo") or "").strip()
     expected_repo = str(
-        expected_repo_full_name or policy.get("github_repo") or policy.get("repo_full_name") or ""
+        expected_repo_full_name
+        or policy.get("github_repo")
+        or policy.get("repo_full_name")
+        or ""
     ).strip().lower()
     result: dict[str, Any] = {
         "allowed": False,
@@ -132,15 +153,85 @@ def evaluate_autopilot_pr_closeout_gate(
         )
         return result
 
+    exception_type = (
+        str(
+            closeout.get("pr_less_exception")
+            or closeout.get("direct_landing_exception")
+            or closeout.get("closeout_exception")
+            or ""
+        )
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+    if exception_type:
+        result["requires_pr"] = False
+        result["exception_type"] = exception_type
+        exception_required_text = {
+            "linear_evidence_comment_id": closeout.get("linear_evidence_comment_id")
+            or closeout.get("linear_comment_id"),
+            "cleanup_proof": closeout.get("cleanup_proof"),
+            "verification_result": closeout.get("verification_result")
+            or closeout.get("checks_result")
+            or closeout.get("test_result"),
+            "exception_proof": closeout.get("exception_proof")
+            or closeout.get("approval_ref")
+            or closeout.get("audit_ref"),
+        }
+        if exception_type in {"explicit_direct_landing_approval", "recorded_stacked_pr_contract"}:
+            exception_required_text["commit"] = closeout.get("commit") or closeout.get("ref")
+        if exception_type == "explicit_direct_landing_approval":
+            exception_required_text["direct_landing_approval_id"] = (
+                closeout.get("direct_landing_approval_id") or closeout.get("approval_id")
+            )
+        if exception_type == "recorded_stacked_pr_contract":
+            exception_required_text["stacked_pr_contract"] = (
+                closeout.get("stacked_pr_contract") or closeout.get("stacked_pr_url")
+            )
+        for field, value in exception_required_text.items():
+            if not str(value or "").strip():
+                result["missing"].append(field)
+        if exception_type not in _PR_LESS_CLOSEOUT_EXCEPTIONS:
+            result["violations"].append(f"unsupported_pr_less_exception:{exception_type}")
+        if not _truthy_evidence(closeout.get("cleanup_done") or closeout.get("cleanup_status")):
+            result["missing"].append("cleanup_done")
+        cleanup_proof = str(exception_required_text.get("cleanup_proof") or "").strip().lower()
+        if cleanup_proof in _PENDING_CLOSEOUT_MARKERS:
+            result["violations"].append("cleanup_proof_pending")
+        commit = str(exception_required_text.get("commit") or "").strip()
+        if commit and not _SHA_RE.fullmatch(commit):
+            result["violations"].append("commit_ref_not_sha_like")
+        if result["missing"] or result["violations"]:
+            return result
+        result.update(
+            {
+                "allowed": True,
+                "status": "allowed",
+                "reason": "autopilot_pr_less_closeout_exception_satisfied",
+            }
+        )
+        return result
+
     required_text_fields = {
         "commit": closeout.get("commit") or closeout.get("ref"),
+        "repo_full_name": closeout.get("repo_full_name") or closeout.get("repo"),
         "remote_branch": closeout.get("remote_branch") or closeout.get("branch"),
+        "task_branch": closeout.get("task_branch")
+        or closeout.get("local_branch")
+        or closeout.get("remote_branch")
+        or closeout.get("branch"),
+        "task_worktree_path": closeout.get("task_worktree_path")
+        or closeout.get("worktree_path"),
         "pr_url": closeout.get("pr_url") or closeout.get("pull_request_url"),
         "pr_base": closeout.get("pr_base") or closeout.get("base_branch"),
         "pr_head": closeout.get("pr_head") or closeout.get("head_branch"),
         "linear_evidence_comment_id": closeout.get("linear_evidence_comment_id")
         or closeout.get("linear_comment_id"),
         "cleanup_proof": closeout.get("cleanup_proof"),
+        "verification_result": closeout.get("verification_result")
+        or closeout.get("checks_result")
+        or closeout.get("test_result"),
     }
     for field, value in required_text_fields.items():
         if not str(value or "").strip():
@@ -149,7 +240,9 @@ def evaluate_autopilot_pr_closeout_gate(
     required_bool_fields = {
         "branch_pushed": closeout.get("branch_pushed"),
         "pr_created": closeout.get("pr_created"),
+        "repo_verified": closeout.get("repo_verified"),
         "pr_verified": closeout.get("pr_verified"),
+        "sha_verified": closeout.get("sha_verified") or closeout.get("repo_head_sha_verified"),
         "checks_passed": closeout.get("checks_passed"),
         "cleanup_done": closeout.get("cleanup_done") or closeout.get("cleanup_status"),
     }
@@ -165,11 +258,17 @@ def evaluate_autopilot_pr_closeout_gate(
     pr_match = _PR_URL_RE.fullmatch(pr_url) if pr_url else None
     if pr_url and not pr_match:
         result["violations"].append("pr_url_not_github_pull_url")
-    elif pr_match and expected_repo:
+    elif pr_match:
         actual_repo = f"{pr_match.group('owner')}/{pr_match.group('repo')}".lower()
-        if actual_repo != expected_repo:
+        if not expected_repo:
+            result["missing"].append("trusted_expected_repo_full_name")
+        elif actual_repo != expected_repo:
             result["violations"].append(
                 f"pr_url_repo_mismatch:expected={expected_repo}:actual={actual_repo}"
+            )
+        if expected_repo and evidence_repo and evidence_repo.lower() != expected_repo:
+            result["violations"].append(
+                f"repo_full_name_mismatch:expected={expected_repo}:actual={evidence_repo.lower()}"
             )
 
     pr_base = str(required_text_fields["pr_base"] or "").strip()
@@ -180,6 +279,15 @@ def evaluate_autopilot_pr_closeout_gate(
     remote_branch = str(required_text_fields["remote_branch"] or "").strip()
     if pr_head and remote_branch and pr_head != remote_branch:
         result["violations"].append("pr_head_remote_branch_mismatch")
+
+    task_branch = str(required_text_fields["task_branch"] or "").strip()
+    work_id = str(expected_work_id or closeout.get("work_id") or "").strip().lower()
+    if task_branch and work_id and work_id not in task_branch.lower():
+        result["violations"].append(f"task_branch_not_card_scoped:{work_id}")
+
+    cleanup_proof = str(required_text_fields["cleanup_proof"] or "").strip().lower()
+    if cleanup_proof in _PENDING_CLOSEOUT_MARKERS:
+        result["violations"].append("cleanup_proof_pending")
 
     if pr_base in _RELEASE_ONLY_BASES and not release_approved:
         result["violations"].append(f"release_base_requires_explicit_approval:{pr_base}")
@@ -598,7 +706,12 @@ def classify_linear_target(issue: Mapping[str, Any], requested_id: str) -> dict[
     }
 
 
-def summarize_work_state(work_state_store: Any = None) -> dict[str, Any]:
+def summarize_work_state(
+    work_state_store: Any = None,
+    *,
+    repo_policy: Optional[Mapping[str, Any]] = None,
+    expected_repo_full_name: Optional[str] = None,
+) -> dict[str, Any]:
     """Return read-only work_state summary for /autopilot status/dry-run."""
 
     try:
@@ -623,12 +736,18 @@ def summarize_work_state(work_state_store: Any = None) -> dict[str, Any]:
                     and getattr(record, "mode", None) == "delegated"
                 ):
                     delegated_omx_live += 1
+        closeout = _autopilot_closeout_snapshot_from_records(
+            records,
+            repo_policy=repo_policy,
+            expected_repo_full_name=expected_repo_full_name,
+        )
         return {
             "available": True,
             "records_total": len(records),
             "counts_by_state": counts_by_state,
             "hermes_owned_live": hermes_owned_live,
             "delegated_omx_live": delegated_omx_live,
+            "autopilot_closeout": closeout,
         }
     except Exception as exc:
         return {
@@ -807,6 +926,147 @@ def _work_state_lock_snapshot(work_state_store: Any = None) -> dict[str, Any]:
         }
 
 
+def _is_autopilot_closeout_record(record: Any) -> bool:
+    return (
+        getattr(record, "owner", None) == "hermes"
+        and getattr(record, "mode", None) == "autopilot"
+        and getattr(record, "close_authority", None) == "autopilot_pr_closeout_gate"
+    )
+
+
+def _record_review_closeout_evidence(record: Any) -> dict[str, Any]:
+    raw = getattr(record, "review_closeout", None)
+    evidence = dict(raw) if isinstance(raw, Mapping) else {}
+    work_id = str(getattr(record, "work_id", "") or "").strip()
+    if work_id:
+        evidence.setdefault("work_id", work_id)
+    repo_path = getattr(record, "repo_path", None)
+    if repo_path:
+        evidence.setdefault("repo_path", repo_path)
+    worktree_path = getattr(record, "worktree_path", None)
+    if worktree_path:
+        evidence.setdefault("worktree_path", worktree_path)
+        evidence.setdefault("task_worktree_path", worktree_path)
+    task_branch = getattr(record, "task_branch", None)
+    if task_branch:
+        evidence.setdefault("task_branch", task_branch)
+    cleanup_proof = getattr(record, "cleanup_proof", None)
+    if cleanup_proof:
+        evidence.setdefault("cleanup_proof", cleanup_proof)
+    return evidence
+
+
+def _autopilot_closeout_snapshot_from_records(
+    records: list[Any],
+    *,
+    repo_policy: Optional[Mapping[str, Any]] = None,
+    expected_repo_full_name: Optional[str] = None,
+) -> dict[str, Any]:
+    blocked_cards: list[dict[str, Any]] = []
+    review_ready_prs: list[dict[str, Any]] = []
+    for record in records:
+        if not _is_autopilot_closeout_record(record):
+            continue
+        evidence = _record_review_closeout_evidence(record)
+        gate = evaluate_autopilot_pr_closeout_gate(
+            evidence=evidence,
+            repo_name=evidence.get("repo_name"),
+            repo_policy=repo_policy,
+            expected_repo_full_name=expected_repo_full_name,
+            expected_work_id=str(getattr(record, "work_id", "") or ""),
+        )
+        entry = {
+            "work_id": getattr(record, "work_id", None),
+            "owner_session_id": getattr(record, "owner_session_id", None),
+            "state": getattr(record, "state", None),
+            "status": gate.get("status"),
+            "reason": gate.get("reason"),
+            "missing": list(gate.get("missing") or []),
+            "violations": list(gate.get("violations") or []),
+        }
+        if gate.get("allowed"):
+            entry.update(
+                {
+                    "pr_url": evidence.get("pr_url") or evidence.get("pull_request_url"),
+                    "remote_branch": evidence.get("remote_branch") or evidence.get("branch"),
+                    "commit": evidence.get("commit") or evidence.get("ref"),
+                    "exception_type": gate.get("exception_type"),
+                }
+            )
+            review_ready_prs.append(entry)
+        else:
+            blocked_cards.append(entry)
+    return {
+        "records_evaluated": len(blocked_cards) + len(review_ready_prs),
+        "review_ready_prs": review_ready_prs,
+        "blocked_cards": blocked_cards,
+        "review_ready_count": len(review_ready_prs),
+        "blocked_count": len(blocked_cards),
+    }
+
+
+def _closeout_snapshot_blocking_cards_for_target(
+    closeout_snapshot: Mapping[str, Any],
+    target_id: Optional[str],
+) -> list[dict[str, Any]]:
+    target = str(target_id or "").strip().upper()
+    blocking_cards: list[dict[str, Any]] = []
+    for card in closeout_snapshot.get("blocked_cards") or []:
+        if not isinstance(card, Mapping):
+            continue
+        work_id = str(card.get("work_id") or "").strip().upper()
+        if target and work_id == target:
+            continue
+        blocking_cards.append(dict(card))
+    return blocking_cards
+
+
+def _closeout_gate_blocked_dry_run(
+    closeout_snapshot: Mapping[str, Any],
+    *,
+    blocking_cards: list[dict[str, Any]],
+) -> dict[str, Any]:
+    gated_snapshot = dict(closeout_snapshot)
+    gated_snapshot["blocked_cards"] = blocking_cards
+    gated_snapshot["blocked_count"] = len(blocking_cards)
+    return _empty_dry_run(
+        "blocked",
+        "autopilot_closeout_review_gate_blocked",
+        closeout_gate=gated_snapshot,
+    )
+
+
+def _autopilot_closeout_snapshot(
+    work_state_store: Any = None,
+    *,
+    repo_policy: Optional[Mapping[str, Any]] = None,
+    expected_repo_full_name: Optional[str] = None,
+) -> dict[str, Any]:
+    try:
+        store = work_state_store
+        if store is None:
+            from gateway.work_state import WorkStateStore
+
+            store = WorkStateStore()
+        return {
+            "available": True,
+            **_autopilot_closeout_snapshot_from_records(
+                store.list_records(),
+                repo_policy=repo_policy,
+                expected_repo_full_name=expected_repo_full_name,
+            ),
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "reason": f"work_state_unavailable:{type(exc).__name__}",
+            "blocked_cards": [],
+            "review_ready_prs": [],
+            "blocked_count": 0,
+            "review_ready_count": 0,
+        }
+
+
 def _candidate_from_issue(
     issue: Mapping[str, Any],
     *,
@@ -953,6 +1213,9 @@ def evaluate_dry_run_admission(
     work_state_store: Any = None,
     target_issue: Optional[Mapping[str, Any]] = None,
     target_classification: Optional[Mapping[str, Any]] = None,
+    enforce_closeout_gate: bool = False,
+    repo_policy: Optional[Mapping[str, Any]] = None,
+    expected_repo_full_name: Optional[str] = None,
 ) -> dict[str, Any]:
     """Produce CH-388 read-only admission proof for /autopilot dry-run."""
 
@@ -971,6 +1234,22 @@ def evaluate_dry_run_admission(
     if not command.target_id:
         if not bool(state.get("enabled")):
             return _empty_dry_run("paused", "controller_disabled_noop")
+        closeout_snapshot = _autopilot_closeout_snapshot(
+            work_state_store,
+            repo_policy=repo_policy,
+            expected_repo_full_name=expected_repo_full_name,
+        )
+        if not closeout_snapshot.get("available"):
+            return _empty_dry_run(
+                "blocked",
+                "work_state_unavailable_fail_closed",
+                work_state_reason=closeout_snapshot.get("reason"),
+            )
+        if closeout_snapshot.get("blocked_cards"):
+            return _closeout_gate_blocked_dry_run(
+                closeout_snapshot,
+                blocking_cards=list(closeout_snapshot.get("blocked_cards") or []),
+            )
         queue = linear_client.list_execution_ready_issues(
             team_key="CH",
             state_name="Execution Ready",
@@ -984,6 +1263,28 @@ def evaluate_dry_run_admission(
             )
         issues = queue.get("issues") if isinstance(queue.get("issues"), list) else []
         return _finish_dry_run(issues, active_work_ids=active_ids)
+
+    if enforce_closeout_gate:
+        closeout_snapshot = _autopilot_closeout_snapshot(
+            work_state_store,
+            repo_policy=repo_policy,
+            expected_repo_full_name=expected_repo_full_name,
+        )
+        if not closeout_snapshot.get("available"):
+            return _empty_dry_run(
+                "blocked",
+                "work_state_unavailable_fail_closed",
+                work_state_reason=closeout_snapshot.get("reason"),
+            )
+        blocking_cards = _closeout_snapshot_blocking_cards_for_target(
+            closeout_snapshot,
+            command.target_id,
+        )
+        if blocking_cards:
+            return _closeout_gate_blocked_dry_run(
+                closeout_snapshot,
+                blocking_cards=blocking_cards,
+            )
 
     target_payload = target_issue or linear_client.fetch_issue(command.target_id)
     if target_payload.get("status") != "ok":
@@ -1113,6 +1414,20 @@ def _format_result_message(decision: Mapping[str, Any]) -> str:
                 f"{work_state.get('hermes_owned_live', 0)} Hermes live, "
                 f"{work_state.get('delegated_omx_live', 0)} delegated OMX live."
             )
+            closeout = work_state.get("autopilot_closeout") or {}
+            lines.append(
+                "autopilot review: "
+                f"{closeout.get('review_ready_count', 0)} review-ready, "
+                f"{closeout.get('blocked_count', 0)} blocked."
+            )
+            blocked_cards = closeout.get("blocked_cards") or []
+            for card in blocked_cards[:3]:
+                lines.append(
+                    "blocked review: "
+                    f"{card.get('work_id')} "
+                    f"missing={','.join(card.get('missing') or []) or '-'} "
+                    f"violations={','.join(card.get('violations') or []) or '-'}"
+                )
         else:
             lines.append(f"work_state: {work_state.get('reason', 'unavailable')}")
     dry_run = decision.get("dry_run") or {}
@@ -1222,6 +1537,8 @@ def run_autopilot_once(
     actor: Optional[str] = None,
     owner_session_id: Optional[str] = None,
     target_id: Optional[str] = None,
+    repo_policy: Optional[Mapping[str, Any]] = None,
+    expected_repo_full_name: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
     """Materialize at most one admitted autopilot task.
@@ -1271,6 +1588,9 @@ def run_autopilot_once(
         state=state,
         linear_client=client,
         work_state_store=work_state_store,
+        enforce_closeout_gate=True,
+        repo_policy=repo_policy,
+        expected_repo_full_name=expected_repo_full_name,
     )
     if dry_run.get("status") != "would_run":
         return {
@@ -1336,6 +1656,25 @@ def run_autopilot_once(
         close_authority="autopilot_pr_closeout_gate",
         cleanup_required=True,
         cleanup_proof="pending_autopilot_pr_closeout_cleanup",
+        review_closeout={
+            "status": "pending",
+            "required": True,
+            "work_id": work_id,
+            "required_evidence": [
+                "repo_full_name",
+                "task_worktree_path",
+                "task_branch",
+                "commit_sha",
+                "pushed_branch",
+                "pr_url",
+                "pr_base",
+                "pr_head",
+                "checks_passed",
+                "verification_result",
+                "linear_evidence_comment_id",
+                "cleanup_proof",
+            ],
+        },
     )
     if work_state_store is None or not hasattr(work_state_store, "upsert"):
         return {
@@ -1392,12 +1731,33 @@ def run_autopilot_once(
     spawn_payload = spawn_result if isinstance(spawn_result, Mapping) else {"result": spawn_result}
     executor_session_id = spawn_payload.get("session_id") or spawn_payload.get("executor_session_id")
     proof = str(spawn_payload.get("proof") or "executor spawned from generated /goal contract")
+    repo_path = spawn_payload.get("repo_path")
+    worktree_path = spawn_payload.get("worktree_path") or spawn_payload.get("task_worktree_path")
+    task_branch = (
+        spawn_payload.get("task_branch")
+        or spawn_payload.get("branch")
+        or spawn_payload.get("local_branch")
+        or spawn_payload.get("remote_branch")
+    )
+    review_closeout = {
+        **record.review_closeout,
+        "status": "pending_review_artifacts",
+        "repo_path": repo_path,
+        "task_worktree_path": worktree_path,
+        "worktree_path": worktree_path,
+        "task_branch": task_branch,
+    }
+    review_closeout = {key: value for key, value in review_closeout.items() if value is not None}
     if hasattr(work_state_store, "update_record"):
         work_state_store.update_record(
             work_id,
             owner_session,
             state="running",
             executor_session_id=str(executor_session_id) if executor_session_id else None,
+            repo_path=str(repo_path) if repo_path else None,
+            worktree_path=str(worktree_path) if worktree_path else None,
+            task_branch=str(task_branch) if task_branch else None,
+            review_closeout=review_closeout,
             proof=proof,
             last_progress_at=event_at,
             next_action="Await executor evidence; do not mark Linear Done without verification",
@@ -1426,6 +1786,8 @@ def handle_autopilot_command(
     work_state_store: Any = None,
     linear_client: Optional[LinearIssueClient] = None,
     executor_spawner: Optional[Callable[..., Any]] = None,
+    repo_policy: Optional[Mapping[str, Any]] = None,
+    expected_repo_full_name: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> AutopilotResult:
     """Handle /autopilot without spawning executors or mutating Linear.
@@ -1475,7 +1837,11 @@ def handle_autopilot_command(
         linear = dict(classify_linear_target(target_issue, command.target_id))
         work_state = classify_work_state_target(command.target_id, work_state_store)
     else:
-        work_state = summarize_work_state(work_state_store)
+        work_state = summarize_work_state(
+            work_state_store,
+            repo_policy=repo_policy,
+            expected_repo_full_name=expected_repo_full_name,
+        )
 
     dry_run: Optional[dict[str, Any]] = None
     if command.action == ACTION_DRY_RUN:
@@ -1486,6 +1852,8 @@ def handle_autopilot_command(
             work_state_store=work_state_store,
             target_issue=target_issue,
             target_classification=linear,
+            repo_policy=repo_policy,
+            expected_repo_full_name=expected_repo_full_name,
         )
 
     admission = _admission_decision(command=command, state=state, linear=linear, dry_run=dry_run)
@@ -1527,6 +1895,8 @@ def handle_autopilot_runtime_command(
     linear_client: Optional[LinearIssueClient] = None,
     executor_spawner: Optional[Callable[..., Any]] = None,
     owner_session_id: Optional[str] = None,
+    repo_policy: Optional[Mapping[str, Any]] = None,
+    expected_repo_full_name: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> AutopilotResult:
     """Handle the live operator /autopilot path.
@@ -1548,6 +1918,8 @@ def handle_autopilot_runtime_command(
             state_store=state_store,
             work_state_store=work_state_store,
             linear_client=linear_client,
+            repo_policy=repo_policy,
+            expected_repo_full_name=expected_repo_full_name,
             now=now,
         )
 
@@ -1558,6 +1930,8 @@ def handle_autopilot_runtime_command(
             state_store=state_store,
             work_state_store=work_state_store,
             linear_client=linear_client,
+            repo_policy=repo_policy,
+            expected_repo_full_name=expected_repo_full_name,
             now=now,
         )
 
@@ -1575,6 +1949,8 @@ def handle_autopilot_runtime_command(
         actor=actor,
         owner_session_id=owner_session_id,
         target_id=command.target_id,
+        repo_policy=repo_policy,
+        expected_repo_full_name=expected_repo_full_name,
         now=now,
     )
     decision: dict[str, Any] = {
