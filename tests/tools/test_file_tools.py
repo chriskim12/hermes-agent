@@ -246,7 +246,11 @@ class TestPatchHints:
         mock_get.return_value = mock_ops
 
         from tools.file_tools import patch_tool
-        raw = patch_tool(mode="replace", path="foo.py", old_string="x", new_string="y")
+        with patch(
+            "tools.file_tools._resolve_policy_context",
+            return_value=("/tmp/hermes/.worktrees/unit", None),
+        ):
+            raw = patch_tool(mode="replace", path="foo.py", old_string="x", new_string="y")
         # patch_tool surfaces the hint as a structured "_hint" field on the
         # JSON error payload (not an inline "[Hint: ..." tail).
         assert "_hint" in raw
