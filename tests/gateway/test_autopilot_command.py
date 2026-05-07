@@ -20,6 +20,7 @@ from gateway.autopilot import (
     AutopilotStateStore,
     autopilot_controller_tick,
     classify_linear_target,
+    classify_work_state_target,
     evaluate_autopilot_pr_closeout_gate,
     handle_autopilot_command,
     handle_autopilot_runtime_command,
@@ -1395,6 +1396,40 @@ def test_runtime_command_keeps_status_and_dry_run_read_only(tmp_path):
     assert result.decision["side_effects"]["executor_spawned"] is False
     assert work_state.records == []
     spawner.assert_not_called()
+
+
+def test_work_state_target_classification_includes_read_only_kanban_run_projection():
+    record = _autopilot_work_record(
+        "CH-411",
+        owner="hermes",
+        executor="omx",
+        mode="delegated",
+        owner_session_id="owner-session",
+        state="blocked",
+        executor_session_id="exec-session",
+        tmux_session="omx-CH-411",
+        repo_path="/repo/hermes-agent",
+        proof="work_state:blocked",
+        next_action="Operator review required",
+    )
+
+    class _Store:
+        def resolve_delegated_signal_candidate(self, *, work_id: str, live_only: bool):
+            return {
+                "status": "single_match",
+                "reason": "eligible",
+                "record": record,
+                "matches": [record.to_dict()],
+            }
+
+    result = classify_work_state_target("CH-411", _Store())
+
+    assert result["resolution_status"] == "single_match"
+    projection = result["kanban_run_projection"]
+    assert projection["status"] == "mapped"
+    assert projection["task_status"] == "blocked"
+    assert projection["task_run"]["outcome"] == "blocked"
+    assert projection["task_run"]["metadata"]["source"] == "autopilot_work_state_target"
 
 
 def test_executor_result_ingest_records_controller_event_not_completion_authority(tmp_path):
