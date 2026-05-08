@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_native_admission as native_admission
 from hermes_cli import linear_kanban_shadow as linear_shadow
 
 
@@ -63,6 +64,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "status": t.status,
         "priority": t.priority,
         "tenant": t.tenant,
+        "public_id": t.public_id,
         "workspace_kind": t.workspace_kind,
         "workspace_path": t.workspace_path,
         "created_by": t.created_by,
@@ -227,6 +229,43 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Fetch/map the issue and report the task payload without writing Kanban",
     )
     p_shadow_linear.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    # --- native-create ---
+    p_native_create = sub.add_parser(
+        "native-create",
+        help="Create a Kanban-native work item with PP-NNN public ID admission checks",
+    )
+    p_native_create.add_argument("title", help="Native work title")
+    p_native_create.add_argument("--body", default=None, help="Optional opening context")
+    p_native_create.add_argument("--namespace", default=native_admission.DEFAULT_NATIVE_NAMESPACE,
+                                 help="Two-letter public ID namespace (default: HL)")
+    p_native_create.add_argument("--public-id", default=None,
+                                 help="Explicit PP-NNN public ID; otherwise next namespace sequence is used")
+    p_native_create.add_argument("--tenant", required=True, help="Tenant namespace")
+    p_native_create.add_argument("--repo", dest="repo_full_name", required=True,
+                                 help="Repository full name, e.g. NousResearch/hermes-agent")
+    p_native_create.add_argument("--profile", required=True, help="Hermes profile expected to execute/review")
+    p_native_create.add_argument("--executor", required=True, help="Executor intent, e.g. hermes-direct or omx")
+    p_native_create.add_argument("--closeout-policy", required=True,
+                                 help="Closeout policy/verifier contract name")
+    p_native_create.add_argument("--base-branch", default=None, help="Integration/base branch intent")
+    p_native_create.add_argument("--worktree-branch", default=None, help="Feature worktree branch intent")
+    p_native_create.add_argument("--approval-boundary", default="human_approval_required",
+                                 help="Human approval boundary (default: human_approval_required)")
+    p_native_create.add_argument("--workspace", default="worktree",
+                                 help="scratch | worktree | dir:<path> (default: worktree)")
+    p_native_create.add_argument("--parent", action="append", default=[],
+                                 help="Parent Kanban task id (repeatable)")
+    p_native_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
+    p_native_create.add_argument("--skill", action="append", default=[], dest="skills",
+                                 help="Skill to force-load into eventual worker (repeatable)")
+    p_native_create.add_argument("--idempotency-key", default=None,
+                                 help="Dedup key override; default kanban:<public_id>")
+    p_native_create.add_argument("--created-by", default="kanban-native-admission",
+                                 help="Author recorded on the task")
+    p_native_create.add_argument("--dry-run", action="store_true",
+                                 help="Validate and print admission payload without writing Kanban")
+    p_native_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- list ---
     p_list = sub.add_parser("list", aliases=["ls"], help="List tasks")
@@ -483,6 +522,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "init":     _cmd_init,
         "create":   _cmd_create,
         "shadow-linear": _cmd_shadow_linear,
+        "native-create": _cmd_native_create,
         "list":     _cmd_list,
         "ls":       _cmd_list,
         "show":     _cmd_show,
@@ -692,6 +732,58 @@ def _cmd_shadow_linear(args: argparse.Namespace) -> int:
         f"{action} {result['task_id'] or '(new task)'} "
         f"[{result['tenant']}] {result['idempotency_key']} "
         f"({result['status']})"
+    )
+    return 0
+
+
+def _cmd_native_create(args: argparse.Namespace) -> int:
+    try:
+        ws_kind, ws_path = _parse_workspace_flag(args.workspace)
+        req = native_admission.NativeAdmissionRequest(
+            title=args.title,
+            body=args.body,
+            namespace=args.namespace,
+            public_id=args.public_id,
+            tenant=args.tenant,
+            repo_full_name=args.repo_full_name,
+            profile=args.profile,
+            executor=args.executor,
+            closeout_policy=args.closeout_policy,
+            base_branch=args.base_branch,
+            worktree_branch=args.worktree_branch,
+            approval_boundary=args.approval_boundary,
+            workspace_kind=ws_kind,
+            workspace_path=ws_path,
+            priority=args.priority,
+            parents=tuple(args.parent or ()),
+            skills=tuple(args.skills or ()),
+            idempotency_key=args.idempotency_key,
+            created_by=args.created_by or _profile_author(),
+        )
+        with kb.connect() as conn:
+            result = native_admission.create_native_work(
+                conn,
+                req,
+                dry_run=bool(getattr(args, "dry_run", False)),
+            )
+    except Exception as exc:
+        print(f"kanban: native-create: {exc}", file=sys.stderr)
+        return 1
+
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("status") not in {"blocked"} else 2
+    if result.get("status") == "blocked":
+        print(
+            "Blocked native admission: missing " + ", ".join(result.get("missing") or []),
+            file=sys.stderr,
+        )
+        return 2
+    action = "Would create" if result.get("dry_run") else ("Created" if result.get("created") else "Reused")
+    print(
+        f"{action} {result['task_id'] or '(new task)'} "
+        f"{result['public_id']} [{result['task']['tenant']}] "
+        f"{result['task']['idempotency_key']} ({result['task']['status']})"
     )
     return 0
 
