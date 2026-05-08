@@ -575,6 +575,7 @@ class Task:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     tenant: Optional[str]
+    public_id: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
     # Unified non-success counter. Incremented on any of:
@@ -636,6 +637,7 @@ class Task:
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             tenant=row["tenant"] if "tenant" in keys else None,
+            public_id=row["public_id"] if "public_id" in keys else None,
             result=row["result"] if "result" in keys else None,
             idempotency_key=row["idempotency_key"] if "idempotency_key" in keys else None,
             consecutive_failures=(
@@ -768,6 +770,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     claim_lock           TEXT,
     claim_expires        INTEGER,
     tenant               TEXT,
+    public_id            TEXT,
     result               TEXT,
     idempotency_key      TEXT,
     -- Unified consecutive-failure counter. Incremented on spawn
@@ -871,6 +874,7 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_tenant          ON tasks(tenant);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_public_id       ON tasks(public_id) WHERE public_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_idempotency     ON tasks(idempotency_key);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
@@ -995,6 +999,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     if "tenant" not in cols:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
+    if "public_id" not in cols:
+        _add_column_if_missing(conn, "tasks", "public_id", "public_id TEXT")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_public_id "
+            "ON tasks(public_id) WHERE public_id IS NOT NULL"
+        )
     if "result" not in cols:
         _add_column_if_missing(conn, "tasks", "result", "result TEXT")
     if "idempotency_key" not in cols:
@@ -1242,6 +1252,7 @@ def create_task(
     parents: Iterable[str] = (),
     triage: bool = False,
     idempotency_key: Optional[str] = None,
+    public_id: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
@@ -1339,6 +1350,15 @@ def create_task(
         ).fetchone()
         if row:
             return row["id"]
+    if public_id:
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE public_id = ? "
+            "AND status != 'archived' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (public_id,),
+        ).fetchone()
+        if row:
+            return row["id"]
 
     now = int(time.time())
 
@@ -1377,9 +1397,9 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        tenant, idempotency_key, max_runtime_seconds, skills,
+                        tenant, public_id, idempotency_key, max_runtime_seconds, skills,
                         max_retries
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -1393,6 +1413,7 @@ def create_task(
                         workspace_kind,
                         workspace_path,
                         tenant,
+                        public_id,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds else None,
                         json.dumps(skills_list) if skills_list is not None else None,
@@ -1413,6 +1434,7 @@ def create_task(
                         "status": initial_status,
                         "parents": list(parents),
                         "tenant": tenant,
+                        "public_id": public_id,
                         "skills": list(skills_list) if skills_list else None,
                     },
                 )
