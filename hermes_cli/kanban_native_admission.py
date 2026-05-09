@@ -14,7 +14,7 @@ from typing import Any, Iterable, Optional
 
 from hermes_cli import kanban_db as kb
 
-DEFAULT_NATIVE_NAMESPACE = "HL"
+DEFAULT_NATIVE_NAMESPACE = "BO"
 NATIVE_IDEMPOTENCY_PREFIX = "kanban:"
 _NAMESPACE_RE = re.compile(r"^[A-Z]{2}$")
 _PUBLIC_ID_RE = re.compile(r"^[A-Z]{2}-\d{3,}$")
@@ -49,6 +49,8 @@ def normalize_namespace(namespace: str) -> str:
         raise ValueError("namespace must be exactly two uppercase letters")
     if ns == "CH":
         raise ValueError("CH is reserved for Linear legacy references and cannot be used for native work")
+    if ns == "HL":
+        raise ValueError("HL is not a Kanban-native namespace or legacy alias; use BO for Brain OS work")
     return ns
 
 
@@ -74,6 +76,40 @@ def _missing_required(req: NativeAdmissionRequest) -> list[str]:
 
 def native_idempotency_key(public_id: str) -> str:
     return f"{NATIVE_IDEMPOTENCY_PREFIX}{normalize_public_id(public_id)}"
+
+
+def namespace_admission_blocker(conn: Any, namespace: str) -> Optional[dict[str, str]]:
+    """Return a fail-closed blocker when a native namespace is not approved.
+
+    Namespace shape validation is necessary but not sufficient: CH-426 policy
+    requires a live registry entry with ``status='active'`` before native work
+    can allocate IDs or enter candidate selection. Reserved legacy, retired,
+    unknown, or duplicate registry state blocks admission instead of falling
+    back to a default domain.
+    """
+    ns = normalize_namespace(namespace)
+    rows = [item for item in kb.list_namespaces(conn) if item.prefix == ns]
+    if not rows:
+        return {
+            "field": "namespace",
+            "reason": "native_namespace_unregistered",
+            "message": f"namespace {ns} is not registered for Kanban-native work",
+        }
+    statuses = {row.status for row in rows}
+    if len(rows) != 1 or len(statuses) != 1:
+        return {
+            "field": "namespace",
+            "reason": "native_namespace_ambiguous",
+            "message": f"namespace {ns} has ambiguous registry state",
+        }
+    status = rows[0].status
+    if status != "active":
+        return {
+            "field": "namespace",
+            "reason": f"native_namespace_{status}",
+            "message": f"namespace {ns} is {status}, not active",
+        }
+    return None
 
 
 def next_public_id(conn: Any, namespace: str = DEFAULT_NATIVE_NAMESPACE) -> str:
@@ -161,17 +197,28 @@ def build_native_admission_payload(
     dry_run: bool = True,
 ) -> dict[str, Any]:
     missing = _missing_required(req)
-    namespace = normalize_namespace(req.namespace)
-    public_id = normalize_public_id(req.public_id) if req.public_id else next_public_id(conn, namespace)
+    requested_namespace = normalize_namespace(req.namespace)
+    public_id = normalize_public_id(req.public_id) if req.public_id else next_public_id(conn, requested_namespace)
+    namespace = public_id.split("-", 1)[0]
+    namespace_blocker = namespace_admission_blocker(conn, namespace)
     idempotency_key = req.idempotency_key or native_idempotency_key(public_id)
     existing_id = existing_native_task_id(conn, public_id)
     body = build_native_body(req, public_id, idempotency_key)
-    status = "blocked" if missing else "would_create"
+    blockers = list(missing)
+    if namespace_blocker:
+        blockers.append(namespace_blocker["field"])
+    status = "blocked" if blockers else "would_create"
+    reason = "native_admission_contract_ready"
+    if missing:
+        reason = "native_admission_missing_required_fields"
+    elif namespace_blocker:
+        reason = namespace_blocker["reason"]
     return {
         "status": status,
-        "reason": "native_admission_contract_ready" if not missing else "native_admission_missing_required_fields",
+        "reason": reason,
         "dry_run": dry_run,
-        "missing": missing,
+        "missing": blockers,
+        "namespace_policy": namespace_blocker or {"status": "active", "namespace": namespace},
         "public_id": public_id,
         "task_id": existing_id,
         "created": False,

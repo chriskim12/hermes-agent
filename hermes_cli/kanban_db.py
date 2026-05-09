@@ -681,35 +681,57 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
 def _seed_default_namespaces(conn: sqlite3.Connection) -> None:
     now = int(time.time())
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO kanban_namespaces
-            (prefix, name, status, allocation_authority, created_at, notes)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
+    # CH-426 final policy removed the earlier provisional HL namespace entirely:
+    # Brain OS work uses BO, and there is intentionally no HL namespace or
+    # compatibility alias. Existing DBs from the provisional CH-418/CH-417
+    # window may already contain an active HL seed row, so remove it during
+    # migration before seeding the approved registry.
+    conn.execute("DELETE FROM kanban_namespaces WHERE prefix = 'HL'")
+    conn.execute("DELETE FROM task_aliases WHERE upper(alias) = 'HL' OR upper(alias) LIKE 'HL-%'")
+    defaults = (
         (
-            "HL",
-            "Hermes Ledger / Kanban Work Ledger",
+            "BO",
+            "Brain OS",
             "active",
-            "Hermes Work Ledger allocator",
-            now,
-            "Initial native namespace for Hermes Work Ledger control-plane work.",
+            "Chris-approved Brain OS namespace",
+            "Default native namespace for Chris's agent operating-system work, including ledger substrate maintenance.",
         ),
-    )
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO kanban_namespaces
-            (prefix, name, status, allocation_authority, created_at, notes)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
         (
             "CH",
             "Chris/Linear issue namespace",
             "reserved_legacy",
             "Linear only",
-            now,
             "Compatibility/projection refs only; never allocate for native Kanban work.",
         ),
+        (
+            "DC",
+            "DailyChingu",
+            "active",
+            "Chris-approved project namespace",
+            "Approved by Chris for Kanban-native DailyChingu work IDs.",
+        ),
+        (
+            "WS",
+            "Whystarve",
+            "active",
+            "Chris-approved project namespace",
+            "Approved by Chris for Kanban-native Whystarve work IDs.",
+        ),
+        (
+            "RS",
+            "Risu",
+            "active",
+            "Chris-approved project namespace",
+            "Approved by Chris for Kanban-native Risu work IDs.",
+        ),
+    )
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO kanban_namespaces
+            (prefix, name, status, allocation_authority, created_at, notes)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [(prefix, name, status, authority, now, notes) for prefix, name, status, authority, notes in defaults],
     )
 
 
@@ -1009,6 +1031,7 @@ def register_namespace(
     status: str = "active",
     allocation_authority: str,
     notes: Optional[str] = None,
+    migration_alias_policy: Optional[str] = None,
 ) -> None:
     prefix = (prefix or "").strip().upper()
     if len(prefix) != 2 or not prefix.isalpha() or not prefix.isascii():
@@ -1017,10 +1040,28 @@ def register_namespace(
         raise ValueError(f"status must be one of {sorted(VALID_NAMESPACE_STATUSES)}")
     if prefix == "CH" and status != "reserved_legacy":
         raise ValueError("CH is reserved legacy and cannot be active native authority")
+    if prefix == "HL":
+        raise ValueError("HL is not a Kanban-native namespace or legacy alias; use BO for Brain OS work")
     if not str(name or "").strip():
         raise ValueError("namespace name is required")
     if not str(allocation_authority or "").strip():
         raise ValueError("allocation_authority is required")
+    existing = conn.execute(
+        "SELECT status FROM kanban_namespaces WHERE prefix = ?",
+        (prefix,),
+    ).fetchone()
+    if (
+        existing
+        and existing["status"] == "retired"
+        and status != "retired"
+        and not str(migration_alias_policy or "").strip()
+    ):
+        raise ValueError(
+            "retired namespace cannot be reused without explicit migration/alias policy"
+        )
+    if migration_alias_policy:
+        policy_note = f"migration_alias_policy={migration_alias_policy.strip()}"
+        notes = f"{notes.strip()}\n{policy_note}" if notes and notes.strip() else policy_note
     conn.execute(
         """
         INSERT INTO kanban_namespaces
@@ -1047,8 +1088,11 @@ def list_namespaces(conn: sqlite3.Connection) -> list[Namespace]:
 def add_task_alias(conn: sqlite3.Connection, task_id: str, alias: str, *, kind: str = "legacy_ref") -> None:
     alias = (alias or "").strip()
     kind = (kind or "").strip()
+    alias_upper = alias.upper()
     if not alias:
         raise ValueError("alias is required")
+    if alias_upper == "HL" or alias_upper.startswith("HL-"):
+        raise ValueError("HL aliases are not supported; use BO for Brain OS work")
     if not kind:
         raise ValueError("alias kind is required")
     if get_task(conn, task_id) is None:

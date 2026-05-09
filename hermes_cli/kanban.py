@@ -238,7 +238,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_native_create.add_argument("title", help="Native work title")
     p_native_create.add_argument("--body", default=None, help="Optional opening context")
     p_native_create.add_argument("--namespace", default=native_admission.DEFAULT_NATIVE_NAMESPACE,
-                                 help="Two-letter public ID namespace (default: HL)")
+                                 help=f"Two-letter public ID namespace (default: {native_admission.DEFAULT_NATIVE_NAMESPACE})")
     p_native_create.add_argument("--public-id", default=None,
                                  help="Explicit PP-NNN public ID; otherwise next namespace sequence is used")
     p_native_create.add_argument("--tenant", required=True, help="Tenant namespace")

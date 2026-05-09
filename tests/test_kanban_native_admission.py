@@ -34,7 +34,7 @@ def test_native_create_run_slash_json_smoke(monkeypatch, tmp_path):
     data = json.loads(out)
 
     assert data["status"] == "created"
-    assert data["public_id"] == "HL-001"
+    assert data["public_id"] == "BO-001"
     assert data["task"]["assignee"] is None
     assert data["side_effects"]["executor_spawned"] is False
     assert data["authority"]["routing_verdict"]["verdict"] == "Hermes direct"
@@ -50,8 +50,8 @@ def test_native_admission_dry_run_is_linear_free_and_no_write(monkeypatch, tmp_p
         count = conn.execute("SELECT COUNT(*) AS c FROM tasks").fetchone()["c"]
 
     assert result["status"] == "would_create"
-    assert result["public_id"] == "HL-001"
-    assert result["task"]["idempotency_key"] == "kanban:HL-001"
+    assert result["public_id"] == "BO-001"
+    assert result["task"]["idempotency_key"] == "kanban:BO-001"
     assert result["side_effects"] == {
         "kanban_task_written": False,
         "executor_spawned": False,
@@ -66,15 +66,15 @@ def test_native_admission_creates_triage_task_with_separate_public_id(monkeypatc
     kb.init_db()
 
     with kb.connect() as conn:
-        result = native.create_native_work(conn, _req(public_id="HL-009"))
+        result = native.create_native_work(conn, _req(public_id="BO-009"))
         task = kb.get_task(conn, result["task_id"])
 
     assert result["status"] == "created"
     assert result["created"] is True
     assert task is not None
-    assert task.id != "HL-009"
-    assert task.public_id == "HL-009"
-    assert task.idempotency_key == "kanban:HL-009"
+    assert task.id != "BO-009"
+    assert task.public_id == "BO-009"
+    assert task.idempotency_key == "kanban:BO-009"
     assert task.status == "triage"
     assert task.assignee is None
     assert task.workspace_kind == "worktree"
@@ -83,7 +83,7 @@ def test_native_admission_creates_triage_task_with_separate_public_id(monkeypatc
     payload_text = task.body.split("```json source_payload\n", 1)[1].split("\n```", 1)[0]
     payload = json.loads(payload_text)
     assert payload["source"] == "kanban_native"
-    assert payload["public_id"] == "HL-009"
+    assert payload["public_id"] == "BO-009"
     assert payload["admission"]["linear_required"] is False
     assert payload["admission"]["executor_dispatch"] == "forbidden_during_admission"
     assert payload["routing"]["verdict"] == "hermes-direct"
@@ -100,9 +100,9 @@ def test_native_admission_reuses_existing_public_id(monkeypatch, tmp_path):
     kb.init_db()
 
     with kb.connect() as conn:
-        first = native.create_native_work(conn, _req(public_id="HL-002"))
-        second = native.create_native_work(conn, _req(public_id="HL-002", title="Retry title"))
-        rows = conn.execute("SELECT id FROM tasks WHERE public_id = ?", ("HL-002",)).fetchall()
+        first = native.create_native_work(conn, _req(public_id="BO-002"))
+        second = native.create_native_work(conn, _req(public_id="BO-002", title="Retry title"))
+        rows = conn.execute("SELECT id FROM tasks WHERE public_id = ?", ("BO-002",)).fetchall()
 
     assert first["created"] is True
     assert second["status"] == "reused"
@@ -135,6 +135,113 @@ def test_native_admission_rejects_ch_namespace(monkeypatch, tmp_path):
             assert "CH is reserved" in str(exc)
         else:
             raise AssertionError("expected CH namespace rejection")
+
+
+def test_native_admission_fails_closed_for_unregistered_namespace(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    kb.init_db()
+
+    with kb.connect() as conn:
+        result = native.create_native_work(conn, _req(namespace="ZZ"), dry_run=True)
+        count = conn.execute("SELECT COUNT(*) AS c FROM tasks").fetchone()["c"]
+
+    assert result["status"] == "blocked"
+    assert result["reason"] == "native_namespace_unregistered"
+    assert result["missing"] == ["namespace"]
+    assert result["public_id"] == "ZZ-001"
+    assert result["namespace_policy"]["message"] == "namespace ZZ is not registered for Kanban-native work"
+    assert count == 0
+
+
+def test_native_admission_fails_closed_for_retired_namespace(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    kb.init_db()
+
+    with kb.connect() as conn:
+        kb.register_namespace(
+            conn,
+            "ZZ",
+            name="Retired Zone",
+            status="retired",
+            allocation_authority="retired allocator",
+        )
+        result = native.create_native_work(conn, _req(namespace="ZZ"))
+        count = conn.execute("SELECT COUNT(*) AS c FROM tasks").fetchone()["c"]
+
+    assert result["status"] == "blocked"
+    assert result["reason"] == "native_namespace_retired"
+    assert result["namespace_policy"]["message"] == "namespace ZZ is retired, not active"
+    assert count == 0
+
+
+def test_native_admission_allows_approved_active_namespace(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    kb.init_db()
+
+    with kb.connect() as conn:
+        kb.register_namespace(
+            conn,
+            "ZZ",
+            name="Approved Zone",
+            status="active",
+            allocation_authority="test allocation gate",
+        )
+        result = native.create_native_work(conn, _req(namespace="ZZ"), dry_run=True)
+
+    assert result["status"] == "would_create"
+    assert result["public_id"] == "ZZ-001"
+    assert result["namespace_policy"] == {"status": "active", "namespace": "ZZ"}
+
+
+def test_native_admission_allows_seeded_project_namespaces(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    kb.init_db()
+
+    with kb.connect() as conn:
+        for namespace, expected in (("DC", "DC-001"), ("WS", "WS-001"), ("RS", "RS-001")):
+            result = native.create_native_work(conn, _req(namespace=namespace), dry_run=True)
+            assert result["status"] == "would_create"
+            assert result["public_id"] == expected
+            assert result["namespace_policy"] == {"status": "active", "namespace": namespace}
+
+
+def test_native_admission_rejects_hl_namespace(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    kb.init_db()
+
+    with kb.connect() as conn:
+        try:
+            native.create_native_work(conn, _req(namespace="HL"), dry_run=True)
+        except ValueError as exc:
+            assert "HL is not a Kanban-native namespace" in str(exc)
+        else:
+            raise AssertionError("expected HL namespace rejection")
+
+
+def test_native_admission_explicit_public_id_uses_public_id_namespace_policy(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    kb.init_db()
+
+    with kb.connect() as conn:
+        result = native.create_native_work(conn, _req(public_id="DC-009"), dry_run=True)
+
+    assert result["status"] == "would_create"
+    assert result["public_id"] == "DC-009"
+    assert result["namespace_policy"] == {"status": "active", "namespace": "DC"}
+
+
+def test_native_admission_explicit_public_id_rejects_unapproved_prefix(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    kb.init_db()
+
+    with kb.connect() as conn:
+        result = native.create_native_work(conn, _req(public_id="ZZ-009"), dry_run=True)
+        count = conn.execute("SELECT COUNT(*) AS c FROM tasks").fetchone()["c"]
+
+    assert result["status"] == "blocked"
+    assert result["reason"] == "native_namespace_unregistered"
+    assert result["public_id"] == "ZZ-009"
+    assert count == 0
 
 
 def test_native_admission_parent_validation_is_no_write(monkeypatch, tmp_path):

@@ -58,8 +58,41 @@ def test_init_creates_expected_tables(kanban_home):
 def test_init_seeds_native_and_legacy_namespaces(kanban_home):
     with kb.connect() as conn:
         namespaces = {ns.prefix: ns for ns in kb.list_namespaces(conn)}
-    assert namespaces["HL"].status == "active"
+    assert namespaces["BO"].name == "Brain OS"
+    assert namespaces["BO"].status == "active"
+    assert namespaces["BO"].allocation_authority == "Chris-approved Brain OS namespace"
     assert namespaces["CH"].status == "reserved_legacy"
+    assert namespaces["DC"].name == "DailyChingu"
+    assert namespaces["DC"].status == "active"
+    assert namespaces["WS"].name == "Whystarve"
+    assert namespaces["WS"].status == "active"
+    assert namespaces["RS"].name == "Risu"
+    assert namespaces["RS"].status == "active"
+    assert namespaces["DC"].allocation_authority == "Chris-approved project namespace"
+    assert "HL" not in namespaces
+
+
+def test_init_removes_provisional_hl_namespace_from_existing_db(kanban_home):
+    kb.init_db()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="existing task")
+        conn.execute(
+            """
+            INSERT INTO kanban_namespaces
+                (prefix, name, status, allocation_authority, created_at, notes)
+            VALUES ('HL', 'Hermes Ledger', 'active', 'obsolete provisional seed', 1, 'old seed')
+            """
+        )
+        conn.execute(
+            "INSERT INTO task_aliases (task_id, alias, kind, created_at) VALUES (?, 'HL-001', 'legacy_ref', 1)",
+            (task_id,),
+        )
+    kb.init_db()
+    with kb.connect() as conn:
+        namespaces = {ns.prefix: ns for ns in kb.list_namespaces(conn)}
+        hl_alias = kb.resolve_task_alias(conn, "HL-001")
+    assert "HL" not in namespaces
+    assert hl_alias is None
 
 
 # ---------------------------------------------------------------------------
@@ -180,10 +213,54 @@ def test_register_namespace_validates_governance_rules(kanban_home):
             kb.register_namespace(conn, "YY", name="bad", status="unknown", allocation_authority="x")
         with pytest.raises(ValueError, match="reserved legacy"):
             kb.register_namespace(conn, "CH", name="Legacy", status="active", allocation_authority="x")
+        with pytest.raises(ValueError, match="HL is not a Kanban-native namespace"):
+            kb.register_namespace(conn, "HL", name="Hermes Ledger", allocation_authority="x")
         with pytest.raises(ValueError, match="namespace name"):
             kb.register_namespace(conn, "YY", name="", allocation_authority="x")
         with pytest.raises(ValueError, match="allocation_authority"):
             kb.register_namespace(conn, "YY", name="bad", allocation_authority="")
+
+
+def test_retired_namespace_reuse_requires_explicit_migration_alias_policy(kanban_home):
+    with kb.connect() as conn:
+        kb.register_namespace(
+            conn,
+            "ZZ",
+            name="Retired Zone",
+            status="retired",
+            allocation_authority="historical allocator",
+            notes="closed after migration",
+        )
+
+        with pytest.raises(ValueError, match="retired namespace cannot be reused"):
+            kb.register_namespace(
+                conn,
+                "ZZ",
+                name="Reused Zone",
+                status="active",
+                allocation_authority="new allocator",
+            )
+
+        kb.register_namespace(
+            conn,
+            "ZZ",
+            name="Reused Zone",
+            status="active",
+            allocation_authority="new allocator",
+            migration_alias_policy="aliases ZZ-NNN to NZ-NNN during approved migration CH-426-test",
+        )
+        namespaces = {ns.prefix: ns for ns in kb.list_namespaces(conn)}
+        assert namespaces["ZZ"].status == "active"
+        assert "migration_alias_policy=" in namespaces["ZZ"].notes
+
+
+def test_hl_alias_registration_is_rejected(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="brain os task")
+        with pytest.raises(ValueError, match="HL aliases are not supported"):
+            kb.add_task_alias(conn, task_id, "HL-001")
+        with pytest.raises(ValueError, match="HL aliases are not supported"):
+            kb.add_task_alias(conn, task_id, "hl")
 
 
 def test_task_authority_round_trips_and_links_continuation(kanban_home):
