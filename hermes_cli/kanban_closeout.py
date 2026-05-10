@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_drift_audit
 
 CLOSEOUT_EVIDENCE_SCHEMA = "kanban_closeout_evidence.v1"
 VALID_CLOSEOUT_PHASES = ("worker_done", "review_ready", "closed")
@@ -379,6 +380,8 @@ def verify_closeout_transition(
             blockers.append("invalid_review_ready_source_phase")
         blockers.extend(_review_ready_blockers(normalized))
     else:  # closed
+        for key in ("drift_audit", "sustained_drift_audit"):
+            blockers.extend(kanban_drift_audit.closeout_blocks_from_audit(normalized.get(key)))
         has_exception = _no_pr_exception_present(normalized)
         if current_phase != "review_ready" and not has_exception:
             blockers.append("closed_requires_review_ready")
