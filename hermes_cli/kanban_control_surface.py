@@ -27,9 +27,22 @@ _SECRET_REPLACEMENTS: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(r"(?i)(api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*[^\s,;]+"),
         r"\1=[REDACTED]",
     ),
+    (
+        re.compile(r"(?i)([?&](?:access_)?token=)[^&\s]+"),
+        r"\1[REDACTED]",
+    ),
     (re.compile(r"(?i)bearer\s+[a-z0-9._~+/=-]{12,}"), "Bearer [REDACTED]"),
     (re.compile(r"(?i)sk-[a-z0-9_-]{8,}"), "[REDACTED]"),
     (re.compile(r"(?i)xox[baprs]-[a-z0-9-]{8,}"), "[REDACTED]"),
+    (
+        re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[a-z]{2,}(?![\w.-])", re.IGNORECASE),
+        "[REDACTED_EMAIL]",
+    ),
+    (
+        re.compile(r"(?<!\d)(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}(?!\d)"),
+        "[REDACTED_PHONE]",
+    ),
+    (re.compile(r"<@!?\d{12,}>"), "<@[REDACTED]>"),
 )
 
 
