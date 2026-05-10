@@ -164,7 +164,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("kanban", "Multi-profile collaboration board (tasks, links, comments)",
                "Tools & Skills", args_hint="[subcommand]",
                subcommands=("list", "ls", "show", "create", "assign", "link", "unlink",
-                            "claim", "comment", "complete", "block", "unblock", "archive",
+                            "claim", "comment", "complete", "closeout", "block", "unblock", "archive",
                             "tail", "dispatch", "context", "init", "gc")),
     CommandDef("reload", "Reload .env variables into the running session", "Tools & Skills",
                cli_only=True),

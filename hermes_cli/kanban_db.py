@@ -1206,6 +1206,101 @@ def set_task_authority(
     return True
 
 
+def apply_closeout_transition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    review_phase: str,
+    closeout_evidence: dict,
+) -> bool:
+    """Persist a verified Kanban-native closeout phase transition.
+
+    The verifier lives in :mod:`hermes_cli.kanban_closeout`; this DB helper only
+    applies already-verified facts to the governance columns.  Final ``closed``
+    maps to raw task ``done`` status because v1 task statuses do not have a
+    separate ``closed`` enum.  Earlier review phases never imply final closure.
+    """
+    if review_phase not in VALID_REVIEW_PHASES:
+        raise ValueError(f"review_phase must be one of {sorted(VALID_REVIEW_PHASES)}")
+    if not isinstance(closeout_evidence, dict):
+        raise ValueError("closeout_evidence must be a JSON object")
+
+    now = int(time.time())
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if current is None:
+            return False
+
+        if review_phase == "closed":
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET review_phase = ?,
+                       closeout_evidence = ?,
+                       status = 'done',
+                       completed_at = COALESCE(completed_at, ?),
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL
+                 WHERE id = ?
+                   AND status != 'archived'
+                """,
+                (
+                    review_phase,
+                    _json_dumps_dict(closeout_evidence, "closeout_evidence"),
+                    now,
+                    task_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="completed",
+                status="done",
+                summary="Kanban closeout approved and closed",
+                metadata={"closeout_phase": "closed"},
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET review_phase = ?,
+                       closeout_evidence = ?
+                 WHERE id = ?
+                   AND status != 'archived'
+                """,
+                (
+                    review_phase,
+                    _json_dumps_dict(closeout_evidence, "closeout_evidence"),
+                    task_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = _current_run_id(conn, task_id)
+
+        _append_event(
+            conn,
+            task_id,
+            "closeout_transition",
+            {
+                "review_phase": review_phase,
+                "blockers": closeout_evidence.get("verification", {}).get("blockers", []),
+                "allowed": closeout_evidence.get("verification", {}).get("allowed"),
+                "linear_done_mutated": False,
+            },
+            run_id=run_id,
+        )
+    if review_phase == "closed":
+        recompute_ready(conn)
+    return True
+
+
 def list_tasks(
     conn: sqlite3.Connection,
     *,
@@ -1789,7 +1884,12 @@ def complete_task(
                    completed_at = ?,
                    claim_lock   = NULL,
                    claim_expires= NULL,
-                   worker_pid   = NULL
+                   worker_pid   = NULL,
+                   review_phase = CASE
+                       WHEN closeout_evidence IS NOT NULL
+                            AND review_phase IS NULL THEN 'worker_done'
+                       ELSE review_phase
+                   END
              WHERE id = ?
                AND status IN ('running', 'ready', 'blocked')
             """,
@@ -1825,6 +1925,7 @@ def complete_task(
             {
                 "result_len": len(result) if result else 0,
                 "summary": ev_summary or None,
+                "final_closed": False,
             },
             run_id=run_id,
         )
