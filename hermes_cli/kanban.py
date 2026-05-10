@@ -26,6 +26,7 @@ from typing import Any, Optional
 from hermes_cli import kanban_control_surface as control_surface
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_closeout
+from hermes_cli import kanban_drift_audit
 from hermes_cli import kanban_native_admission as native_admission
 from hermes_cli import linear_kanban_shadow as linear_shadow
 
@@ -443,6 +444,45 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_control.add_argument("--limit", type=int, default=8, help="Max rows per queue (default: 8)")
     p_control.add_argument("--json", action="store_true")
 
+    # --- drift-audit ---
+    p_audit = sub.add_parser(
+        "drift-audit",
+        aliases=["audit-drift", "audit"],
+        help="Audit Kanban drift against non-authoritative projections",
+    )
+    p_audit.add_argument("--domain", default="all", help="Kanban tenant/domain to sample (default: all)")
+    p_audit.add_argument(
+        "--mode",
+        choices=kanban_drift_audit.VALID_MODES,
+        default="gating",
+        help="gating exits non-zero on closeout-blocking drift; informational always exits 0",
+    )
+    p_audit.add_argument(
+        "--sample-id",
+        action="append",
+        default=[],
+        help="Authoritative Kanban task/public/alias/idempotency id to include (repeatable)",
+    )
+    p_audit.add_argument("--limit", type=int, default=kanban_drift_audit.DEFAULT_SAMPLE_LIMIT)
+    p_audit.add_argument(
+        "--projection",
+        default=None,
+        help="JSON projection snapshot to compare; treated as non-authoritative",
+    )
+    p_audit.add_argument(
+        "--projection-file",
+        default=None,
+        help="Path to JSON projection snapshot; treated as non-authoritative",
+    )
+    p_audit.add_argument("--repo", default=None, help="Local repo path for git HEAD drift checks")
+    p_audit.add_argument(
+        "--stale-after",
+        type=int,
+        default=kanban_drift_audit.DEFAULT_STALE_AFTER_SECONDS,
+        help="Seconds before a projection snapshot is stale (default: 86400)",
+    )
+    p_audit.add_argument("--json", action="store_true", help="Emit JSON output")
+
     # --- notify subscribe / list / remove ---
     p_nsub = sub.add_parser(
         "notify-subscribe",
@@ -589,6 +629,9 @@ def kanban_command(args: argparse.Namespace) -> int:
         "control-surface": _cmd_control_surface,
         "control": _cmd_control_surface,
         "ledger": _cmd_control_surface,
+        "drift-audit": _cmd_drift_audit,
+        "audit-drift": _cmd_drift_audit,
+        "audit": _cmd_drift_audit,
         "log":      _cmd_log,
         "runs":     _cmd_runs,
         "heartbeat": _cmd_heartbeat,
@@ -1125,6 +1168,45 @@ def _cmd_closeout(args: argparse.Namespace) -> int:
     action = "Verified" if getattr(args, "check_only", False) else "Transitioned"
     print(f"{action} {args.task_id} -> {args.phase}")
     return 0
+
+
+def _load_projection_arg(args: argparse.Namespace) -> Any:
+    if getattr(args, "projection", None) and getattr(args, "projection_file", None):
+        raise ValueError("use either --projection or --projection-file, not both")
+    if getattr(args, "projection_file", None):
+        return Path(args.projection_file).expanduser().read_text(encoding="utf-8")
+    return getattr(args, "projection", None)
+
+
+def _cmd_drift_audit(args: argparse.Namespace) -> int:
+    try:
+        projection = _load_projection_arg(args)
+        with kb.connect() as conn:
+            report = kanban_drift_audit.audit_drift(
+                conn,
+                domain=getattr(args, "domain", "all") or "all",
+                mode=getattr(args, "mode", "gating"),
+                sampled_ids=tuple(getattr(args, "sample_id", None) or ()),
+                projection_snapshot=projection,
+                sample_limit=max(
+                    1,
+                    int(getattr(args, "limit", kanban_drift_audit.DEFAULT_SAMPLE_LIMIT)),
+                ),
+                stale_after_seconds=max(
+                    1,
+                    int(getattr(args, "stale_after", kanban_drift_audit.DEFAULT_STALE_AFTER_SECONDS)),
+                ),
+                repo_path=getattr(args, "repo", None),
+            )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"kanban: drift-audit: {exc}", file=sys.stderr)
+        return 2
+
+    if getattr(args, "json", False):
+        print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
+    else:
+        print(kanban_drift_audit.format_audit_report(report))
+    return 2 if report.blocking else 0
 
 
 def _cmd_block(args: argparse.Namespace) -> int:
