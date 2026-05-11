@@ -62,19 +62,127 @@ _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
 
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths / board selection
 # ---------------------------------------------------------------------------
 
-def kanban_db_path() -> Path:
-    """Return the path to ``kanban.db`` inside the active HERMES_HOME."""
+DEFAULT_BOARD = "default"
+_RESERVED_BOARD_NAMES = {"logs", "workspaces"}
+
+
+def normalize_board_name(board: Optional[str]) -> str:
+    """Normalize and validate a Kanban board name.
+
+    ``default`` preserves the historical single-board layout at
+    ``$HERMES_HOME/kanban.db``. Non-default boards are hard-isolated under
+    ``$HERMES_HOME/kanban/boards/<board>/``.
+    """
+    name = (board or os.environ.get("HERMES_KANBAN_BOARD") or DEFAULT_BOARD).strip().lower()
+    if not name:
+        name = DEFAULT_BOARD
+    if len(name) > 63:
+        raise ValueError("board name must be 63 characters or fewer")
+    if name in _RESERVED_BOARD_NAMES:
+        raise ValueError(f"{name!r} is reserved and cannot be used as a board name")
+    if not (name[0].isalnum() and all(c.isalnum() or c in "-_" for c in name)):
+        raise ValueError("board name must start with an ASCII letter/digit and contain only letters, digits, '-' or '_'")
+    return name
+
+
+def active_board() -> str:
+    """Return the currently selected board name."""
+    return normalize_board_name(None)
+
+
+def _boards_root() -> Path:
     from hermes_constants import get_hermes_home
-    return get_hermes_home() / "kanban.db"
+    return get_hermes_home() / "kanban" / "boards"
 
 
-def workspaces_root() -> Path:
+def board_root(board: Optional[str] = None) -> Path:
+    """Return the hard-isolated root directory for ``board``.
+
+    The default board intentionally maps to the historical Hermes home
+    layout so existing installs keep using ``$HERMES_HOME/kanban.db`` and
+    ``$HERMES_HOME/kanban/workspaces``.
+    """
+    from hermes_constants import get_hermes_home
+    name = normalize_board_name(board)
+    if name == DEFAULT_BOARD:
+        return get_hermes_home()
+    return _boards_root() / name
+
+
+def kanban_db_path(board: Optional[str] = None) -> Path:
+    """Return the SQLite DB path for the active or requested Kanban board."""
+    name = normalize_board_name(board)
+    if name == DEFAULT_BOARD:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / "kanban.db"
+    return board_root(name) / "kanban.db"
+
+
+def workspaces_root(board: Optional[str] = None) -> Path:
     """Return the directory under which ``scratch`` workspaces are created."""
-    from hermes_constants import get_hermes_home
-    return get_hermes_home() / "kanban" / "workspaces"
+    name = normalize_board_name(board)
+    if name == DEFAULT_BOARD:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / "kanban" / "workspaces"
+    return board_root(name) / "workspaces"
+
+
+def logs_root(board: Optional[str] = None) -> Path:
+    """Return the per-board worker log directory."""
+    name = normalize_board_name(board)
+    if name == DEFAULT_BOARD:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / "kanban" / "logs"
+    return board_root(name) / "logs"
+
+
+def create_board(board: str) -> Path:
+    """Create and initialize a board; return its DB path."""
+    name = normalize_board_name(board)
+    path = kanban_db_path(name)
+    init_db(path)
+    workspaces_root(name).mkdir(parents=True, exist_ok=True)
+    logs_root(name).mkdir(parents=True, exist_ok=True)
+    if name == DEFAULT_BOARD:
+        return path
+    manifest = board_root(name) / "board.json"
+    if not manifest.exists():
+        manifest.write_text(json.dumps({"name": name, "created_at": int(time.time())}, indent=2) + "\n")
+    return path
+
+
+def list_boards() -> list[dict[str, Any]]:
+    """List known boards from disk, including the historical default board."""
+    boards = [{
+        "name": DEFAULT_BOARD,
+        "db_path": str(kanban_db_path(DEFAULT_BOARD)),
+        "root": str(board_root(DEFAULT_BOARD)),
+        "active": active_board() == DEFAULT_BOARD,
+    }]
+    root = _boards_root()
+    if root.exists():
+        for child in sorted(p for p in root.iterdir() if p.is_dir()):
+            try:
+                name = normalize_board_name(child.name)
+            except ValueError:
+                continue
+            boards.append({
+                "name": name,
+                "db_path": str(kanban_db_path(name)),
+                "root": str(board_root(name)),
+                "active": active_board() == name,
+            })
+    seen = set()
+    out = []
+    for b in boards:
+        if b["name"] in seen:
+            continue
+        seen.add(b["name"])
+        out.append(b)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2594,6 +2702,7 @@ def _default_spawn(task: Task, workspace: str) -> Optional[int]:
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
+    env["HERMES_KANBAN_BOARD"] = active_board()
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # HERMES_PROFILE is the author the kanban_comment tool defaults to.
     # `hermes -p <assignee>` activates the profile, but the env var is
@@ -2629,9 +2738,8 @@ def _default_spawn(task: Task, workspace: str) -> Optional[int]:
         "chat",
         "-q", prompt,
     ])
-    # Redirect output to a per-task log under HERMES_HOME/kanban/logs/.
-    from hermes_constants import get_hermes_home
-    log_dir = get_hermes_home() / "kanban" / "logs"
+    # Redirect output to a per-task log under the active board's logs/.
+    log_dir = logs_root()
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{task.id}.log"
     _rotate_worker_log(log_path, DEFAULT_LOG_ROTATE_BYTES)

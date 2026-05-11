@@ -120,6 +120,7 @@ def _handle_show(args: dict, **kw) -> str:
                 }
 
             return json.dumps({
+                "board": kb.active_board(),
                 "task": _task_dict(task),
                 "parents": parents,
                 "children": children,

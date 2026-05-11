@@ -147,6 +147,47 @@ def test_run_slash_tenant_filter(kanban_home):
     assert "biz-b task" in b and "biz-a task" not in b
 
 
+def test_board_create_and_global_board_isolation(kanban_home):
+    out = kc.run_slash("boards create dc --json")
+    created = json.loads(out)
+    assert created["name"] == "dc"
+    assert created["db_path"].endswith("/kanban/boards/dc/kanban.db")
+    assert created["workspace_root"].endswith("/kanban/boards/dc/workspaces")
+    assert created["logs_root"].endswith("/kanban/boards/dc/logs")
+
+    kc.run_slash("create 'default task' --tenant kanban")
+    dc_created = json.loads(kc.run_slash("--board dc create 'dc task' --tenant billing --json"))
+    assert dc_created["board"] == "dc"
+    assert dc_created["tenant"] == "billing"
+
+    default_list = kc.run_slash("list")
+    dc_list = kc.run_slash("--board dc list")
+    assert "default task" in default_list and "dc task" not in default_list
+    assert "dc task" in dc_list and "default task" not in dc_list
+
+    boards = json.loads(kc.run_slash("--board dc boards list --json"))
+    by_name = {b["name"]: b for b in boards}
+    assert by_name["default"]["active"] is False
+    assert by_name["dc"]["active"] is True
+
+
+def test_board_env_selects_worker_tool_db(kanban_home, monkeypatch):
+    from tools import kanban_tools
+
+    kc.run_slash("boards create ws")
+    task = json.loads(kc.run_slash("--board ws create 'worker visible' --tenant growth --json"))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "ws")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task["id"])
+
+    payload = json.loads(kanban_tools._handle_show({}, task_id=task["id"]))
+    assert payload["board"] == "ws"
+    assert payload["task"]["title"] == "worker visible"
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    missing = json.loads(kanban_tools._handle_show({"task_id": task["id"]}))
+    assert "not found" in missing["error"]
+
+
 def _seed_control_surface_tasks():
     with kb.connect() as conn:
         active = kb.create_task(

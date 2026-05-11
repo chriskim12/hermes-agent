@@ -185,7 +185,9 @@ SKILLS_GUIDANCE = (
 KANBAN_GUIDANCE = (
     "# You are a Kanban worker\n"
     "You were spawned by the Hermes Kanban dispatcher to execute ONE task from "
-    "the shared board at `~/.hermes/kanban.db`. Your task id is in "
+    "the board named in `$HERMES_KANBAN_BOARD` (default board uses "
+    "`~/.hermes/kanban.db`; non-default boards are isolated under "
+    "`~/.hermes/kanban/boards/<board>/`). Your task id is in "
     "`$HERMES_KANBAN_TASK`; your workspace is `$HERMES_KANBAN_WORKSPACE`. "
     "The `kanban_*` tools in your schema are your primary coordination surface — "
     "they write directly to the shared SQLite DB and work regardless of terminal "

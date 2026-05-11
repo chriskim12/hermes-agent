@@ -60,6 +60,7 @@ def _fmt_task_line(t: kb.Task) -> str:
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     return {
+        "board": kb.active_board(),
         "id": t.id,
         "title": t.title,
         "body": t.body,
@@ -180,7 +181,29 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "or docs/hermes-kanban-v1-spec.pdf for the full design."
         ),
     )
+    kanban_parser.add_argument(
+        "--board",
+        default=None,
+        help=(
+            "Kanban board to use. 'default' preserves the historical "
+            "$HERMES_HOME/kanban.db board; non-default boards are isolated "
+            "under $HERMES_HOME/kanban/boards/<board>/ (also settable via "
+            "HERMES_KANBAN_BOARD)."
+        ),
+    )
     sub = kanban_parser.add_subparsers(dest="kanban_action")
+
+    # --- boards ---
+    p_boards = sub.add_parser("boards", help="List/create/show hard-isolated Kanban boards")
+    boards_sub = p_boards.add_subparsers(dest="boards_action")
+    p_boards_list = boards_sub.add_parser("list", aliases=["ls"], help="List known boards")
+    p_boards_list.add_argument("--json", action="store_true")
+    p_boards_create = boards_sub.add_parser("create", help="Create and initialize a board")
+    p_boards_create.add_argument("name", help="Board name, e.g. bo, dc, ws, rs")
+    p_boards_create.add_argument("--json", action="store_true")
+    p_boards_show = boards_sub.add_parser("show", help="Show board paths and active status")
+    p_boards_show.add_argument("name", nargs="?", default=None, help="Board name (default: active board)")
+    p_boards_show.add_argument("--json", action="store_true")
 
     # --- init ---
     sub.add_parser("init", help="Create kanban.db if missing (idempotent)")
@@ -600,6 +623,18 @@ def kanban_command(args: argparse.Namespace) -> int:
             )
         return 0
 
+    # Select the active hard-isolated board before any DB helper resolves
+    # $HERMES_HOME paths. The env var is process-local and keeps the older
+    # helpers compatible without threading a board argument through every
+    # call surface.
+    board_arg = getattr(args, "board", None)
+    if board_arg:
+        try:
+            os.environ["HERMES_KANBAN_BOARD"] = kb.normalize_board_name(board_arg)
+        except ValueError as exc:
+            print(f"kanban: --board: {exc}", file=sys.stderr)
+            return 2
+
     # Auto-initialize the DB before dispatching any subcommand. init_db
     # is idempotent, so running it every invocation is cheap (one
     # SELECT against sqlite_master when tables already exist) and
@@ -614,6 +649,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         return 1
 
     handlers = {
+        "boards":   _cmd_boards,
         "init":     _cmd_init,
         "create":   _cmd_create,
         "shadow-linear": _cmd_shadow_linear,
@@ -703,6 +739,54 @@ def _parse_duration(val) -> Optional[int]:
             raise ValueError(f"malformed duration {val!r}") from exc
         return int(n * units[s[-1]])
     raise ValueError(f"malformed duration {val!r} (expected 30s, 5m, 2h, 1d, or a number)")
+
+
+def _cmd_boards(args: argparse.Namespace) -> int:
+    action = getattr(args, "boards_action", None) or "list"
+    if action in ("list", "ls"):
+        data = kb.list_boards()
+        if getattr(args, "json", False):
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+            return 0
+        for b in data:
+            mark = "*" if b.get("active") else " "
+            print(f"{mark} {b['name']:16s}  db={b['db_path']}")
+        return 0
+    if action == "create":
+        path = kb.create_board(args.name)
+        payload = {
+            "name": kb.normalize_board_name(args.name),
+            "db_path": str(path),
+            "root": str(kb.board_root(args.name)),
+            "workspace_root": str(kb.workspaces_root(args.name)),
+            "logs_root": str(kb.logs_root(args.name)),
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            print(f"Created board {payload['name']} at {payload['db_path']}")
+        return 0
+    if action == "show":
+        name = kb.normalize_board_name(getattr(args, "name", None))
+        payload = {
+            "name": name,
+            "active": kb.active_board() == name,
+            "db_path": str(kb.kanban_db_path(name)),
+            "root": str(kb.board_root(name)),
+            "workspace_root": str(kb.workspaces_root(name)),
+            "logs_root": str(kb.logs_root(name)),
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            print(f"Board: {payload['name']}")
+            print(f"Active: {payload['active']}")
+            print(f"DB: {payload['db_path']}")
+            print(f"Workspaces: {payload['workspace_root']}")
+            print(f"Logs: {payload['logs_root']}")
+        return 0
+    print(f"kanban boards: unknown action {action!r}", file=sys.stderr)
+    return 2
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
@@ -1733,6 +1817,7 @@ def run_slash(rest: str) -> str:
     except argparse.ArgumentError as exc:
         return f"(usage error: {exc})"
 
+    prev_board = os.environ.get("HERMES_KANBAN_BOARD")
     with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
         try:
             kanban_command(args)
@@ -1740,6 +1825,11 @@ def run_slash(rest: str) -> str:
             pass
         except Exception as exc:
             print(f"error: {exc}", file=sys.stderr)
+        finally:
+            if prev_board is None:
+                os.environ.pop("HERMES_KANBAN_BOARD", None)
+            else:
+                os.environ["HERMES_KANBAN_BOARD"] = prev_board
 
     out = buf_out.getvalue().rstrip()
     err = buf_err.getvalue().rstrip()

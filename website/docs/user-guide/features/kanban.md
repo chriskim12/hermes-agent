@@ -46,32 +46,44 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 ## Core concepts
 
 - **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
-- **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`.
+- **Board** — the hard isolation boundary. The historical `default` board uses `~/.hermes/kanban.db`; named boards use separate DBs, workspaces, logs, and dispatcher/worker context under `~/.hermes/kanban/boards/<board>/`.
+- **Link** — `task_links` row recording a parent → child dependency inside the current board. Because named boards have separate DBs, dependencies do not cross board boundaries.
 - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
 - **Workspace** — the directory a worker operates in. Three kinds:
-  - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/`.
+  - `scratch` (default) — fresh tmp dir under the active board's workspace root (`~/.hermes/kanban/workspaces/<id>/` for `default`, `~/.hermes/kanban/boards/<board>/workspaces/<id>/` for named boards).
   - `dir:<path>` — an existing shared directory (Obsidian vault, mail ops dir, per-account folder). **Must be an absolute path.** Relative paths like `dir:../tenants/foo/` are rejected at dispatch because they'd resolve against whatever CWD the dispatcher happens to be in, which is ambiguous and a confused-deputy escape vector. The path is otherwise trusted — it's your box, your filesystem, the worker runs with your uid. This is the trusted-local-user threat model; kanban is single-host by design.
   - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Worker-side `git worktree add` creates it.
-- **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). After ~5 consecutive spawn failures on the same task the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
-- **Tenant** — optional string namespace. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix.
+- **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). After ~5 consecutive spawn failures on the same task the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc. Workers receive `HERMES_KANBAN_BOARD`, `HERMES_KANBAN_TASK`, and `HERMES_KANBAN_WORKSPACE`.
+- **Tenant** — optional soft filter inside a board. Use it for subdomains/workstreams (`billing`, `growth`, `infra`), not for hard isolation; hard isolation is board-level.
 
 ## Quick start
 
 ```bash
-# 1. Create the board
+# 1. Initialize the default board (historical ~/.hermes/kanban.db)
 hermes kanban init
+
+# Optional: create a named hard-isolated board
+hermes kanban boards create dc
+hermes kanban --board dc boards show
 
 # 2. Start the gateway (hosts the embedded dispatcher)
 hermes gateway start
 
-# 3. Create a task
+# 3. Create a task on the default board
 hermes kanban create "research AI funding landscape" --assignee researcher
+
+# Or create one on a named board
+hermes kanban --board dc create "review billing reminders" \
+  --assignee ops \
+  --tenant billing
 
 # 4. Watch activity live
 hermes kanban watch
+hermes kanban --board dc watch
 
 # 5. See the board
 hermes kanban list
+hermes kanban --board dc list
 hermes kanban stats
 ```
 
