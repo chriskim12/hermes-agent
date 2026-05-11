@@ -76,6 +76,16 @@ def test_board_empty(client):
     assert data["tenants"] == []
     assert data["assignees"] == []
     assert data["latest_event_id"] == 0
+    assert data["review_queue"]["projection"] is True
+    assert data["review_queue"]["authority"] == "kanban_db"
+    assert data["review_queue"]["counts"] == {
+        "worker_done": 0,
+        "review_ready": 0,
+        "closed": 0,
+        "blocked": 0,
+        "stale": 0,
+        "failed": 0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +121,71 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+
+
+def test_board_includes_review_queue_projection(client):
+    conn = kb.connect()
+    try:
+        worker_done = kb.create_task(
+            conn,
+            title="worker finished",
+            assignee="default",
+            review_phase="worker_done",
+            public_id="BO-201",
+        )
+        review_ready = kb.create_task(
+            conn,
+            title="ready for review",
+            assignee="default",
+            review_phase="review_ready",
+            public_id="BO-202",
+        )
+        closed = kb.create_task(
+            conn,
+            title="already closed",
+            review_phase="closed",
+            public_id="BO-203",
+        )
+        blocked = kb.create_task(conn, title="needs human", assignee="default")
+        assert kb.block_task(conn, blocked, reason="waiting for Chris")
+    finally:
+        conn.close()
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    queue = r.json()["review_queue"]
+    assert queue["projection"] is True
+    assert queue["authority"] == "kanban_db"
+    assert queue["counts"]["worker_done"] == 1
+    assert queue["counts"]["review_ready"] == 1
+    assert queue["counts"]["closed"] == 1
+    assert queue["counts"]["blocked"] == 1
+    item_keys = {(i["id"], i["kind"]) for i in queue["items"]}
+    assert (worker_done, "worker_done") in item_keys
+    assert (review_ready, "review_ready") in item_keys
+    assert (blocked, "blocked") in item_keys
+    assert all(i["id"] != closed for i in queue["items"])
+    public_ids = {i["public_id"] for i in queue["items"]}
+    assert {"BO-201", "BO-202"} <= public_ids
+
+
+def test_board_review_queue_counts_stale_tasks(client):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="old ready", assignee="default", public_id="BO-204")
+        old = int(time.time()) - (25 * 60 * 60)
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (old, tid))
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    queue = r.json()["review_queue"]
+    assert queue["counts"]["stale"] == 1
+    assert any(i["id"] == tid and i["kind"] == "stale" for i in queue["items"])
 
 
 def test_tenant_filter(client):

@@ -135,6 +135,109 @@ BOARD_COLUMNS: list[str] = [
 
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
+_REVIEW_QUEUE_PHASES = ("worker_done", "review_ready", "closed")
+_STALE_THRESHOLDS_SECONDS = {
+    "ready": 24 * 60 * 60,
+    "running": 60 * 60,
+    "blocked": 24 * 60 * 60,
+    "todo": 30 * 24 * 60 * 60,
+}
+
+
+def _staleness_tier(task: kanban_db.Task) -> Optional[str]:
+    """Return a coarse stale tier for dashboard review projection only."""
+    try:
+        age = kanban_db.task_age(task)
+    except Exception:
+        return None
+    seconds = (
+        age.get("started_age_seconds")
+        if task.status == "running"
+        else age.get("created_age_seconds")
+    )
+    if seconds is None:
+        return None
+    threshold = _STALE_THRESHOLDS_SECONDS.get(task.status)
+    if threshold is None or seconds < threshold:
+        return None
+    return "stale"
+
+
+def _build_review_queue(
+    tasks: list[kanban_db.Task],
+    diagnostics_per_task: dict[str, list[dict]],
+) -> dict[str, Any]:
+    """Summarise review/attention queues without creating a new authority.
+
+    The Kanban DB remains the authority; this payload is a read-only projection
+    for the dashboard to make worker_done/review_ready/blocked/stale/failure
+    states visible at a glance.
+    """
+    counts: dict[str, int] = {
+        "worker_done": 0,
+        "review_ready": 0,
+        "closed": 0,
+        "blocked": 0,
+        "stale": 0,
+        "failed": 0,
+    }
+    items: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_item(task: kanban_db.Task, kind: str, severity: str = "info") -> None:
+        key = (task.id, kind)
+        if key in seen:
+            return
+        seen.add(key)
+        items.append(
+            {
+                "id": task.id,
+                "public_id": task.public_id,
+                "title": task.title,
+                "status": task.status,
+                "review_phase": task.review_phase,
+                "assignee": task.assignee,
+                "tenant": task.tenant,
+                "kind": kind,
+                "severity": severity,
+            }
+        )
+
+    for task in tasks:
+        phase = task.review_phase
+        if phase in _REVIEW_QUEUE_PHASES:
+            counts[phase] += 1
+            if phase != "closed":
+                add_item(task, phase, "review")
+        if task.status == "blocked":
+            counts["blocked"] += 1
+            add_item(task, "blocked", "warning")
+        if _staleness_tier(task):
+            counts["stale"] += 1
+            add_item(task, "stale", "warning")
+        diags = diagnostics_per_task.get(task.id) or []
+        if any(d.get("severity") in {"error", "critical"} for d in diags):
+            counts["failed"] += 1
+            add_item(task, "failed", "critical")
+
+    def priority(item: dict[str, Any]) -> tuple[int, str]:
+        order = {
+            "failed": 0,
+            "blocked": 1,
+            "review_ready": 2,
+            "worker_done": 3,
+            "stale": 4,
+        }
+        return (order.get(str(item.get("kind")), 99), str(item.get("public_id") or item.get("id")))
+
+    items.sort(key=priority)
+    return {
+        "projection": True,
+        "authority": "kanban_db",
+        "counts": counts,
+        "items": items[:20],
+        "truncated": len(items) > 20,
+    }
 
 
 def _task_dict(
@@ -456,6 +559,7 @@ def get_board(
             ],
             "tenants": tenants,
             "assignees": assignees,
+            "review_queue": _build_review_queue(tasks, diagnostics_per_task),
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
         }
