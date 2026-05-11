@@ -221,6 +221,11 @@ def make_runner(platform: Platform, session_entry: SessionEntry = None) -> "Gate
     runner._send_voice_reply = AsyncMock()
     runner._capture_gateway_honcho_if_configured = lambda *a, **kw: None
     runner._emit_gateway_run_progress = AsyncMock()
+    # The e2e command tests exercise the historical direct /new reset path.
+    # Destructive slash confirmation is covered separately; keep this harness
+    # deterministic and side-effect free instead of reading the operator's
+    # real ~/.hermes/config.yaml.
+    runner._read_user_config = lambda: {"approvals": {"destructive_slash_confirm": False}}
 
     runner.pairing_store = MagicMock()
     runner.pairing_store._is_rate_limited = MagicMock(return_value=False)

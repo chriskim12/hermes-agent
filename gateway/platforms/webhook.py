@@ -13,6 +13,10 @@ Each route defines:
   - skills: optional list of skills to load for the agent
   - deliver: where to send the response (github_comment, telegram, etc.)
   - deliver_extra: additional delivery config (repo, pr_number, chat_id)
+  - deliver_only: if true, skip the agent — the rendered prompt IS the
+    message that gets delivered.  Use for external push notifications
+    (Supabase, monitoring alerts, inter-agent pings) where zero LLM cost
+    and sub-second delivery matter more than agent reasoning.
 
 Security:
   - HMAC secret is required per route (validated at startup)
@@ -54,6 +58,29 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8644
 _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
+
+# Hostnames/IP literals that only serve connections originating on the same
+# machine. Anything else is treated as a public bind for safety-rail purposes.
+_LOOPBACK_HOSTS = frozenset({
+    "127.0.0.1",
+    "localhost",
+    "::1",
+    "ip6-localhost",
+    "ip6-loopback",
+})
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True when `host` binds only to the local machine.
+
+    Covers IPv4 loopback, the standard `localhost` alias, IPv6 loopback in
+    both bracketed and bare form, and the common Debian-style aliases. Any
+    falsy value (empty string, None) is conservatively treated as non-loopback
+    because an unset host usually means the platform-default public bind.
+    """
+    if not host:
+        return False
+    return host.strip().lower() in _LOOPBACK_HOSTS
 
 
 def check_webhook_requirements() -> bool:
@@ -115,17 +142,36 @@ class WebhookAdapter(BasePlatformAdapter):
         # Validate routes at startup — secret is required per route
         for name, route in self._routes.items():
             secret = route.get("secret", self._global_secret)
-            if route.get("deliver_only") and route.get("deliver", "log") == "log":
-                raise ValueError(
-                    f"[webhook] Route '{name}' has deliver_only=true but deliver is 'log'. "
-                    "Set a real delivery target."
-                )
             if not secret:
                 raise ValueError(
                     f"[webhook] Route '{name}' has no HMAC secret. "
                     f"Set 'secret' on the route or globally. "
                     f"For testing without auth, set secret to '{_INSECURE_NO_AUTH}'."
                 )
+
+            # Safety rail: refuse to start if INSECURE_NO_AUTH is combined with a
+            # non-loopback bind. The escape hatch is for local testing only;
+            # serving an unauthenticated route on a public interface is a
+            # deployment-grade footgun we'd rather crash early than ship.
+            if secret == _INSECURE_NO_AUTH and not _is_loopback_host(self._host):
+                raise ValueError(
+                    f"[webhook] Route '{name}' uses INSECURE_NO_AUTH secret "
+                    f"but is bound to non-loopback host '{self._host}'. "
+                    f"INSECURE_NO_AUTH is for local testing only. "
+                    f"Refusing to start to prevent accidental exposure."
+                )
+            # deliver_only routes bypass the agent — the POST body becomes a
+            # direct push notification via the configured delivery target.
+            # Validate up-front so misconfiguration surfaces at startup rather
+            # than on the first webhook POST.
+            if route.get("deliver_only"):
+                deliver = route.get("deliver", "log")
+                if not deliver or deliver == "log":
+                    raise ValueError(
+                        f"[webhook] Route '{name}' has deliver_only=true but "
+                        f"deliver is '{deliver}'. Direct delivery requires a "
+                        f"real target (telegram, discord, slack, github_comment, etc.)."
+                    )
 
         app = web.Application()
         app.router.add_get("/health", self._handle_health)
@@ -184,21 +230,6 @@ class WebhookAdapter(BasePlatformAdapter):
         deliver_type = delivery.get("deliver", "log")
 
         if deliver_type == "log":
-            logger.info("[webhook] Response for %s: %s", chat_id, content[:200])
-            return SendResult(success=True)
-
-        try:
-            return await self._direct_deliver(content, delivery)
-        except Exception as e:
-            logger.error("[webhook] Delivery error: %s", e)
-            return SendResult(success=False, error=str(e))
-
-    async def _direct_deliver(self, content: str, delivery: dict) -> SendResult:
-        """Deliver rendered webhook content without invoking the agent."""
-        deliver_type = delivery.get("deliver", "log")
-
-        if deliver_type == "log":
-            chat_id = delivery.get("chat_id", "webhook")
             logger.info("[webhook] Response for %s: %s", chat_id, content[:200])
             return SendResult(success=True)
 
@@ -312,14 +343,14 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"error": "Payload too large"}, status=413
             )
 
-        # Read body
+        # Read body (must be done before any validation)
         try:
             raw_body = await request.read()
         except Exception as e:
             logger.error("[webhook] Failed to read body: %s", e)
             return web.json_response({"error": "Bad request"}, status=400)
 
-        # Validate HMAC signature (skip for INSECURE_NO_AUTH testing mode)
+        # Validate HMAC signature FIRST (skip for INSECURE_NO_AUTH testing mode)
         secret = route_config.get("secret", self._global_secret)
         if secret and secret != _INSECURE_NO_AUTH:
             if not self._validate_signature(request, raw_body, secret):
@@ -330,9 +361,7 @@ class WebhookAdapter(BasePlatformAdapter):
                     {"error": "Invalid signature"}, status=401
                 )
 
-        # ── Rate limiting ────────────────────────────────────────
-        # Count only authenticated requests; invalid signatures must not burn
-        # quota or attackers can rate-limit legitimate webhook deliveries.
+        # ── Rate limiting (after auth) ───────────────────────────
         now = time.time()
         window = self._rate_counts.setdefault(route_name, [])
         window[:] = [t for t in window if now - t < 60]
@@ -359,11 +388,10 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
 
         # Check event type filter
-        payload_event_type = payload.get("event_type", "") if isinstance(payload, dict) else ""
         event_type = (
             request.headers.get("X-GitHub-Event", "")
             or request.headers.get("X-GitLab-Event", "")
-            or payload_event_type
+            or payload.get("event_type", "")
             or "unknown"
         )
         allowed_events = route_config.get("events", [])
@@ -376,103 +404,6 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             return web.json_response(
                 {"status": "ignored", "event": event_type}
-            )
-
-        delivery_id = request.headers.get(
-            "X-GitHub-Delivery",
-            request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
-        )
-
-        if route_config.get("owner_ingress"):
-            if not self.gateway_runner or not hasattr(self.gateway_runner, "handle_owner_ingress_packet"):
-                return web.json_response(
-                    {"status": "reject", "verdict": "reject", "reason": "gateway_runner_unavailable"},
-                    status=503,
-                )
-            verdict = await self.gateway_runner.handle_owner_ingress_packet(
-                payload,
-                route_name=route_name,
-                delivery_id=delivery_id,
-            )
-            return web.json_response(
-                {k: v for k, v in verdict.items() if k != "http_status"},
-                status=int(verdict.get("http_status", 202)),
-            )
-
-        if route_config.get("delegated_ingress"):
-            if not self.gateway_runner or not hasattr(self.gateway_runner, "handle_delegated_ingress_packet"):
-                return web.json_response(
-                    {"status": "reject", "verdict": "reject", "reason": "gateway_runner_unavailable"},
-                    status=503,
-                )
-            verdict = await self.gateway_runner.handle_delegated_ingress_packet(
-                payload,
-                route_name=route_name,
-                delivery_id=delivery_id,
-            )
-            return web.json_response(
-                {k: v for k, v in verdict.items() if k != "http_status"},
-                status=int(verdict.get("http_status", 202)),
-            )
-
-        if route_config.get("clawhip_native_ingress"):
-            registry = getattr(self.gateway_runner, "work_session_registry", None)
-            if registry is None:
-                return web.json_response(
-                    {"status": "reject", "verdict": "reject", "reason": "work_session_registry_unavailable"},
-                    status=503,
-                )
-            event_payload = payload if isinstance(payload, dict) else {}
-            event_payload = dict(event_payload)
-            event_payload["ingress_route"] = route_name
-            event_payload["delivery_id"] = delivery_id
-            result = registry.ingest_clawhip_native_event(event_payload)
-            if result.get("status") != "accepted":
-                return web.json_response(
-                    {
-                        "status": "reject",
-                        "verdict": "reject",
-                        "registry_status": result.get("status"),
-                        "reason": result.get("reason", "clawhip_native_ingress_rejected"),
-                    },
-                    status=422,
-                )
-            record = result.get("record")
-            delegated_alert_result = None
-            semantic_alert = result.get("semantic_alert")
-            if (
-                isinstance(semantic_alert, dict)
-                and semantic_alert.get("classifier_reason")
-                and self.gateway_runner
-                and hasattr(self.gateway_runner, "handle_delegated_ingress_packet")
-            ):
-                delegated_alert_result = await self.gateway_runner.handle_delegated_ingress_packet(
-                    semantic_alert,
-                    route_name=route_name,
-                    delivery_id=delivery_id,
-                )
-            return web.json_response(
-                {
-                    "status": "accepted",
-                    "verdict": "accepted",
-                    "registry_status": result.get("status"),
-                    "route": route_name,
-                    "delivery_id": delivery_id,
-                    "provider": getattr(record, "provider", None),
-                    "provider_session_id": getattr(record, "provider_session_id", None),
-                    "linear_card_id": getattr(record, "linear_card_id", None),
-                    "lane_id": getattr(record, "lane_id", None),
-                    "lifecycle_state": getattr(record, "lifecycle_state", None),
-                    "classification": result.get("classification"),
-                    "deliver_policy": result.get("deliver_policy"),
-                    "semantic_alert": {
-                        "state": semantic_alert.get("classifier_state"),
-                        "reason": semantic_alert.get("classifier_reason"),
-                        "required_owner_action": semantic_alert.get("required_owner_action"),
-                    } if isinstance(semantic_alert, dict) else None,
-                    "delegated_alert": delegated_alert_result,
-                },
-                status=202,
             )
 
         # Format prompt from template
@@ -535,6 +466,64 @@ class WebhookAdapter(BasePlatformAdapter):
             )
         self._seen_deliveries[delivery_id] = now
 
+        # ── Direct delivery mode (deliver_only) ─────────────────
+        # Skip the agent entirely — the rendered prompt IS the message we
+        # deliver.  Use case: external services (Supabase, monitoring,
+        # cron jobs, other agents) that need to push a plain notification
+        # to a user's chat with zero LLM cost.  Reuses the same HMAC auth,
+        # rate limiting, idempotency, and template rendering as agent mode.
+        if route_config.get("deliver_only"):
+            delivery = {
+                "deliver": route_config.get("deliver", "log"),
+                "deliver_extra": self._render_delivery_extra(
+                    route_config.get("deliver_extra", {}), payload
+                ),
+                "payload": payload,
+            }
+            logger.info(
+                "[webhook] direct-deliver event=%s route=%s target=%s msg_len=%d delivery=%s",
+                event_type,
+                route_name,
+                delivery["deliver"],
+                len(prompt),
+                delivery_id,
+            )
+            try:
+                result = await self._direct_deliver(prompt, delivery)
+            except Exception:
+                logger.exception(
+                    "[webhook] direct-deliver failed route=%s delivery=%s",
+                    route_name,
+                    delivery_id,
+                )
+                return web.json_response(
+                    {"status": "error", "error": "Delivery failed", "delivery_id": delivery_id},
+                    status=502,
+                )
+
+            if result.success:
+                return web.json_response(
+                    {
+                        "status": "delivered",
+                        "route": route_name,
+                        "target": delivery["deliver"],
+                        "delivery_id": delivery_id,
+                    },
+                    status=200,
+                )
+            # Delivery attempted but target rejected it — surface as 502
+            # with a generic error (don't leak adapter-level detail).
+            logger.warning(
+                "[webhook] direct-deliver target rejected route=%s target=%s error=%s",
+                route_name,
+                delivery["deliver"],
+                result.error,
+            )
+            return web.json_response(
+                {"status": "error", "error": "Delivery failed", "delivery_id": delivery_id},
+                status=502,
+            )
+
         # Use delivery_id in session key so concurrent webhooks on the
         # same route get independent agent runs (not queued/interrupted).
         session_chat_id = f"webhook:{route_name}:{delivery_id}"
@@ -552,20 +541,6 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
         self._prune_delivery_info(now)
-
-        if route_config.get("deliver_only"):
-            result = await self.send(session_chat_id, prompt)
-            if not result.success:
-                return web.json_response({"error": "Delivery failed"}, status=502)
-            return web.json_response(
-                {
-                    "status": "delivered",
-                    "route": route_name,
-                    "target": deliver_config["deliver"],
-                    "delivery_id": delivery_id,
-                },
-                status=200,
-            )
 
         # Build source and event
         source = self.build_source(
@@ -701,6 +676,34 @@ class WebhookAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Response delivery
     # ------------------------------------------------------------------
+
+    async def _direct_deliver(
+        self, content: str, delivery: dict
+    ) -> SendResult:
+        """Deliver *content* directly without invoking the agent.
+
+        Used by ``deliver_only`` routes: the rendered template becomes the
+        literal message body, and we dispatch to the same delivery helpers
+        that the agent-mode ``send()`` flow uses.  All target types that
+        work in agent mode work here — Telegram, Discord, Slack, GitHub
+        PR comments, etc.
+        """
+        deliver_type = delivery.get("deliver", "log")
+
+        if deliver_type == "log":
+            # Shouldn't reach here — startup validation rejects deliver_only
+            # with deliver=log — but guard defensively.
+            logger.info("[webhook] direct-deliver log-only: %s", content[:200])
+            return SendResult(success=True)
+
+        if deliver_type == "github_comment":
+            return await self._deliver_github_comment(content, delivery)
+
+        # Fall through to the cross-platform dispatcher, which validates the
+        # target name and routes via the gateway runner.
+        return await self._deliver_cross_platform(
+            deliver_type, content, delivery
+        )
 
     async def _deliver_github_comment(
         self, content: str, delivery: dict

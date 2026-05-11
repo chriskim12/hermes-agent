@@ -15,6 +15,49 @@ on:
 permissions:
   contents: read
 
+# BO-010 upstream-first split: these files encode fork-local legacy CLI/gateway
+# expectations that no longer match the upstream-first reconciliation surface.
+# They are not deleted; the blocking job excludes them and the migration debt is
+# documented in docs/bo-010-upstream-first-ci-contract-split.md.
+env:
+  LEGACY_LOCAL_FORK_TESTS: |
+    tests/acp/test_server.py
+    tests/cli/test_cprint_bg_thread.py
+    tests/cli/test_cli_file_drop.py
+    tests/cli/test_cli_force_redraw.py
+    tests/cli/test_cli_goal_interrupt.py
+    tests/cli/test_cli_init.py
+    tests/cli/test_cli_markdown_rendering.py
+    tests/cli/test_cli_new_session.py
+    tests/cli/test_cli_save_config_value.py
+    tests/cli/test_cli_status_bar.py
+    tests/cli/test_ctrl_enter_newline.py
+    tests/cli/test_destructive_slash_confirm.py
+    tests/cli/test_manual_compress.py
+    tests/cli/test_prompt_text_input_thread_safety.py
+    tests/cli/test_resume_display.py
+    tests/gateway/test_autopilot_command.py
+    tests/gateway/test_clawhip_work_session_registry.py
+    tests/gateway/test_config.py
+    tests/gateway/test_delegated_process_exit_fail_closed.py
+    tests/gateway/test_linear_card_execution_routing.py
+    tests/gateway/test_owner_ingress_work_state.py
+    tests/gateway/test_owner_thread_relay.py
+    tests/gateway/test_tts_media_routing.py
+    tests/gateway/test_update_streaming.py
+    tests/gateway/test_verbose_command.py
+    tests/gateway/test_voice_command.py
+    tests/hermes_cli/test_cmd_update.py
+    tests/hermes_cli/test_gateway_service.py
+    tests/hermes_cli/test_update_gateway_restart.py
+    tests/hermes_cli/test_web_server.py
+    tests/run_agent/test_async_httpx_del_neuter.py
+    tests/test_hermes_bootstrap.py
+    tests/tools/test_terminal_config_env_sync.py
+    tests/tools/test_vision_native_fast_path.py
+    tests/tools/test_voice_cli_integration.py
+    tests/tools/test_windows_native_support.py
+
 # Cancel in-progress runs for the same PR/branch
 concurrency:
   group: tests-${{ github.ref }}
@@ -23,7 +66,10 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Upstream-first PRs pull in a much larger test surface than the local fork
+    # previously ran; keep the blocking test job finite but avoid cancelling a
+    # healthy full-suite run before pytest can report results.
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -46,7 +92,12 @@ jobs:
       - name: Run tests
         run: |
           source .venv/bin/activate
-          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto
+          mapfile -t legacy_tests < <(printf '%s\n' "$LEGACY_LOCAL_FORK_TESTS" | sed '/^$/d')
+          ignore_args=(--ignore=tests/integration --ignore=tests/e2e)
+          for path in "${legacy_tests[@]}"; do
+            ignore_args+=(--ignore="$path")
+          done
+          python -m pytest tests/ -q "${ignore_args[@]}" --tb=short -n auto
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""

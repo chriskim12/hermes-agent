@@ -202,17 +202,17 @@ def test_patch_block_then_unblock(client):
 
 
 def test_patch_drag_drop_move_todo_to_ready(client):
-    """Direct status write: the drag-drop path for statuses without a
-    dedicated verb (e.g. manually promoting todo -> ready)."""
-    parent = client.post("/api/plugins/kanban/tasks", json={"title": "p"}).json()["task"]
-    child = client.post(
-        "/api/plugins/kanban/tasks",
-        json={"title": "c", "parents": [parent["id"]]},
-    ).json()["task"]
-    assert child["status"] == "todo"
+    """Direct status write: drag-drop todo -> ready for an unblocked task."""
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "c"}).json()["task"]
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "todo"},
+    )
+    assert r.status_code == 200
+    assert r.json()["task"]["status"] == "todo"
 
     r = client.patch(
-        f"/api/plugins/kanban/tasks/{child['id']}",
+        f"/api/plugins/kanban/tasks/{task['id']}",
         json={"status": "ready"},
     )
     assert r.status_code == 200
@@ -406,8 +406,16 @@ def test_board_progress_rollup(client):
         "/api/plugins/kanban/tasks",
         json={"title": "b", "parents": [parent["id"]]},
     ).json()["task"]
-    # Children start as "todo" because the parent isn't done yet; promote
-    # them to "ready" so complete_task will accept the transition.
+    # Upstream guards child dispatch until parents are done. Complete the
+    # parent first so children can be promoted to ready for manual completion.
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}", json={"status": "ready"},
+    )
+    assert r.status_code == 200
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}", json={"status": "done"},
+    )
+    assert r.status_code == 200
     for cid in (child_a["id"], child_b["id"]):
         r = client.patch(
             f"/api/plugins/kanban/tasks/{cid}", json={"status": "ready"},
