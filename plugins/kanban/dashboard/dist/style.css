@@ -60,6 +60,101 @@
   color: var(--color-muted-foreground) !important;
 }
 
+
+/* ---- Review queue projection ----------------------------------------- */
+.hermes-kanban-review-strip {
+  border: 1px solid color-mix(in srgb, var(--color-border) 85%, transparent);
+  background: color-mix(in srgb, var(--color-card) 82%, transparent);
+  border-radius: var(--radius);
+  padding: 0.55rem 0.65rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+.hermes-kanban-review-strip-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.hermes-kanban-review-strip-title {
+  font-size: 0.8rem;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+.hermes-kanban-review-strip-sub {
+  font-size: 0.68rem;
+  color: var(--color-muted-foreground);
+}
+.hermes-kanban-review-strip-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+.hermes-kanban-review-chip {
+  border: 1px solid color-mix(in srgb, var(--color-border) 80%, transparent);
+  border-radius: 999px;
+  color: var(--color-muted-foreground);
+  font-size: 0.68rem;
+  padding: 0.08rem 0.45rem;
+}
+.hermes-kanban-review-chip strong {
+  color: var(--color-foreground);
+  font-variant-numeric: tabular-nums;
+}
+.hermes-kanban-review-chip--active {
+  background: color-mix(in srgb, var(--color-foreground) 7%, transparent);
+}
+.hermes-kanban-review-chip--failed.hermes-kanban-review-chip--active,
+.hermes-kanban-review-chip--blocked.hermes-kanban-review-chip--active {
+  border-color: color-mix(in srgb, var(--color-destructive, #d14a4a) 70%, var(--color-border));
+}
+.hermes-kanban-review-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+.hermes-kanban-review-row {
+  appearance: none;
+  border: 1px solid color-mix(in srgb, var(--color-border) 75%, transparent);
+  background: color-mix(in srgb, var(--color-background) 70%, transparent);
+  color: var(--color-foreground);
+  border-radius: var(--radius-sm, 0.25rem);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  max-width: 28rem;
+  padding: 0.22rem 0.45rem;
+  text-align: left;
+}
+.hermes-kanban-review-row:hover {
+  border-color: var(--color-ring);
+}
+.hermes-kanban-review-row-kind,
+.hermes-kanban-review-phase {
+  font-size: 0.62rem;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.hermes-kanban-review-row-id {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.68rem;
+  color: var(--color-muted-foreground);
+}
+.hermes-kanban-review-row-title {
+  font-size: 0.72rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hermes-kanban-review-row-meta,
+.hermes-kanban-review-more {
+  color: var(--color-muted-foreground);
+  font-size: 0.68rem;
+}
+
 /* ---- Columns layout -------------------------------------------------- */
 
 .hermes-kanban-columns {

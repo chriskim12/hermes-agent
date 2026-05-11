@@ -594,7 +594,7 @@
         if (tenantFilter && t.tenant !== tenantFilter) return false;
         if (assigneeFilter && t.assignee !== assigneeFilter) return false;
         if (q) {
-          const hay = `${t.id} ${t.title || ""} ${t.body || ""} ${t.result || ""} ${t.latest_summary || ""} ${t.assignee || ""} ${t.tenant || ""}`.toLowerCase();
+          const hay = `${t.id} ${t.public_id || ""} ${t.title || ""} ${t.body || ""} ${t.result || ""} ${t.latest_summary || ""} ${t.assignee || ""} ${t.tenant || ""} ${t.review_phase || ""}`.toLowerCase();
           if (hay.indexOf(q) === -1) return false;
         }
         return true;
@@ -912,6 +912,10 @@
           boardData,
           onOpen: setSelectedTaskId,
         }),
+        h(ReviewQueueStrip, {
+          reviewQueue: boardData.review_queue,
+          onOpen: setSelectedTaskId,
+        }),
         h(BoardToolbar, {
           board: boardData,
           tenantFilter, setTenantFilter,
@@ -998,6 +1002,76 @@
       return bLa - aLa;
     });
     return out;
+  }
+
+  function ReviewQueueStrip(props) {
+    const { t } = useI18n();
+    const q = props.reviewQueue || {};
+    const counts = q.counts || {};
+    const items = q.items || [];
+    const openCount = (counts.failed || 0) + (counts.blocked || 0) +
+      (counts.review_ready || 0) + (counts.worker_done || 0) + (counts.stale || 0);
+    const hasSignal = openCount > 0 || (counts.closed || 0) > 0;
+    if (!hasSignal) return null;
+    const chips = [
+      ["review_ready", "Review ready"],
+      ["worker_done", "Worker done"],
+      ["blocked", "Blocked"],
+      ["stale", "Stale"],
+      ["failed", "Failed"],
+      ["closed", "Closed"],
+    ];
+    return h("div", {
+      className: "hermes-kanban-review-strip",
+      title: tx(t, "reviewQueueProjectionHint",
+        "Read-only projection from kanban.db. Use closeout commands for authority transitions."),
+    },
+      h("div", { className: "hermes-kanban-review-strip-head" },
+        h("span", { className: "hermes-kanban-review-strip-title" },
+          tx(t, "reviewQueue", "Review queue")),
+        h("span", { className: "hermes-kanban-review-strip-sub" },
+          tx(t, "projectionOnly", "projection only · authority: kanban.db")),
+      ),
+      h("div", { className: "hermes-kanban-review-strip-chips" },
+        chips.map(function (pair) {
+          const key = pair[0];
+          const label = pair[1];
+          const n = counts[key] || 0;
+          return h("span", {
+            key: key,
+            className: cn(
+              "hermes-kanban-review-chip",
+              n > 0 ? "hermes-kanban-review-chip--active" : "",
+              "hermes-kanban-review-chip--" + key,
+            ),
+            title: label + ": " + n,
+          }, label, " ", h("strong", null, n));
+        }),
+      ),
+      items.length > 0
+        ? h("div", { className: "hermes-kanban-review-list" },
+            items.slice(0, 8).map(function (item) {
+              const displayId = item.public_id || item.id;
+              return h("button", {
+                key: item.id + ":" + item.kind,
+                className: cn(
+                  "hermes-kanban-review-row",
+                  "hermes-kanban-review-row--" + (item.kind || "info"),
+                ),
+                onClick: function () { props.onOpen(item.id); },
+                type: "button",
+                title: (item.public_id ? item.public_id + " / " + item.id : item.id) + " · " + item.kind,
+              },
+                h("span", { className: "hermes-kanban-review-row-kind" }, item.kind),
+                h("span", { className: "hermes-kanban-review-row-id" }, displayId),
+                h("span", { className: "hermes-kanban-review-row-title" }, item.title || tx(t, "untitled", "(untitled)")),
+                item.assignee ? h("span", { className: "hermes-kanban-review-row-meta" }, "@", item.assignee) : null,
+              );
+            }),
+            q.truncated ? h("span", { className: "hermes-kanban-review-more" }, "…") : null,
+          )
+        : null,
+    );
   }
 
   function AttentionStrip(props) {
@@ -2048,6 +2122,7 @@
     };
 
     const progress = t.progress;
+    const displayId = t.public_id || t.id;
 
     return h("div", {
       ref: cardRef,
@@ -2085,7 +2160,11 @@
               }),
             ),
             h("span", { className: "hermes-kanban-card-id",
-                        title: `Task id: ${t.id}. Use this id with kanban_show, /kanban show, or hermes kanban show.` }, t.id),
+                        title: t.public_id ? `Public id: ${t.public_id}. Internal task id: ${t.id}.` : `Task id: ${t.id}. Use this id with kanban_show, /kanban show, or hermes kanban show.` }, displayId),
+            t.review_phase
+              ? h(Badge, { variant: "outline", className: cn("hermes-kanban-review-phase", "hermes-kanban-review-phase--" + t.review_phase),
+                           title: `Review phase: ${t.review_phase}. Closeout authority remains the Kanban DB, not this dashboard projection.` }, t.review_phase)
+              : null,
             t.warnings && t.warnings.count > 0
               ? h("span", {
                   className: cn(
