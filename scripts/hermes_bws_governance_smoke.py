@@ -41,7 +41,7 @@ class Check:
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     if data.get("schema") != "hermes-runtime-secrets/v1":
         raise ValueError(f"unsupported manifest schema: {data.get('schema')!r}")
     keys = [entry.get("key") for entry in data.get("entries", [])]
@@ -55,7 +55,7 @@ def env_keys(path: Path) -> set[str]:
     keys: set[str] = set()
     if not path.exists():
         return keys
-    for line in path.read_text(errors="ignore").splitlines():
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "=" not in stripped:
             continue
