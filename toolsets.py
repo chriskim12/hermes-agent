@@ -46,6 +46,9 @@ _HERMES_CORE_TOOLS = [
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
     # Text-to-speech
     "text_to_speech",
+    # Media workflows
+    "youtube_music_dig",
+    "youtube_music_retry_pending",
     # Planning & memory
     "todo", "memory",
     # Session history search
