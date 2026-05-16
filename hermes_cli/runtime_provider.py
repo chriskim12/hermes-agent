@@ -164,7 +164,18 @@ def _copilot_runtime_api_mode(model_cfg: Dict[str, Any], api_key: str) -> str:
         return "chat_completions"
 
 
-_VALID_API_MODES = {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}
+_VALID_API_MODES = {
+    "chat_completions",
+    "codex_responses",
+    "anthropic_messages",
+    "bedrock_converse",
+    # Optional opt-in: hand the entire turn to a `codex app-server` subprocess
+    # so terminal/file-ops/patching/sandboxing run inside Codex's own runtime
+    # instead of Hermes' tool dispatch. Gated behind config key
+    # `model.openai_runtime == "codex_app_server"` AND provider in
+    # {"openai", "openai-codex"}. Default is unchanged.
+    "codex_app_server",
+}
 
 
 def _parse_api_mode(raw: Any) -> Optional[str]:
@@ -174,6 +185,23 @@ def _parse_api_mode(raw: Any) -> Optional[str]:
         if normalized in _VALID_API_MODES:
             return normalized
     return None
+
+
+def _maybe_apply_codex_app_server_runtime(
+    *,
+    provider: str,
+    api_mode: str,
+    model_cfg: Optional[Dict[str, Any]],
+) -> str:
+    """Rewrite OpenAI/Codex runtime to codex app-server only on explicit opt-in."""
+    if not model_cfg:
+        return api_mode
+    if provider not in ("openai", "openai-codex"):
+        return api_mode
+    runtime = str(model_cfg.get("openai_runtime") or "").strip().lower()
+    if runtime == "codex_app_server":
+        return "codex_app_server"
+    return api_mode
 
 
 def _resolve_runtime_from_pool_entry(
@@ -284,6 +312,12 @@ def _resolve_runtime_from_pool_entry(
     # https://opencode.ai/zen/go/v1/messages instead of .../v1/v1/messages).
     if api_mode == "anthropic_messages" and provider in ("opencode-zen", "opencode-go"):
         base_url = re.sub(r"/v1/?$", "", base_url)
+
+    # Optional opt-in: route OpenAI/Codex turns through `codex app-server`.
+    # Inert when `model.openai_runtime` is unset or "auto".
+    api_mode = _maybe_apply_codex_app_server_runtime(
+        provider=provider, api_mode=api_mode, model_cfg=model_cfg
+    )
 
     return {
         "provider": provider,
@@ -801,9 +835,14 @@ def _resolve_explicit_runtime(
             last_refresh = creds.get("last_refresh")
             if not explicit_base_url:
                 base_url = creds.get("base_url", "").rstrip("/") or base_url
+        api_mode = _maybe_apply_codex_app_server_runtime(
+            provider="openai-codex",
+            api_mode="codex_responses",
+            model_cfg=model_cfg,
+        )
         return {
             "provider": "openai-codex",
-            "api_mode": "codex_responses",
+            "api_mode": api_mode,
             "base_url": base_url,
             "api_key": api_key,
             "source": "explicit",
@@ -1062,9 +1101,14 @@ def resolve_runtime_provider(
     if provider == "openai-codex":
         try:
             creds = resolve_codex_runtime_credentials()
+            api_mode = _maybe_apply_codex_app_server_runtime(
+                provider="openai-codex",
+                api_mode="codex_responses",
+                model_cfg=model_cfg,
+            )
             return {
                 "provider": "openai-codex",
-                "api_mode": "codex_responses",
+                "api_mode": api_mode,
                 "base_url": creds.get("base_url", "").rstrip("/"),
                 "api_key": creds.get("api_key", ""),
                 "source": creds.get("source", "hermes-auth-store"),

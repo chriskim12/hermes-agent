@@ -27,6 +27,60 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     assert resolved["source"] == "manual"
 
 
+def test_openai_runtime_codex_app_server_opt_in_rewrites_pool_api_mode(monkeypatch):
+    class _Entry:
+        access_token = "pool-token"
+        source = "manual"
+        base_url = "https://chatgpt.com/backend-api/codex"
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _Entry()
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "openai-codex", "openai_runtime": "codex_app_server"},
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved["api_mode"] == "codex_app_server"
+
+
+def test_openai_runtime_codex_app_server_opt_in_rewrites_auth_store_api_mode(monkeypatch):
+    class _Pool:
+        def has_credentials(self):
+            return False
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "openai-codex", "openai_runtime": "codex_app_server"},
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(
+        rp,
+        "resolve_codex_runtime_credentials",
+        lambda: {
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "codex-token",
+            "source": "hermes-auth-store",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved["api_mode"] == "codex_app_server"
+
+
 def test_resolve_runtime_provider_anthropic_pool_respects_config_base_url(monkeypatch):
     class _Entry:
         access_token = "pool-token"
