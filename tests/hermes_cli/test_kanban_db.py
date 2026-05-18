@@ -50,6 +50,79 @@ def test_init_creates_expected_tables(kanban_home):
     names = {r["name"] for r in rows}
     assert {"tasks", "task_links", "task_comments", "task_events"} <= names
 
+    with kb.connect() as conn:
+        link_cols = {
+            row["name"]: row for row in conn.execute("PRAGMA table_info(task_links)")
+        }
+    assert link_cols["relation_type"]["dflt_value"] == "'dependency'"
+
+
+def test_init_migrates_legacy_task_links_to_dependency(tmp_path):
+    db = tmp_path / "legacy-kanban.db"
+    raw = sqlite3.connect(db)
+    raw.executescript(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            result TEXT,
+            workspace_kind TEXT NOT NULL DEFAULT 'default',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            last_failure_at INTEGER,
+            last_failure_error TEXT,
+            tenant TEXT,
+            public_id TEXT,
+            idempotency_key TEXT,
+            max_runtime_seconds INTEGER,
+            last_heartbeat_at INTEGER,
+            current_run_id INTEGER,
+            review_phase TEXT,
+            routing_verdict TEXT,
+            admission_snapshot TEXT,
+            closeout_evidence TEXT,
+            continuation_of TEXT,
+            workflow_template_id TEXT,
+            current_step_key TEXT,
+            skills TEXT,
+            max_retries INTEGER
+        );
+        CREATE TABLE task_links (
+            parent_id TEXT NOT NULL,
+            child_id TEXT NOT NULL,
+            PRIMARY KEY (parent_id, child_id)
+        );
+        INSERT INTO tasks (id, title, status, priority, created_by, created_at)
+        VALUES ('p', 'parent', 'todo', 0, 'test', 1),
+               ('c', 'child', 'todo', 0, 'test', 1);
+        INSERT INTO task_links (parent_id, child_id) VALUES ('p', 'c');
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    kb.init_db(db)
+
+    with kb.connect(db) as conn:
+        row = conn.execute(
+            "SELECT parent_id, child_id, relation_type FROM task_links"
+        ).fetchone()
+    assert dict(row) == {
+        "parent_id": "p",
+        "child_id": "c",
+        "relation_type": "dependency",
+    }
+
 
 def test_connect_honors_kanban_busy_timeout_env(kanban_home, monkeypatch):
     """All kanban connections should use the explicit busy-timeout knob.
@@ -290,6 +363,47 @@ def test_link_keeps_ready_child_when_parent_already_done(kanban_home):
         assert kb.get_task(conn, b).status == "ready"
         kb.link_tasks(conn, a, b)
         assert kb.get_task(conn, b).status == "ready"
+
+
+def test_hierarchy_link_does_not_gate_child_readiness_or_completion(kanban_home):
+    """Umbrella/epic relationships must not behave like dependencies."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="umbrella parent")
+        child = kb.create_task(conn, title="executable child")
+        assert kb.get_task(conn, parent).status == "ready"
+        assert kb.get_task(conn, child).status == "ready"
+
+        kb.link_tasks(conn, parent, child, relation_type="hierarchy")
+
+        assert kb.get_task(conn, child).status == "ready"
+        assert kb.complete_task(conn, child, result="child done") is True
+        assert kb.get_task(conn, child).status == "done"
+        assert kb.get_task(conn, parent).status == "ready"
+
+
+def test_converting_dependency_to_hierarchy_releases_child_gate(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="umbrella parent")
+        child = kb.create_task(conn, title="executable child")
+        kb.link_tasks(conn, parent, child)
+        assert kb.get_task(conn, child).status == "todo"
+
+        kb.link_tasks(conn, parent, child, relation_type="hierarchy")
+
+        assert kb.get_task(conn, child).status == "ready"
+        assert kb.complete_task(conn, child, result="child done") is True
+
+
+def test_hierarchy_link_is_visible_but_excluded_from_parent_results(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="umbrella parent")
+        child = kb.create_task(conn, title="executable child")
+        kb.complete_task(conn, parent, result="umbrella note")
+        kb.link_tasks(conn, parent, child, relation_type="hierarchy")
+
+        assert kb.parent_ids(conn, child) == [parent]
+        assert kb.child_ids(conn, parent) == [child]
+        assert kb.parent_results(conn, child) == []
 
 
 def test_link_rejects_self_loop(kanban_home):

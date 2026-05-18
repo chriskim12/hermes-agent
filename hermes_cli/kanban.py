@@ -491,12 +491,29 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
 
     # --- link / unlink ---
-    p_link = sub.add_parser("link", help="Add a parent->child dependency")
+    p_link = sub.add_parser(
+        "link",
+        help="Add a task relationship (dependency by default; hierarchy for epic/umbrella children)",
+    )
     p_link.add_argument("parent_id")
     p_link.add_argument("child_id")
-    p_unlink = sub.add_parser("unlink", help="Remove a parent->child dependency")
+    p_link.add_argument(
+        "--type",
+        dest="relation_type",
+        choices=sorted(kb.VALID_LINK_TYPES),
+        default="dependency",
+        help="Relationship type: dependency gates child readiness; hierarchy is display/rollup only",
+    )
+    p_unlink = sub.add_parser("unlink", help="Remove a task relationship")
     p_unlink.add_argument("parent_id")
     p_unlink.add_argument("child_id")
+    p_unlink.add_argument(
+        "--type",
+        dest="relation_type",
+        choices=sorted(kb.VALID_LINK_TYPES),
+        default=None,
+        help="Remove only this relationship type (default: remove any relation between the pair)",
+    )
 
     # --- claim ---
     p_claim = sub.add_parser(
@@ -1810,19 +1827,23 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
 
 def _cmd_link(args: argparse.Namespace) -> int:
+    relation = getattr(args, "relation_type", "dependency")
     with kb.connect_closing() as conn:
-        kb.link_tasks(conn, args.parent_id, args.child_id)
-    print(f"Linked {args.parent_id} -> {args.child_id}")
+        kb.link_tasks(conn, args.parent_id, args.child_id, relation_type=relation)
+    print(f"Linked {args.parent_id} -> {args.child_id} ({relation})")
     return 0
 
 
 def _cmd_unlink(args: argparse.Namespace) -> int:
+    relation = getattr(args, "relation_type", None)
     with kb.connect_closing() as conn:
-        ok = kb.unlink_tasks(conn, args.parent_id, args.child_id)
+        ok = kb.unlink_tasks(conn, args.parent_id, args.child_id, relation_type=relation)
     if not ok:
-        print(f"No such link: {args.parent_id} -> {args.child_id}", file=sys.stderr)
+        suffix = f" ({relation})" if relation else ""
+        print(f"No such link: {args.parent_id} -> {args.child_id}{suffix}", file=sys.stderr)
         return 1
-    print(f"Unlinked {args.parent_id} -> {args.child_id}")
+    suffix = f" ({relation})" if relation else ""
+    print(f"Unlinked {args.parent_id} -> {args.child_id}{suffix}")
     return 0
 
 

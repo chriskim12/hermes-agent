@@ -1082,8 +1082,12 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
-    parent_id  TEXT NOT NULL,
-    child_id   TEXT NOT NULL,
+    parent_id     TEXT NOT NULL,
+    child_id      TEXT NOT NULL,
+    -- Relationship semantics are explicit:
+    --   dependency: parent must be done before child can be ready/claimed.
+    --   hierarchy:  parent is an umbrella/epic container; it does not gate child work.
+    relation_type TEXT NOT NULL DEFAULT 'dependency',
     PRIMARY KEY (parent_id, child_id)
 );
 
@@ -1749,6 +1753,27 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
 
+    link_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_links'"
+    ).fetchone() is not None
+    if link_table_exists:
+        link_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_links)")}
+        if "relation_type" not in link_cols:
+            _add_column_if_missing(
+                conn,
+                "task_links",
+                "relation_type",
+                "relation_type TEXT NOT NULL DEFAULT 'dependency'",
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_links_type_child "
+            "ON task_links(relation_type, child_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_links_type_parent "
+            "ON task_links(relation_type, parent_id)"
+        )
+
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
     ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
@@ -2304,7 +2329,11 @@ def create_task(
                 )
                 for pid in parents:
                     conn.execute(
-                        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                        """
+                        INSERT OR IGNORE INTO task_links
+                            (parent_id, child_id, relation_type)
+                        VALUES (?, ?, 'dependency')
+                        """,
                         (pid, task_id),
                     )
                 _append_event(
@@ -2451,9 +2480,30 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
 # Links
 # ---------------------------------------------------------------------------
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+VALID_LINK_TYPES = {"dependency", "hierarchy"}
+
+
+def _normalize_link_type(relation_type: str | None) -> str:
+    relation = (relation_type or "dependency").strip().lower()
+    if relation not in VALID_LINK_TYPES:
+        raise ValueError(
+            f"unknown link type {relation_type!r}; expected one of "
+            + ", ".join(sorted(VALID_LINK_TYPES))
+        )
+    return relation
+
+
+def link_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    relation_type: str = "dependency",
+) -> None:
+    relation = _normalize_link_type(relation_type)
     if parent_id == child_id:
-        raise ValueError("a task cannot depend on itself")
+        raise ValueError("a task cannot link to itself")
+    should_recompute = False
     with write_txn(conn):
         missing = _find_missing_parents(conn, [parent_id, child_id])
         if missing:
@@ -2462,23 +2512,48 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             raise ValueError(
                 f"linking {parent_id} -> {child_id} would create a cycle"
             )
-        conn.execute(
-            "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+        previous = conn.execute(
+            """
+            SELECT relation_type FROM task_links
+            WHERE parent_id = ? AND child_id = ?
+            """,
             (parent_id, child_id),
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO task_links (parent_id, child_id, relation_type)
+            VALUES (?, ?, ?)
+            ON CONFLICT(parent_id, child_id)
+            DO UPDATE SET relation_type = excluded.relation_type
+            """,
+            (parent_id, child_id, relation),
         )
-        # If child was ready but parent is not yet done, demote child to todo.
-        parent_status = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (parent_id,)
-        ).fetchone()["status"]
-        if parent_status != "done":
-            conn.execute(
-                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
-                (child_id,),
-            )
+        # Only dependency edges participate in scheduler gating. Hierarchy
+        # edges model epic/umbrella breakdown and must not block child work.
+        if relation == "dependency":
+            parent_status = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (parent_id,)
+            ).fetchone()["status"]
+            if parent_status != "done":
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                    (child_id,),
+                )
+        elif previous is not None and previous["relation_type"] == "dependency":
+            # Converting a blocking dependency to hierarchy can unblock the
+            # child immediately if no other open dependency remains.
+            should_recompute = True
         _append_event(
             conn, child_id, "linked",
-            {"parent": parent_id, "child": child_id},
+            {
+                "parent": parent_id,
+                "child": child_id,
+                "relation_type": relation,
+                "previous_relation_type": previous["relation_type"] if previous else None,
+            },
         )
+    if should_recompute:
+        recompute_ready(conn)
 
 
 def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
@@ -2504,16 +2579,32 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
     return False
 
 
-def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+def unlink_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    relation_type: str | None = None,
+) -> bool:
+    relation = _normalize_link_type(relation_type) if relation_type is not None else None
     with write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
-            (parent_id, child_id),
-        )
+        if relation is None:
+            cur = conn.execute(
+                "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+                (parent_id, child_id),
+            )
+        else:
+            cur = conn.execute(
+                """
+                DELETE FROM task_links
+                WHERE parent_id = ? AND child_id = ? AND relation_type = ?
+                """,
+                (parent_id, child_id, relation),
+            )
         if cur.rowcount:
             _append_event(
                 conn, child_id, "unlinked",
-                {"parent": parent_id, "child": child_id},
+                {"parent": parent_id, "child": child_id, "relation_type": relation},
             )
         removed = cur.rowcount > 0
     if removed:
@@ -2548,7 +2639,9 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
         SELECT t.id AS id, t.result AS result
         FROM tasks t
         JOIN task_links l ON l.parent_id = t.id
-        WHERE l.child_id = ? AND t.status = 'done'
+        WHERE l.child_id = ?
+          AND l.relation_type = 'dependency'
+          AND t.status = 'done'
         ORDER BY t.completed_at ASC
         """,
         (task_id,),
@@ -2969,7 +3062,7 @@ def recompute_ready(
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
+                "WHERE l.child_id = ? AND l.relation_type = 'dependency'",
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
@@ -3045,7 +3138,9 @@ def claim_task(
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            "WHERE l.child_id = ? "
+            "AND l.relation_type = 'dependency' "
+            "AND p.status NOT IN ('done', 'archived') LIMIT 1",
             (task_id,),
         ).fetchone()
         if undone:
@@ -4256,7 +4351,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         undone_parents = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            "WHERE l.child_id = ? "
+            "AND l.relation_type = 'dependency' "
+            "AND p.status != 'done' LIMIT 1",
             (task_id,),
         ).fetchone()
         new_status = "todo" if undone_parents else "ready"
@@ -6882,7 +6979,12 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # fall back to ``task.result`` when no run rows exist (legacy DBs,
     # or tasks completed before the runs table landed).
     parent_rows = conn.execute(
-        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+        """
+        SELECT parent_id
+        FROM task_links
+        WHERE child_id = ? AND relation_type = 'dependency'
+        ORDER BY parent_id
+        """,
         (task_id,),
     ).fetchall()
     parent_ids = [r["parent_id"] for r in parent_rows]
