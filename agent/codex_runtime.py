@@ -22,6 +22,8 @@ import os
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
+from agent.cwd_utils import safe_process_cwd
+
 logger = logging.getLogger(__name__)
 
 
@@ -47,7 +49,7 @@ def run_codex_app_server_turn(
     # Spawned on first turn, reused across turns, closed at AIAgent
     # shutdown (see _cleanup hook).
     if not hasattr(agent, "_codex_session") or agent._codex_session is None:
-        cwd = getattr(agent, "session_cwd", None) or os.getcwd()
+        cwd = getattr(agent, "session_cwd", None) or safe_process_cwd(os.getenv("TERMINAL_CWD"))
         # Approval callback: defer to Hermes' standard prompt flow if a
         # CLI thread has installed one. Gateway / cron contexts get the
         # codex-side fail-closed default.
