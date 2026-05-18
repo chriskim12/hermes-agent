@@ -305,6 +305,7 @@ class TestBuiltinDiscovery:
             "tools.feishu_drive_tool",
             "tools.file_tools",
             "tools.homeassistant_tool",
+            "tools.google_workspace_tool",
             "tools.image_generation_tool",
             "tools.kanban_tools",
             "tools.memory_tool",
