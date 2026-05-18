@@ -112,16 +112,42 @@ class _Exec:
 
 
 class _Files:
+    def list(self, **kwargs):
+        return _Exec({"files": [{"id": "fallback", "name": "Should Not Leak"}]})
+
     def get(self, **kwargs):
         return _Exec({"id": kwargs["fileId"], "name": "Doc", "mimeType": "text/plain", "parents": ["folder-ok"]})
 
     def get_media(self, **kwargs):
         return _Exec(b"drive text")
 
+    def export(self, **kwargs):
+        return _Exec(b"sheet text")
+
+
+class _SpreadsheetFiles(_Files):
+    def get(self, **kwargs):
+        return _Exec({"id": kwargs["fileId"], "name": "Sheet", "mimeType": "application/vnd.google-apps.spreadsheet", "parents": ["folder-ok"]})
+
+    def export(self, **kwargs):
+        assert kwargs["mimeType"] == "text/csv"
+        return _Exec(b"a,b\n1,2")
+
+
+class _Drives:
+    def list(self, **kwargs):
+        return _Exec({"drives": []})
+
 
 class _FakeDriveService:
+    def __init__(self, files=None):
+        self._files = files or _Files()
+
     def files(self):
-        return _Files()
+        return self._files
+
+    def drives(self):
+        return _Drives()
 
 
 def test_drive_read_checks_item_allowlist_and_caches(monkeypatch, tmp_path):
@@ -135,6 +161,24 @@ def test_drive_read_checks_item_allowlist_and_caches(monkeypatch, tmp_path):
     with sqlite3.connect(tmp_path / "gw.sqlite") as conn:
         rows = conn.execute("select profile, file_id, text_excerpt from drive_files").fetchall()
     assert rows == [("whystarve", "file123", "drive text")]
+
+
+def test_drive_read_exports_spreadsheets_as_csv(monkeypatch, tmp_path):
+    install_profiles(monkeypatch)
+    monkeypatch.setattr(gw, "_workspace_config", lambda: {"cache": {"path": str(tmp_path / "gw.sqlite")}})
+    monkeypatch.setattr(gw, "_audit", lambda *a, **k: None)
+    monkeypatch.setattr(gw, "_build_google_service", lambda *a, **k: _FakeDriveService(_SpreadsheetFiles()))
+    payload = json.loads(gw.google_drive_read("whystarve", "sheet123"))
+    assert payload["ok"] is True
+    assert payload["text"] == "a,b\n1,2"
+
+
+def test_drive_search_fails_closed_when_named_shared_drive_resolves_empty(monkeypatch):
+    install_profiles(monkeypatch)
+    monkeypatch.setattr(gw, "_build_google_service", lambda *a, **k: _FakeDriveService())
+    payload = json.loads(gw.google_drive_search("whystarve", "deck"))
+    assert payload["ok"] is False
+    assert payload["error"] == "drive_allowlist_resolution_empty"
 
 
 def test_google_workspace_toolset_is_static_and_resolves():

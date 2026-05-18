@@ -372,6 +372,8 @@ def google_drive_search(profile: str | None, query: str, folder: str | None = No
             q += f" and '{_escape_drive_query(folder)}' in parents"
         max_results = max(1, min(int(limit or 10), 50))
         drive_ids = _allowed_drive_ids(service, p) if not folder else set()
+        allowed_drives = _as_list(p.drive.get("allowed_shared_drives")) + _as_list(p.drive.get("allowed_shared_drive_ids"))
+        allowed_folders = _as_list(p.drive.get("allowed_folders"))
         files: list[dict[str, Any]] = []
         if drive_ids:
             for drive_id in sorted(drive_ids):
@@ -380,9 +382,11 @@ def google_drive_search(profile: str | None, query: str, folder: str | None = No
                 if len(files) >= max_results:
                     files = files[:max_results]
                     break
-        else:
+        elif folder:
             result = _drive_list_call(service, q=q, limit=max_results)
             files = result.get("files", []) or []
+        else:
+            raise GoogleWorkspaceError("drive_allowlist_resolution_empty")
         now = int(time.time())
         with _cache_conn() as conn:
             for item in files:
@@ -408,6 +412,12 @@ def google_drive_read(profile: str | None, file_id: str) -> str:
         text = ""
         if mime_type.startswith("application/vnd.google-apps."):
             export_mime = "text/plain"
+            if mime_type == "application/vnd.google-apps.spreadsheet":
+                export_mime = "text/csv"
+            elif mime_type == "application/vnd.google-apps.presentation":
+                export_mime = "text/plain"
+            elif mime_type == "application/vnd.google-apps.document":
+                export_mime = "text/plain"
             content = service.files().export(fileId=file_id, mimeType=export_mime).execute()
             text = content.decode("utf-8", errors="replace") if isinstance(content, bytes) else str(content)
         else:
@@ -426,6 +436,8 @@ def google_drive_read(profile: str | None, file_id: str) -> str:
         return _json_ok({"profile": p.name, "metadata": meta, "text": text})
     except GoogleWorkspaceError as exc:
         return _json_error(str(exc), reason="policy_or_prerequisite_failure", profile=profile, file_id=_mask(file_id))
+    except Exception as exc:
+        return _json_error("drive_read_failed", reason="google_api_failure", profile=profile, file_id=_mask(file_id), detail=type(exc).__name__)
 
 
 def google_drive_recent(profile: str | None, days: int = 7, folder: str | None = None, limit: int = 10) -> str:
