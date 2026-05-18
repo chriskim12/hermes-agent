@@ -62,6 +62,7 @@ def test_codex_session_executor_returns_structured_evidence_not_final_answer():
     assert "bounded Codex executor under Hermes Agent" in prompt
     assert "Hermes/Yuuka remains the user-facing agent and verifier" in prompt
     assert "Do not write a final response to the user" in prompt
+    assert "success must be false if you cannot verify the requested condition" in prompt
     assert "Task:\nFix the failing focused test" in prompt
     assert kwargs == {"turn_timeout": 12}
     assert fake.closed is True
@@ -83,6 +84,59 @@ def test_codex_session_executor_wraps_plain_text_as_unverified_summary():
     assert evidence["tests_run"] == []
     assert evidence["requires_hermes_verification"] is True
     assert evidence["raw_codex_final_text"] == "I changed files and ran tests."
+
+
+def test_codex_session_executor_honors_codex_reported_failure():
+    from agent.executors.codex_session import run_codex_session
+
+    class FailedEvidenceSession(FakeCodexSession):
+        def run_turn(self, user_input, **kwargs):
+            return TurnResult(
+                final_text=json.dumps(
+                    {
+                        "success": False,
+                        "summary": "sandbox command failed before verification",
+                        "commands_run": ["test -e tools/codex_session_tool.py"],
+                        "error": "sandbox command failed before verification",
+                    }
+                )
+            )
+
+    evidence = run_codex_session(task="Verify file", session_factory=FailedEvidenceSession)
+
+    assert evidence["success"] is False
+    assert evidence["summary"] == "sandbox command failed before verification"
+    assert evidence["commands_run"] == ["test -e tools/codex_session_tool.py"]
+    assert evidence["error"] == "sandbox command failed before verification"
+    assert evidence["requires_hermes_verification"] is True
+
+
+def test_codex_session_executor_rejects_contradictory_unable_to_verify_success():
+    from agent.executors.codex_session import run_codex_session
+
+    class ContradictoryEvidenceSession(FakeCodexSession):
+        def run_turn(self, user_input, **kwargs):
+            return TurnResult(
+                final_text=json.dumps(
+                    {
+                        "success": True,
+                        "summary": "Unable to verify file existence because sandboxed read-only commands failed.",
+                        "changed_files": [],
+                        "commands_run": ["test -e tools/codex_session_tool.py"],
+                        "tests_run": [],
+                        "diff": "",
+                        "error": None,
+                    }
+                )
+            )
+
+    evidence = run_codex_session(task="Verify file", session_factory=ContradictoryEvidenceSession)
+
+    assert evidence["success"] is False
+    assert evidence["error"] == "codex_evidence_reports_unverified_result"
+    assert evidence["ambiguous"] is True
+    assert evidence["changed_files"] == []
+    assert evidence["requires_hermes_verification"] is True
 
 
 def test_codex_session_executor_reports_errors_as_evidence():

@@ -17,6 +17,11 @@ from agent.transports.codex_app_server_session import CodexAppServerSession, Tur
 
 _EVIDENCE_LIST_FIELDS = ("changed_files", "commands_run", "tests_run")
 _EVIDENCE_TEXT_FIELDS = ("summary", "diff")
+_UNVERIFIED_RESULT_MARKERS = (
+    "unable to verify",
+    "could not verify",
+    "failed to verify",
+)
 
 
 def _as_string_list(value: Any) -> list[str]:
@@ -58,6 +63,11 @@ def _base_evidence(*, success: bool) -> dict[str, Any]:
     }
 
 
+def _reports_unverified_result(summary: str) -> bool:
+    lowered = (summary or "").lower()
+    return any(marker in lowered for marker in _UNVERIFIED_RESULT_MARKERS)
+
+
 def build_codex_executor_prompt(task: str) -> str:
     """Build the bounded Codex prompt for evidence-only executor turns."""
     return (
@@ -67,14 +77,26 @@ def build_codex_executor_prompt(task: str) -> str:
         "return a single JSON object as execution evidence.\n\n"
         "Required JSON keys: success, summary, changed_files, commands_run, "
         "tests_run, diff, error. Use arrays for changed_files, commands_run, "
-        "and tests_run. Put null in error when successful.\n\n"
+        "and tests_run. Put null in error when successful. The field "
+        "success must be false if you cannot verify the requested condition, if any "
+        "required command fails, if sandboxing blocks verification, or if "
+        "permission escalation is rejected.\n\n"
         f"Task:\n{task.strip()}"
     )
 
 
 def _normalize_success_evidence(result: TurnResult) -> dict[str, Any]:
     parsed = _parse_codex_final_text(result.final_text or "")
-    evidence = _base_evidence(success=True)
+    reported_error = parsed.get("error")
+    reported_success = parsed.get("success")
+    summary = str(parsed.get("summary") or "")
+    reports_unverified = _reports_unverified_result(summary)
+    success = not (
+        reported_success is False
+        or (reported_error is not None and str(reported_error))
+        or reports_unverified
+    )
+    evidence = _base_evidence(success=success)
     for key in _EVIDENCE_TEXT_FIELDS:
         value = parsed.get(key)
         if value is not None:
@@ -83,6 +105,10 @@ def _normalize_success_evidence(result: TurnResult) -> dict[str, Any]:
         evidence[key] = _as_string_list(parsed.get(key))
     if "raw_codex_final_text" in parsed:
         evidence["raw_codex_final_text"] = str(parsed["raw_codex_final_text"])
+    if not success:
+        evidence["error"] = str(reported_error) if reported_error else "codex_evidence_reports_unverified_result"
+        if reports_unverified and reported_success is True:
+            evidence["ambiguous"] = True
     evidence["codex"] = {
         "thread_id": result.thread_id,
         "turn_id": result.turn_id,
