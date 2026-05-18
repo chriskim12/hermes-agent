@@ -82,6 +82,7 @@ from agent.process_bootstrap import (
     _get_proxy_for_base_url,
 )
 from agent.iteration_budget import IterationBudget
+from agent.cwd_utils import safe_process_cwd as _safe_process_cwd
 
 
 from hermes_cli.env_loader import load_hermes_dotenv
