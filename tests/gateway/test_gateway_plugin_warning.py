@@ -17,7 +17,15 @@ def test_gateway_plugin_discovery_failure_is_warning(caplog, monkeypatch):
     with caplog.at_level(logging.WARNING, logger="gateway.run"):
         gateway_run._discover_gateway_plugins()
 
-    assert "plugin discovery failed at gateway startup" in caplog.text
+    warning_records = [
+        record
+        for record in caplog.records
+        if record.name == "gateway.run"
+        and record.levelno == logging.WARNING
+        and record.getMessage() == "plugin discovery failed at gateway startup"
+    ]
+    assert len(warning_records) == 1
+    assert warning_records[0].exc_info is not None
     assert "plugin registry offline" in caplog.text
 
 
