@@ -576,6 +576,64 @@ class SessionEntry:
         )
 
 
+@dataclass
+class IntakeState:
+    """Persisted state for an explicit Kanban intake interview.
+
+    Intake state is deliberately separate from ordinary chat history. It is only
+    created by an explicit intake command/handler, and continuation lookup
+    requires the same scoped source context so unrelated messages do not get
+    attached to a draft by accident.
+    """
+
+    intake_id: str
+    state_key: str
+    project: str
+    tenant: Optional[str]
+    source: SessionSource
+    draft: Dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+    expires_at: datetime
+    status: str = "active"
+    last_prompt: Optional[str] = None
+
+    @property
+    def expired(self) -> bool:
+        return _now() > self.expires_at
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "intake_id": self.intake_id,
+            "state_key": self.state_key,
+            "project": self.project,
+            "tenant": self.tenant,
+            "source": self.source.to_dict(),
+            "draft": self.draft,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "expires_at": self.expires_at.isoformat(),
+            "status": self.status,
+            "last_prompt": self.last_prompt,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "IntakeState":
+        return cls(
+            intake_id=str(data["intake_id"]),
+            state_key=str(data["state_key"]),
+            project=str(data["project"]).upper(),
+            tenant=data.get("tenant"),
+            source=SessionSource.from_dict(data["source"]),
+            draft=dict(data.get("draft") or {}),
+            created_at=datetime.fromisoformat(data["created_at"]),
+            updated_at=datetime.fromisoformat(data["updated_at"]),
+            expires_at=datetime.fromisoformat(data["expires_at"]),
+            status=data.get("status", "active"),
+            last_prompt=data.get("last_prompt"),
+        )
+
+
 def is_shared_multi_user_session(
     source: SessionSource,
     *,
@@ -679,6 +737,8 @@ class SessionStore:
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}
         self._loaded = False
+        self._intake_states: Dict[str, IntakeState] = {}
+        self._intake_loaded = False
         self._lock = threading.Lock()
         self._has_active_processes_fn = has_active_processes_fn
         
@@ -748,6 +808,252 @@ class SessionStore:
             group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
         )
+
+    def _intake_states_path(self) -> Path:
+        return self.sessions_dir / "intake_states.json"
+
+    @staticmethod
+    def _normalize_intake_project(project: str) -> str:
+        normalized = (project or "").strip().upper()
+        if not normalized:
+            raise ValueError("project is required for intake state")
+        return normalized
+
+    @staticmethod
+    def _normalize_intake_tenant(tenant: Optional[str]) -> Optional[str]:
+        if tenant is None:
+            return None
+        normalized = str(tenant).strip().lower()
+        return normalized or None
+
+    def _intake_context_parts(self, source: SessionSource) -> tuple[str, ...]:
+        """Return the context tuple used to bind intake state to a chat/user.
+
+        The tuple intentionally includes platform, guild/workspace, channel or
+        thread parent, thread id, and user id.  This makes draft continuation
+        deterministic and prevents ordinary traffic in a nearby Discord channel
+        or by another user from attaching itself to the active intake.
+        """
+        platform = source.platform.value if source.platform else ""
+        parent_chat_id = source.parent_chat_id or ""
+        chat_id = source.chat_id or ""
+        thread_id = source.thread_id or ""
+        # Some adapters model a Discord thread as the chat_id and keep the
+        # parent channel in parent_chat_id; others keep chat_id as the parent
+        # and put the thread id in thread_id.  Store both positions so either
+        # representation remains safely scoped.
+        return (
+            platform,
+            source.guild_id or "",
+            parent_chat_id,
+            chat_id,
+            thread_id,
+            source.chat_type or "",
+            source.user_id_alt or source.user_id or "",
+        )
+
+    def _intake_state_key(
+        self,
+        source: SessionSource,
+        *,
+        project: str,
+        tenant: Optional[str] = None,
+    ) -> str:
+        project_norm = self._normalize_intake_project(project)
+        tenant_norm = self._normalize_intake_tenant(tenant) or "_"
+        context = ":".join(str(part).replace(":", "%3A") for part in self._intake_context_parts(source))
+        return f"intake:v1:{tenant_norm}:{project_norm}:{context}"
+
+    def _ensure_intake_loaded_locked(self) -> None:
+        if self._intake_loaded:
+            return
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        path = self._intake_states_path()
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                for key, item in (data or {}).items():
+                    try:
+                        state = IntakeState.from_dict(item)
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    self._intake_states[str(key)] = state
+            except Exception as e:
+                print(f"[gateway] Warning: Failed to load intake state: {e}")
+        self._intake_loaded = True
+        self._prune_expired_intakes_locked(save=False)
+
+    def _save_intake_states(self) -> None:
+        import tempfile
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        path = self._intake_states_path()
+        data = {key: state.to_dict() for key, state in self._intake_states.items()}
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(self.sessions_dir), suffix=".tmp", prefix=".intake_states_"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            atomic_replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError as e:
+                logger.debug("Could not remove temp file %s: %s", tmp_path, e)
+            raise
+
+    def _prune_expired_intakes_locked(self, *, save: bool = True) -> None:
+        before = len(self._intake_states)
+        self._intake_states = {
+            key: state
+            for key, state in self._intake_states.items()
+            if state.status == "active" and not state.expired
+        }
+        if save and len(self._intake_states) != before:
+            self._save_intake_states()
+
+    def start_intake(
+        self,
+        source: SessionSource,
+        *,
+        project: str,
+        goal: str,
+        tenant: Optional[str] = None,
+        draft: Optional[Dict[str, Any]] = None,
+        ttl_minutes: int = 24 * 60,
+    ) -> IntakeState:
+        """Start or replace an explicit intake draft for this scoped context."""
+        project_norm = self._normalize_intake_project(project)
+        tenant_norm = self._normalize_intake_tenant(tenant)
+        now = _now()
+        key = self._intake_state_key(source, project=project_norm, tenant=tenant_norm)
+        draft_data = dict(draft or {})
+        draft_data.setdefault("goal", (goal or "").strip())
+        draft_data.setdefault("project", project_norm)
+        if tenant_norm:
+            draft_data.setdefault("tenant", tenant_norm)
+        state = IntakeState(
+            intake_id=f"intake_{uuid.uuid4().hex[:12]}",
+            state_key=key,
+            project=project_norm,
+            tenant=tenant_norm,
+            source=source,
+            draft=draft_data,
+            created_at=now,
+            updated_at=now,
+            expires_at=now + timedelta(minutes=max(1, int(ttl_minutes))),
+        )
+        with self._lock:
+            self._ensure_intake_loaded_locked()
+            self._prune_expired_intakes_locked(save=False)
+            self._intake_states[key] = state
+            self._save_intake_states()
+        return state
+
+    def get_active_intake(
+        self,
+        source: SessionSource,
+        *,
+        project: Optional[str] = None,
+        tenant: Optional[str] = None,
+    ) -> Optional[IntakeState]:
+        """Return the single active intake for this source, or None.
+
+        Without an explicit project, continuation is allowed only when exactly
+        one active draft matches this tenant/project/user/channel/thread scope.
+        If multiple drafts are active, callers must ask for project explicitly
+        rather than guessing.
+        """
+        project_norm = self._normalize_intake_project(project) if project else None
+        tenant_norm = self._normalize_intake_tenant(tenant)
+        context = self._intake_context_parts(source)
+        with self._lock:
+            self._ensure_intake_loaded_locked()
+            self._prune_expired_intakes_locked()
+            if project_norm:
+                state = self._intake_states.get(
+                    self._intake_state_key(source, project=project_norm, tenant=tenant_norm)
+                )
+                if state and state.status == "active" and not state.expired:
+                    return state
+                return None
+            matches = []
+            for state in self._intake_states.values():
+                if state.status != "active" or state.expired:
+                    continue
+                if tenant_norm is not None and state.tenant != tenant_norm:
+                    continue
+                if self._intake_context_parts(state.source) == context:
+                    matches.append(state)
+            if len(matches) == 1:
+                return matches[0]
+            return None
+
+    def update_intake_draft(
+        self,
+        source: SessionSource,
+        *,
+        intake_id: str,
+        draft_updates: Optional[Dict[str, Any]] = None,
+        last_prompt: Optional[str] = None,
+        project: Optional[str] = None,
+        tenant: Optional[str] = None,
+        ttl_minutes: Optional[int] = None,
+    ) -> Optional[IntakeState]:
+        state = self.get_active_intake(source, project=project, tenant=tenant)
+        if state is None or state.intake_id != intake_id:
+            return None
+        with self._lock:
+            self._ensure_intake_loaded_locked()
+            current = self._intake_states.get(state.state_key)
+            if current is None or current.intake_id != intake_id:
+                return None
+            if draft_updates:
+                current.draft.update(draft_updates)
+            if last_prompt is not None:
+                current.last_prompt = last_prompt
+            current.updated_at = _now()
+            if ttl_minutes is not None:
+                current.expires_at = current.updated_at + timedelta(minutes=max(1, int(ttl_minutes)))
+            self._save_intake_states()
+            return current
+
+    def clear_intake(
+        self,
+        source: SessionSource,
+        *,
+        intake_id: Optional[str] = None,
+        project: Optional[str] = None,
+        tenant: Optional[str] = None,
+    ) -> bool:
+        state = self.get_active_intake(source, project=project, tenant=tenant)
+        if state is None:
+            return False
+        if intake_id is not None and state.intake_id != intake_id:
+            return False
+        with self._lock:
+            removed = self._intake_states.pop(state.state_key, None) is not None
+            if removed:
+                self._save_intake_states()
+            return removed
+
+    def clear_intakes_for_source(self, source: SessionSource) -> int:
+        """Clear all active intake drafts bound to this exact context."""
+        context = self._intake_context_parts(source)
+        with self._lock:
+            self._ensure_intake_loaded_locked()
+            keys = [
+                key
+                for key, state in self._intake_states.items()
+                if self._intake_context_parts(state.source) == context
+            ]
+            for key in keys:
+                self._intake_states.pop(key, None)
+            if keys:
+                self._save_intake_states()
+            return len(keys)
     
     def _is_session_expired(self, entry: SessionEntry) -> bool:
         """Check if a session has expired based on its reset policy.
@@ -1132,6 +1438,7 @@ class SessionStore:
         db_end_session_id = None
         db_create_kwargs = None
         new_entry = None
+        source_to_clear = None
 
         with self._lock:
             self._ensure_loaded_locked()
@@ -1159,6 +1466,7 @@ class SessionStore:
 
             self._entries[session_key] = new_entry
             self._save()
+            source_to_clear = old_entry.origin
             db_create_kwargs = {
                 "session_id": session_id,
                 "source": old_entry.platform.value if old_entry.platform else "unknown",
@@ -1170,6 +1478,9 @@ class SessionStore:
                 self._db.end_session(db_end_session_id, "session_reset")
             except Exception as e:
                 logger.debug("Session DB operation failed: %s", e)
+
+        if source_to_clear:
+            self.clear_intakes_for_source(source_to_clear)
 
         if self._db and db_create_kwargs:
             try:
