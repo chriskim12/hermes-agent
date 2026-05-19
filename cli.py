@@ -7917,6 +7917,18 @@ class HermesCLI:
             self._handle_curator_command(cmd_original)
         elif canonical == "kanban":
             self._handle_kanban_command(cmd_original)
+        elif canonical == "autopilot":
+            from gateway.kanban_autopilot import handle_autopilot_command
+            parts = cmd_original.split(maxsplit=1)
+            raw_args = parts[1].strip() if len(parts) > 1 else ""
+            result = handle_autopilot_command(raw_args, actor="local-cli")
+            _cprint(result.message)
+        elif canonical == "ouro-intake":
+            from gateway.ouro_intake import handle_ouro_intake_command
+            parts = cmd_original.split(maxsplit=1)
+            raw_args = parts[1].strip() if len(parts) > 1 else ""
+            result = handle_ouro_intake_command(raw_args, actor="local-cli")
+            _cprint(result.message)
         elif canonical == "skills":
             with self._busy_command(self._slow_command_status(cmd_original)):
                 self._handle_skills_command(cmd_original)

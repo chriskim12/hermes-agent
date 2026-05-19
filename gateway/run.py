@@ -6478,6 +6478,12 @@ class GatewayRunner:
             if _cmd_def_inner and _cmd_def_inner.name == "kanban":
                 return await self._handle_kanban_command(event)
 
+            if _cmd_def_inner and _cmd_def_inner.name == "autopilot":
+                return await self._handle_autopilot_command(event)
+
+            if _cmd_def_inner and _cmd_def_inner.name == "ouro-intake":
+                return await self._handle_ouro_intake_command(event)
+
             # /goal is safe mid-run for status/pause/clear (inspection and
             # control-plane only — doesn't interrupt the running turn).
             # Setting a new goal text mid-run is rejected with the same
@@ -6801,6 +6807,12 @@ class GatewayRunner:
 
         if canonical == "kanban":
             return await self._handle_kanban_command(event)
+
+        if canonical == "autopilot":
+            return await self._handle_autopilot_command(event)
+
+        if canonical == "ouro-intake":
+            return await self._handle_ouro_intake_command(event)
 
         if canonical == "retry":
             return await self._handle_retry_command(event)
@@ -8745,6 +8757,43 @@ class GatewayRunner:
             f"Tier: user\n"
             f"Slash commands you can run: {runnable_str}"
         )
+
+
+    async def _handle_autopilot_command(self, event: MessageEvent) -> str:
+        """Handle /autopilot through the Kanban-first controller."""
+        from gateway.kanban_autopilot import handle_autopilot_command
+
+        source = getattr(event, "source", None)
+        actor = None
+        if source is not None:
+            actor = (
+                getattr(source, "user_name", None)
+                or getattr(source, "user_id", None)
+                or getattr(source, "chat_id", None)
+            )
+        result = handle_autopilot_command(event.get_command_args(), actor=actor)
+        return result.message
+
+
+    async def _handle_ouro_intake_command(self, event: MessageEvent) -> str:
+        """Handle /ouro-intake through the admission-only Kanban controller."""
+        import asyncio
+        from gateway.ouro_intake import handle_ouro_intake_command
+
+        source = getattr(event, "source", None)
+        actor = None
+        if source is not None:
+            actor = (
+                getattr(source, "user_name", None)
+                or getattr(source, "user_id", None)
+                or getattr(source, "chat_id", None)
+            )
+        result = await asyncio.to_thread(
+            handle_ouro_intake_command,
+            event.get_command_args(),
+            actor=actor,
+        )
+        return result.message
 
 
     async def _handle_kanban_command(self, event: MessageEvent) -> str:
