@@ -24,6 +24,7 @@ from hermes_cli.kanban_native_admission import next_public_id, normalize_namespa
 from hermes_integrations.ouroboros_upstream.adapter import (
     build_seed_dict as _vendored_ouroboros_seed_dict,
     record_answer as _vendored_ouroboros_record_answer,
+    review_and_repair_seed_dict as _vendored_ouroboros_review_and_repair_seed_dict,
     start_interview_state as _vendored_ouroboros_start_state,
 )
 
@@ -441,8 +442,13 @@ def _needs_refine_gate(refinement: dict[str, Any], *, previous_question: dict[st
     return bool(refinement.get("needs_confirmation"))
 
 
-def _seed_closer_review(values: dict[str, Any], review: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Local port of upstream Seed Closer's material-decision audit."""
+def _hermes_gateway_seed_closer_fallback(values: dict[str, Any], review: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Hermes gateway fallback for upstream Seed Closer material-decision audit.
+
+    BO-062 keeps this clearly named as a fallback, not a claimed full upstream
+    port. The canonical upstream Seed quality gate now comes from the vendored
+    SeedReviewer/SeedRepairer path attached to the Seed contract.
+    """
 
     goal = str(values.get("goal") or "")
     context = str(values.get("context") or "")
@@ -610,7 +616,7 @@ def _ambiguity_analysis(values: dict[str, Any]) -> dict[str, Any]:
 
 def _seed_review(values: dict[str, Any]) -> dict[str, Any]:
     analysis = _ambiguity_analysis(values)
-    closer = _seed_closer_review(values, analysis)
+    closer = _hermes_gateway_seed_closer_fallback(values, analysis)
     seed_ready = analysis["seed_ready"] and closer["ready"]
     mode = "seed_ready_for_admission" if seed_ready else "decision_gate_only"
     return {
@@ -665,7 +671,7 @@ def _is_restate_approval(answer: str) -> bool:
     return bool(re.search(r"\b(yes|y|approve|approved|confirm|confirmed|correct|ok|okay)\b|맞아|승인|확인|그대로|좋아|진행", text))
 
 
-def _highest_impact_question(values: dict[str, Any], review: dict[str, Any], *, previous_track: str | None = None) -> dict[str, Any]:
+def _hermes_gateway_fallback_question(values: dict[str, Any], review: dict[str, Any], *, previous_track: str | None = None) -> dict[str, Any]:
     language = _detect_language(values)
     track = _infer_track(values)
     flags = set(review.get("ambiguity_flags") or [])
@@ -856,6 +862,9 @@ def _build_seed_contract(values: dict[str, Any], *, public_id: str | None, actor
             "dispatch_allowed": False,
         }
     ] if review["mode"] == "decision_gate_only" else []
+    upstream_seed = _upstream_seed_projection(values, review, session_id=session_id)
+    upstream_auto = _vendored_ouroboros_review_and_repair_seed_dict(upstream_seed)
+    upstream_seed = upstream_auto["seed"]
     seed = {
         "source": "ouro_intake",
         "session_id": session_id,
@@ -865,7 +874,9 @@ def _build_seed_contract(values: dict[str, Any], *, public_id: str | None, actor
         "goal": goal,
         "context": context,
         "interview_refinements": values.get("refined_answers", []),
-        "upstream_seed": _upstream_seed_projection(values, review, session_id=session_id),
+        "upstream_seed": upstream_seed,
+        "upstream_auto_review": upstream_auto["review"],
+        "upstream_auto_repair_history": upstream_auto["repair_history"],
         "non_goals": non_goals,
         "constraints": _as_list(values.get("constraints"), default=["Seed is Kanban admission source material only"]),
         "ontology": _ontology_for(values),
@@ -968,7 +979,7 @@ def _start_interview(raw_args: str, *, actor: str | None, origin: dict[str, Any]
     review = _seed_review(values)
     sessions = _load_sessions()
     status = "restate_pending" if review["mode"] == "seed_ready_for_admission" else "interviewing"
-    question = _highest_impact_question(values, review)
+    question = _hermes_gateway_fallback_question(values, review)
     sessions[session_id] = {
         "session_id": session_id,
         "created_at": int(time.time()),
@@ -1094,7 +1105,7 @@ def _answer_interview(raw_args: str, *, actor: str | None) -> OuroIntakeResult:
                 )
                 message = _format_restate(session_id, values, review)
             else:
-                question = _highest_impact_question(values, review, previous_track=(pending_question or {}).get("track"))
+                question = _hermes_gateway_fallback_question(values, review, previous_track=(pending_question or {}).get("track"))
                 session["status"] = "interviewing"
                 session["phase"] = "interviewing"
                 session["track"] = question["track"]
@@ -1202,7 +1213,7 @@ def _answer_interview(raw_args: str, *, actor: str | None) -> OuroIntakeResult:
         )
         message = _format_restate(session_id, values, review)
     else:
-        question = _highest_impact_question(values, review, previous_track=(previous_question or {}).get("track"))
+        question = _hermes_gateway_fallback_question(values, review, previous_track=(previous_question or {}).get("track"))
         session["status"] = "interviewing"
         session["phase"] = "interviewing"
         session["track"] = question["track"]

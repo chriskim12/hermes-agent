@@ -665,3 +665,34 @@ def test_bo062_gateway_wrapper_keeps_execution_runner_excluded():
     assert not (vendored / "orchestrator").exists()
     assert not (vendored / "ralph_loop.py").exists()
     assert not (vendored / "orchestrator_stage.py").exists()
+
+
+
+def test_bo062_uses_vendored_upstream_seed_reviewer_and_repairer(hermes_home):
+    from gateway.ouro_intake import handle_ouro_intake_command
+    from hermes_integrations.ouroboros_upstream.auto.seed_reviewer import SeedReviewer
+    from hermes_integrations.ouroboros_upstream.auto.seed_repairer import SeedRepairer
+    from hermes_integrations.ouroboros_upstream.core.seed import Seed
+
+    started = handle_ouro_intake_command(
+        'goal:"Ship vendored seed review" project:bo tenant:kanban context:"Hermes gateway existing runtime" acceptance:"pytest exits 0"',
+        actor="tester",
+    )
+    answer = handle_ouro_intake_command(
+        f'answer session:{started.session_id} answer:"exact pytest command exits 0 and no execution runner is called"',
+        actor="tester",
+    )
+    if answer.action == "refine_pending":
+        answer = handle_ouro_intake_command(f"answer session:{started.session_id} answer:승인", actor="tester")
+    if "Restate:" in answer.message:
+        answer = handle_ouro_intake_command(f"answer session:{started.session_id} answer:승인", actor="tester")
+    sessions = json.loads((hermes_home / "ouro_intake_sessions.json").read_text())
+    seed_contract = sessions[started.session_id]["seed"]
+    assert seed_contract["upstream_auto_review"]["grade"] in {"A", "B", "C"}
+    assert "scores" in seed_contract["upstream_auto_review"]
+    assert isinstance(seed_contract["upstream_auto_repair_history"], list)
+    seed = Seed.from_dict(seed_contract["upstream_seed"])
+    review = SeedReviewer().review(seed)
+    repaired_seed, repaired_review, history = SeedRepairer(max_iterations=2).converge(seed)
+    assert repaired_review.grade_result.grade.value in {"A", "B", "C"}
+    assert Seed.from_dict(repaired_seed.to_dict()).goal == seed.goal

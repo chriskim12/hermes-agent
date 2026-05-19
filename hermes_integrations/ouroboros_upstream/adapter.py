@@ -9,6 +9,8 @@ from hermes_integrations.ouroboros_upstream.bigbang.interview import (
     InterviewState,
     InterviewStatus,
 )
+from hermes_integrations.ouroboros_upstream.auto.seed_repairer import SeedRepairer
+from hermes_integrations.ouroboros_upstream.auto.seed_reviewer import SeedReviewer
 from hermes_integrations.ouroboros_upstream.core.seed import (
     BrownfieldContext,
     ContextReference,
@@ -142,3 +144,38 @@ def build_seed_dict(values: dict[str, Any], review: dict[str, Any], *, session_i
     payload = seed.to_dict()
     # Prove we did not create a lookalike dict: validate through upstream model.
     return Seed.from_dict(payload).to_dict()
+
+
+def review_and_repair_seed_dict(seed_payload: dict[str, Any], *, max_iterations: int = 2) -> dict[str, Any]:
+    """Review and bounded-repair a Seed through vendored upstream auto primitives.
+
+    This is intentionally advisory for Hermes admission: upstream `may_run` is
+    recorded for Seed quality, but Hermes still forbids executor dispatch until
+    Chris/Kanban separately approves execution.
+    """
+
+    seed = Seed.from_dict(seed_payload)
+    reviewer = SeedReviewer()
+    repairer = SeedRepairer(reviewer=reviewer, max_iterations=max_iterations)
+    repaired_seed, review, history = repairer.converge(seed)
+    final_payload = Seed.from_dict(repaired_seed.to_dict()).to_dict()
+    return {
+        "seed": final_payload,
+        "review": {
+            "grade": review.grade_result.grade.value,
+            "scores": review.grade_result.scores,
+            "may_run": review.may_run,
+            "can_repair": review.grade_result.can_repair,
+            "findings": [finding.__dict__ for finding in review.findings],
+            "blockers": [blocker.to_dict() for blocker in review.grade_result.blockers],
+        },
+        "repair_history": [
+            {
+                "changed": item.changed,
+                "applied_repairs": list(item.applied_repairs),
+                "unresolved_findings": [finding.__dict__ for finding in item.unresolved_findings],
+                "blocker": item.blocker,
+            }
+            for item in history
+        ],
+    }

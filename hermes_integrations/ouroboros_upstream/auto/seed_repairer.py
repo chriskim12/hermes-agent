@@ -1,0 +1,294 @@
+"""Bounded repair loop for auto-generated Seeds."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+import re
+import threading
+from uuid import uuid4
+
+from hermes_integrations.ouroboros_upstream.auto.grading import VAGUE_TERMS, SeedGrade
+from hermes_integrations.ouroboros_upstream.auto.ledger import LedgerEntry, LedgerSource, LedgerStatus, SeedDraftLedger
+from hermes_integrations.ouroboros_upstream.auto.seed_reviewer import ReviewFinding, SeedReview, SeedReviewer
+from hermes_integrations.ouroboros_upstream.core.seed import Seed
+
+
+class RepairCancelled(Exception):
+    """Raised when the converge loop observes a set cancel signal.
+
+    The repair phase timeout in ``AutoPipeline.run`` cannot interrupt a
+    synchronous ``reviewer.review()`` call mid-execution, but it can stop the
+    loop from launching *another* review/repair iteration once the in-flight
+    call returns. This sentinel travels back through ``asyncio.to_thread``
+    and is intentionally distinct from ``TimeoutError`` (which the awaiter
+    already raised) so log analysis can tell "stopped at iteration boundary"
+    apart from "still hung in reviewer.review()".
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class RepairResult:
+    """Result from one repair attempt."""
+
+    changed: bool
+    seed: Seed
+    applied_repairs: tuple[str, ...] = ()
+    unresolved_findings: tuple[ReviewFinding, ...] = ()
+    blocker: str | None = None
+
+
+@dataclass(slots=True)
+class SeedRepairer:
+    """Deterministically repair common A-grade failures."""
+
+    reviewer: SeedReviewer = field(default_factory=SeedReviewer)
+    # Canonical iteration bound. ``max_repair_rounds`` is preserved as a
+    # backward-compatible alias for existing callers (CLI, MCP, persisted
+    # state). The default mirrors ``AutoPipelineState.max_repair_rounds`` at
+    # ``state.py:228`` so the repairer-layer bound matches the pipeline-layer
+    # bound the rest of the codebase already advertises.
+    max_iterations: int = 5
+    max_repair_rounds: int = field(default=5, repr=False)
+
+    def __post_init__(self) -> None:
+        # Resolve ``max_iterations`` and ``max_repair_rounds`` to a single
+        # bound so callers can use either name without surprise. When a caller
+        # passes only ``max_repair_rounds`` (legacy callsites in CLI / MCP /
+        # tests), mirror it onto ``max_iterations``. When a caller passes
+        # ``max_iterations`` (new contract), mirror it back onto
+        # ``max_repair_rounds`` so existing introspection (e.g. progress
+        # surfaces reading ``repairer.max_repair_rounds``) keeps working.
+        if self.max_iterations == 5 and self.max_repair_rounds != 5:
+            self.max_iterations = self.max_repair_rounds
+        else:
+            self.max_repair_rounds = self.max_iterations
+
+    def repair_once(
+        self,
+        seed: Seed,
+        review: SeedReview,
+        *,
+        ledger: SeedDraftLedger | None = None,
+    ) -> RepairResult:
+        """Apply one deterministic repair pass."""
+        repairable_blocker_codes = set()
+        unrepaired_blockers = []
+        for blocker in review.grade_result.blockers:
+            if blocker.code == "seed_goal_mismatch" and ledger is not None:
+                repairable_blocker_codes.add(blocker.code)
+            else:
+                unrepaired_blockers.append(blocker)
+        if unrepaired_blockers:
+            return RepairResult(
+                changed=False,
+                seed=seed,
+                unresolved_findings=review.findings,
+                blocker="hard blocker present in Seed review",
+            )
+
+        constraints = list(seed.constraints)
+        acceptance = list(seed.acceptance_criteria)
+        goal = seed.goal
+        applied: list[str] = []
+        unresolved: list[ReviewFinding] = []
+        repaired_acceptance_indices: set[int] = set()
+
+        for blocker_code in repairable_blocker_codes:
+            ledger_goal = _latest_resolved_goal(ledger)
+            if ledger_goal:
+                goal = ledger_goal
+                applied.append(_finding_fingerprint(review, blocker_code))
+
+        for finding in review.findings:
+            if finding.code in repairable_blocker_codes:
+                continue
+            if finding.code in {"vague_acceptance_criteria", "untestable_acceptance_criteria"}:
+                index = _target_index(finding.target)
+                if index is not None and index < len(acceptance):
+                    if index not in repaired_acceptance_indices:
+                        acceptance[index] = _observable_preserving_replacement(
+                            acceptance[index], index=index
+                        )
+                        repaired_acceptance_indices.add(index)
+                else:
+                    acceptance.append(
+                        "A command/API check returns stable observable output or artifacts proving the task goal."
+                    )
+                applied.append(finding.fingerprint)
+            elif finding.code == "missing_acceptance_criteria":
+                acceptance.append(
+                    "A command/API check returns stable observable output or artifacts proving the task goal."
+                )
+                applied.append(finding.fingerprint)
+            elif finding.code == "missing_constraints":
+                constraints.append(
+                    "Use existing project patterns and avoid new dependencies unless required by acceptance criteria."
+                )
+                applied.append(finding.fingerprint)
+            elif finding.code == "missing_non_goals" and ledger is not None:
+                ledger.add_entry(
+                    "non_goals",
+                    LedgerEntry(
+                        key="non_goals.auto_mvp",
+                        value=_safe_auto_mvp_non_goal(ledger),
+                        source=LedgerSource.NON_GOAL,
+                        confidence=0.86,
+                        status=LedgerStatus.DEFAULTED,
+                        rationale="Repair loop bounded scope without contradicting the requested goal.",
+                    ),
+                )
+                applied.append(finding.fingerprint)
+            else:
+                unresolved.append(finding)
+
+        changed = bool(applied)
+        updated_seed = seed
+        if changed:
+            updated_seed = seed.model_copy(
+                update={
+                    "goal": goal,
+                    "constraints": tuple(dict.fromkeys(constraints)),
+                    "acceptance_criteria": tuple(dict.fromkeys(acceptance)),
+                    "metadata": seed.metadata.model_copy(
+                        update={
+                            "seed_id": f"seed_{uuid4().hex[:12]}",
+                            "created_at": datetime.now(UTC),
+                            "parent_seed_id": seed.metadata.seed_id,
+                        }
+                    ),
+                }
+            )
+        return RepairResult(
+            changed=changed,
+            seed=updated_seed,
+            applied_repairs=tuple(applied),
+            unresolved_findings=tuple(unresolved),
+        )
+
+    def converge(
+        self,
+        seed: Seed,
+        *,
+        ledger: SeedDraftLedger | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[Seed, SeedReview, list[RepairResult]]:
+        """Review/repair until A-grade or bounded stop.
+
+        ``max_iterations`` caps the number of recorded repair attempts. Once
+        ``len(history) >= self.max_iterations`` the loop returns the most
+        recent reviewed ``(seed, review, history)`` — this is the upper bound
+        the pipeline relies on to prevent unbounded LLM cost when the reviewer
+        keeps producing the same finding.
+
+        When the bound is reached *immediately after* applying a repair, the
+        last cached ``review`` still describes the *pre-repair* seed; in that
+        case we perform exactly one final reconciliation review so the
+        returned ``(seed, review)`` pair is consistent. The pipeline persists
+        ``state.last_grade`` / ``state.findings`` from this review, so a stale
+        review here would block a seed that the final allowed repair actually
+        fixed (PR #785 review-1).
+
+        ``cancel_event`` enables cooperative cancellation by the pipeline's
+        repair-phase ``asyncio.wait_for``. ``wait_for`` only releases the
+        awaiting coroutine; it cannot interrupt a synchronous reviewer call
+        running in the worker thread. If the event is set, this method
+        raises :class:`RepairCancelled` at the next iteration boundary so no
+        *further* ``reviewer.review`` calls run after the budget expires.
+        The currently in-flight reviewer call still finishes naturally — that
+        is a non-cancellable C/IO boundary in CPython — but the loop will not
+        consume another review's worth of LLM time/cost (PR #785 review-3).
+        """
+        history: list[RepairResult] = []
+        previous_high_fingerprints: set[str] = set()
+        current = seed
+
+        def _check_cancelled() -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RepairCancelled(
+                    "repair phase cancelled by pipeline timeout before next reviewer call"
+                )
+
+        _check_cancelled()
+        review = self.reviewer.review(current, ledger=ledger)
+        for _ in range(self.max_iterations):
+            _check_cancelled()
+            if review.grade_result.grade == SeedGrade.A and review.may_run:
+                return current, review, history
+            high = {
+                finding.fingerprint for finding in review.findings if finding.severity == "high"
+            }
+            repair = self.repair_once(current, review, ledger=ledger)
+            history.append(repair)
+            if repair.blocker or not repair.changed:
+                return current, review, history
+            current = repair.seed
+            if len(history) >= self.max_iterations:
+                # Bound hit *after* a successful repair: the cached ``review``
+                # still describes the previous (pre-repair) seed. Re-review
+                # ``current`` once so the returned pair is consistent.
+                _check_cancelled()
+                review = self.reviewer.review(current, ledger=ledger)
+                return current, review, history
+            if high and high == previous_high_fingerprints:
+                _check_cancelled()
+                review = self.reviewer.review(current, ledger=ledger)
+                return current, review, history
+            previous_high_fingerprints = high
+            _check_cancelled()
+            review = self.reviewer.review(current, ledger=ledger)
+        return current, review, history
+
+
+def _observable_preserving_replacement(criterion: str, *, index: int) -> str:
+    """Make a criterion observable without erasing the original feature subject."""
+    normalized = criterion.strip().rstrip(".")
+    for term in VAGUE_TERMS:
+        normalized = re.sub(rf"\b{re.escape(term)}\b", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\b(should be|is|are|be)\b", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\s+(and|or)\s*$", "", normalized.strip(), flags=re.IGNORECASE)
+    normalized = re.sub(r"\s{2,}", " ", normalized).strip().strip("-:;,. ").strip()
+    subject = normalized or f"acceptance criterion {index + 1}"
+    return (
+        "A command/API check returns stable observable output or artifacts "
+        f"proving the original requirement for {subject}."
+    )
+
+
+def _target_index(target: str) -> int | None:
+    if "[" not in target or "]" not in target:
+        return None
+    try:
+        return int(target.split("[", 1)[1].split("]", 1)[0])
+    except ValueError:
+        return None
+
+
+def _finding_fingerprint(review: SeedReview, code: str) -> str:
+    for finding in review.findings:
+        if finding.code == code:
+            return finding.fingerprint
+    return code
+
+
+def _safe_auto_mvp_non_goal(ledger: SeedDraftLedger) -> str:
+    goal = _latest_resolved_goal(ledger).lower()
+    excluded = ["cloud sync", "paid services"]
+    if not re.search(r"\b(auth|authentication|login|sign[- ]?in|signup|password)\b", goal):
+        excluded.append("authentication")
+    if not re.search(r"\b(production|prod|deploy|deployment|release|publish)\b", goal):
+        excluded.append("production deployment")
+    if not excluded:
+        return "No scope outside the explicitly requested goal is included in auto MVP scope."
+    return f"For auto MVP scope, {', '.join(excluded)} are non-goals unless explicitly requested."
+
+
+def _latest_resolved_goal(ledger: SeedDraftLedger) -> str:
+    section = ledger.sections.get("goal")
+    if section is None:
+        return ""
+    inactive = {LedgerStatus.WEAK, LedgerStatus.CONFLICTING, LedgerStatus.BLOCKED}
+    for entry in reversed(section.entries):
+        if entry.status not in inactive and entry.value.strip():
+            return entry.value
+    return ""
