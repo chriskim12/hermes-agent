@@ -82,7 +82,12 @@ def run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
                 import os
                 import signal
 
-                os.killpg(proc.pid, signal.SIGKILL)
+                killpg = getattr(os, "killpg", None)
+                sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+                if killpg is not None:
+                    killpg(proc.pid, sigkill)
+                else:
+                    proc.kill()
             except Exception:
                 try:
                     proc.kill()

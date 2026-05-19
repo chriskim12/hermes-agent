@@ -565,7 +565,11 @@ def _terminate_command_tts_process_tree(proc: subprocess.Popen) -> None:
     try:
         import signal
 
-        os.killpg(proc.pid, signal.SIGTERM)
+        killpg = getattr(os, "killpg", None)
+        if killpg is not None:
+            killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
     except Exception:
         try:
             proc.terminate()
@@ -581,7 +585,12 @@ def _terminate_command_tts_process_tree(proc: subprocess.Popen) -> None:
     try:
         import signal
 
-        os.killpg(proc.pid, signal.SIGKILL)
+        killpg = getattr(os, "killpg", None)
+        sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        if killpg is not None:
+            killpg(proc.pid, sigkill)
+        else:
+            proc.kill()
     except Exception:
         try:
             proc.kill()
