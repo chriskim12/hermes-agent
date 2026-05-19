@@ -3,6 +3,7 @@ import os
 import socket
 import subprocess
 
+from hermes_cli import kanban
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_native_admission as native
 from hermes_cli.kanban import run_slash
@@ -84,6 +85,105 @@ def test_native_create_accepts_worker_profile_alias_for_top_level_wrapper(monkey
     assert data["status"] == "would_create"
     assert data["authority"]["admission_snapshot"]["profile"] == "yuuka"
     assert data["side_effects"]["kanban_task_written"] is False
+
+
+def _forbid_admission_executor_dispatch(monkeypatch):
+    def forbidden_dispatch(*args, **kwargs):
+        raise AssertionError(
+            "dispatch-forbidden admission guarantee violated: executor dispatch requires a separate approved live preflight"
+        )
+
+    monkeypatch.setattr(native.kb, "dispatch_once", forbidden_dispatch)
+    monkeypatch.setattr(native.kb, "run_daemon", forbidden_dispatch)
+    monkeypatch.setattr(native.kb, "claim_task", forbidden_dispatch)
+    monkeypatch.setattr(kanban.kb, "dispatch_once", forbidden_dispatch)
+
+
+def test_native_admission_dispatch_forbidden_guarantee_never_calls_executor_dispatch_even_with_hermes_direct_default_hints(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _forbid_admission_executor_dispatch(monkeypatch)
+    kb.init_db()
+
+    with kb.connect() as conn:
+        result = native.create_native_work(
+            conn,
+            _req(
+                profile="default",
+                executor="hermes-direct",
+                approval_boundary="separate_approved_live_preflight_required",
+            ),
+        )
+        task = kb.get_task(conn, result["task_id"])
+        run_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM task_runs WHERE task_id = ?",
+            (result["task_id"],),
+        ).fetchone()["c"]
+        dispatch_events = [
+            row["kind"]
+            for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
+                (result["task_id"],),
+            ).fetchall()
+            if row["kind"] in {"claimed", "spawned"}
+        ]
+
+    assert result["status"] == "created"
+    assert result["side_effects"]["executor_spawned"] is False
+    assert result["authority"]["admission_snapshot"]["profile"] == "default"
+    assert result["authority"]["admission_snapshot"]["executor"] == "hermes-direct"
+    assert result["authority"]["admission_snapshot"]["executor_dispatch"] == "forbidden_during_admission"
+    assert result["authority"]["routing_verdict"]["verdict"] == "Hermes direct"
+    assert result["authority"]["routing_verdict"]["boundary"] == "separate_approved_live_preflight_required"
+    assert "executor dispatch is forbidden during admission" in result["authority"]["routing_verdict"]["reason"]
+    assert task is not None
+    assert task.status == "triage"
+    assert task.assignee is None
+    assert task.claim_lock is None
+    assert task.worker_pid is None
+    assert task.admission_snapshot is not None
+    assert task.admission_snapshot["executor_dispatch"] == "forbidden_during_admission"
+    assert run_count == 0
+    assert dispatch_events == []
+
+
+def test_native_create_slash_dispatch_forbidden_admission_guarantee_leaves_dispatcher_unused(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _forbid_admission_executor_dispatch(monkeypatch)
+    kb.init_db()
+
+    out = run_slash(
+        "native-create 'BO-055 hermes-direct default route' "
+        "--tenant kanban --repo NousResearch/hermes-agent --worker-profile default "
+        "--executor hermes-direct --closeout-policy pr_review_handoff_then_done_closeout "
+        "--approval-boundary separate_approved_live_preflight_required --json"
+    )
+    data = json.loads(out)
+
+    assert data["status"] == "created"
+    assert data["task"]["assignee"] is None
+    assert data["side_effects"]["executor_spawned"] is False
+    assert data["authority"]["admission_snapshot"]["profile"] == "default"
+    assert data["authority"]["admission_snapshot"]["executor"] == "hermes-direct"
+    assert data["authority"]["admission_snapshot"]["executor_dispatch"] == "forbidden_during_admission"
+    assert data["authority"]["routing_verdict"] == {
+        "verdict": "Hermes direct",
+        "reason": "native admission records routing intent only; executor dispatch is forbidden during admission",
+        "boundary": "separate_approved_live_preflight_required",
+    }
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, data["task_id"])
+        run_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM task_runs WHERE task_id = ?",
+            (data["task_id"],),
+        ).fetchone()["c"]
+
+    assert task is not None
+    assert task.status == "triage"
+    assert task.assignee is None
+    assert task.claim_lock is None
+    assert task.worker_pid is None
+    assert run_count == 0
 
 
 def test_native_admission_dry_run_is_linear_free_and_no_write(monkeypatch, tmp_path):
