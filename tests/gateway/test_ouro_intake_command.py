@@ -605,3 +605,63 @@ def test_admission_never_dispatches_executor(hermes_home):
         assert task.worker_pid is None
         assert task.claim_lock is None
         assert task.routing_verdict["status"] == "proposed_only"
+
+
+
+def test_bo062_uses_vendored_upstream_interview_state_and_seed_model(hermes_home):
+    from gateway.ouro_intake import handle_ouro_intake_command
+    from hermes_integrations.ouroboros_upstream.bigbang.interview import InterviewState
+    from hermes_integrations.ouroboros_upstream.core.seed import Seed
+
+    started = handle_ouro_intake_command(
+        'goal:"Design gateway intake wrapper" project:bo tenant:kanban context:"Hermes gateway existing runtime" acceptance:"pytest passes"',
+        actor="tester",
+    )
+    sessions = json.loads((hermes_home / "ouro_intake_sessions.json").read_text())
+    state_payload = sessions[started.session_id]["upstream_interview_state"]
+    state = InterviewState.model_validate(state_payload)
+    assert state.interview_id == started.session_id
+    assert state.rounds
+    assert sessions[started.session_id]["upstream_interview_provider"] == "vendored_q00_ouroboros_subset"
+
+    answer = handle_ouro_intake_command(
+        f'answer session:{started.session_id} answer:"pytest test passes; no execution runner or gateway restart"',
+        actor="tester",
+    )
+    if answer.action == "refine_pending":
+        answer = handle_ouro_intake_command(f"answer session:{started.session_id} answer:승인", actor="tester")
+    assert answer.action == "interview_updated"
+    if "Restate:" in answer.message:
+        answer = handle_ouro_intake_command(f"answer session:{started.session_id} answer:승인", actor="tester")
+    assert answer.action == "interview_updated"
+    sessions = json.loads((hermes_home / "ouro_intake_sessions.json").read_text())
+    assert sessions[started.session_id]["status"] == "seed_ready"
+    seed_payload = sessions[started.session_id]["seed"]["upstream_seed"]
+    seed = Seed.from_dict(seed_payload)
+    assert seed.goal == "Design gateway intake wrapper"
+    assert seed.brownfield_context.project_type == "brownfield"
+    assert seed.ontology_schema.fields[0].field_type == "string"
+    assert seed.evaluation_principles[0].name
+    assert seed.exit_conditions[0].evaluation_criteria
+
+
+def test_bo062_vendored_source_records_upstream_commit():
+    from pathlib import Path
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parents[2]
+    ledger = repo_root / "hermes_integrations/ouroboros_upstream/VENDORED_UPSTREAM.md"
+    text = ledger.read_text()
+    upstream_sha = subprocess.check_output(["git", "-C", "/tmp/ouroboros-upstream", "rev-parse", "HEAD"], text=True).strip()
+    assert "https://github.com/Q00/ouroboros" in text
+    assert upstream_sha in text
+
+
+def test_bo062_gateway_wrapper_keeps_execution_runner_excluded():
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[2]
+    vendored = repo_root / "hermes_integrations/ouroboros_upstream"
+    assert not (vendored / "orchestrator").exists()
+    assert not (vendored / "ralph_loop.py").exists()
+    assert not (vendored / "orchestrator_stage.py").exists()

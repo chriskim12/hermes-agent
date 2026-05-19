@@ -21,6 +21,11 @@ from typing import Any
 from hermes_constants import get_hermes_home
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_native_admission import next_public_id, normalize_namespace
+from hermes_integrations.ouroboros_upstream.adapter import (
+    build_seed_dict as _vendored_ouroboros_seed_dict,
+    record_answer as _vendored_ouroboros_record_answer,
+    start_interview_state as _vendored_ouroboros_start_state,
+)
 
 _ALLOWED_PROJECTS = {
     "bo": "BO",
@@ -797,36 +802,15 @@ def _qa_and_repair_seed(seed: dict[str, Any]) -> dict[str, Any]:
 
 
 def _upstream_seed_projection(values: dict[str, Any], review: dict[str, Any], *, session_id: str | None) -> dict[str, Any]:
-    goal = str(values.get("goal") or "").strip()
-    context = str(values.get("context") or "").strip()
-    constraints = _as_list(values.get("constraints"), default=["Follow existing project patterns unless acceptance criteria require otherwise"])
-    acceptance = _as_list(values.get("acceptance_criteria"), default=["A command/API check returns stable observable output or artifacts proving the goal"])
-    ontology = _ontology_for(values)
-    return {
-        "goal": goal,
-        "task_type": str(values.get("task_type") or "code").strip() or "code",
-        "brownfield_context": {
-            "project_type": "brownfield" if re.search(r"brownfield|gateway|repo|runtime|existing", " ".join([goal, context]), re.IGNORECASE) else "greenfield",
-            "context_references": _as_list(values.get("context_references")),
-            "existing_patterns": _as_list(values.get("existing_patterns"), default=[context] if context else []),
-            "existing_dependencies": _as_list(values.get("existing_dependencies")),
-        },
-        "constraints": constraints,
-        "acceptance_criteria": acceptance,
-        "ontology_schema": {
-            "name": ontology["name"],
-            "description": ontology["description"],
-            "fields": ontology["fields"],
-        },
-        "evaluation_principles": _as_list(values.get("evaluation_principles"), default=["completeness: satisfy all acceptance criteria without violating constraints:1.0"]),
-        "exit_conditions": _as_list(values.get("exit_conditions"), default=["all_criteria_met: all acceptance criteria pass:100% criteria pass"]),
-        "metadata": {
-            "version": "1.0.0-hermes-projection",
-            "ambiguity_score": review["ambiguity_score"],
-            "interview_id": session_id,
-            "source": "hermes_ouro_intake_upstream_seed_projection",
-        },
-    }
+    """Build the upstream Seed payload through the vendored Ouroboros model.
+
+    BO-062 intentionally stops hand-rolling a lookalike dict here.  The return
+    value is produced by the vendored upstream `Seed` model and round-tripped
+    through `Seed.from_dict()`, then wrapped by Hermes/Kanban authority fields
+    outside this object.
+    """
+
+    return _vendored_ouroboros_seed_dict(values, review, session_id=session_id)
 
 
 def _build_seed_contract(values: dict[str, Any], *, public_id: str | None, actor: str | None, session_id: str | None = None) -> dict[str, Any]:
@@ -994,6 +978,12 @@ def _start_interview(raw_args: str, *, actor: str | None, origin: dict[str, Any]
         "turns": [],
         "rounds": [],
         "last_question": question if status == "interviewing" else {"id": "restate_confirmation", "track": "restate", "text": _restate_goal(values), "options": []},
+        "upstream_interview_state": _vendored_ouroboros_start_state(
+            session_id,
+            values,
+            question if status == "interviewing" else {"text": _restate_goal(values)},
+        ),
+        "upstream_interview_provider": "vendored_q00_ouroboros_subset",
         "track": question["track"] if status == "interviewing" else "restate",
         "language": _detect_language(values),
         "phase": status,
@@ -1095,6 +1085,13 @@ def _answer_interview(raw_args: str, *, actor: str | None) -> OuroIntakeResult:
                 session["phase"] = "restate_pending"
                 session["restate"] = _restate_goal(values)
                 session["last_question"] = {"id": "restate_confirmation", "track": "restate", "text": session["restate"], "options": []}
+                session["upstream_interview_state"] = _vendored_ouroboros_record_answer(
+                    session.get("upstream_interview_state"),
+                    pending_answer,
+                    session["last_question"],
+                    ambiguity_score=review["ambiguity_score"],
+                    ambiguity_breakdown=review,
+                )
                 message = _format_restate(session_id, values, review)
             else:
                 question = _highest_impact_question(values, review, previous_track=(pending_question or {}).get("track"))
@@ -1102,6 +1099,13 @@ def _answer_interview(raw_args: str, *, actor: str | None) -> OuroIntakeResult:
                 session["phase"] = "interviewing"
                 session["track"] = question["track"]
                 session["last_question"] = question
+                session["upstream_interview_state"] = _vendored_ouroboros_record_answer(
+                    session.get("upstream_interview_state"),
+                    pending_answer,
+                    question,
+                    ambiguity_score=review["ambiguity_score"],
+                    ambiguity_breakdown=review,
+                )
                 message = _format_next_question(session_id, review, question)
             sessions[session_id] = session
             _save_sessions(sessions)
@@ -1124,6 +1128,14 @@ def _answer_interview(raw_args: str, *, actor: str | None) -> OuroIntakeResult:
         session["seed"] = seed
         session["status"] = "seed_ready"
         session["phase"] = "seed_ready"
+        session["upstream_interview_state"] = _vendored_ouroboros_record_answer(
+            session.get("upstream_interview_state"),
+            answer_text,
+            None,
+            ambiguity_score=review["ambiguity_score"],
+            ambiguity_breakdown=review,
+            completed=True,
+        )
         session["updated_at"] = int(time.time())
         sessions[session_id] = session
         _save_sessions(sessions)
@@ -1181,6 +1193,13 @@ def _answer_interview(raw_args: str, *, actor: str | None) -> OuroIntakeResult:
         session["phase"] = "restate_pending"
         session["restate"] = _restate_goal(values)
         session["last_question"] = {"id": "restate_confirmation", "track": "restate", "text": session["restate"], "options": []}
+        session["upstream_interview_state"] = _vendored_ouroboros_record_answer(
+            session.get("upstream_interview_state"),
+            answer_text,
+            session["last_question"],
+            ambiguity_score=review["ambiguity_score"],
+            ambiguity_breakdown=review,
+        )
         message = _format_restate(session_id, values, review)
     else:
         question = _highest_impact_question(values, review, previous_track=(previous_question or {}).get("track"))
@@ -1188,6 +1207,13 @@ def _answer_interview(raw_args: str, *, actor: str | None) -> OuroIntakeResult:
         session["phase"] = "interviewing"
         session["track"] = question["track"]
         session["last_question"] = question
+        session["upstream_interview_state"] = _vendored_ouroboros_record_answer(
+            session.get("upstream_interview_state"),
+            answer_text,
+            question,
+            ambiguity_score=review["ambiguity_score"],
+            ambiguity_breakdown=review,
+        )
         message = _format_next_question(session_id, review, question)
     sessions[session_id] = session
     _save_sessions(sessions)
