@@ -1394,6 +1394,21 @@ def _teams_pipeline_plugin_enabled() -> bool:
     return "teams_pipeline" in enabled or "teams-pipeline" in enabled
 
 
+def _discover_gateway_plugins() -> None:
+    """Discover Python plugins for gateway startup and surface failures visibly."""
+    # Discover Python plugins before shell hooks so plugin block decisions take
+    # precedence in tie cases. The CLI startup path does this via an explicit
+    # call in hermes_cli/main.py; the gateway lazily imports run_agent inside
+    # per-request handlers, so the discover_plugins() side-effect in
+    # model_tools.py is NOT guaranteed to have run by the time startup reaches
+    # shell-hook registration.
+    try:
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
+    except Exception:
+        logger.warning("plugin discovery failed at gateway startup", exc_info=True)
+
+
 def _load_gateway_config() -> dict:
     """Load and parse ~/.hermes/config.yaml, returning {} on any error.
 
@@ -4019,19 +4034,7 @@ class GatewayRunner:
                 "or configure platform allowlists (e.g., TELEGRAM_ALLOWED_USERS=your_id)."
             )
         
-        # Discover Python plugins before shell hooks so plugin block
-        # decisions take precedence in tie cases.  The CLI startup path
-        # does this via an explicit call in hermes_cli/main.py; the
-        # gateway lazily imports run_agent inside per-request handlers,
-        # so the discover_plugins() side-effect in model_tools.py is NOT
-        # guaranteed to have run by the time we reach this point.
-        try:
-            from hermes_cli.plugins import discover_plugins
-            discover_plugins()
-        except Exception:
-            logger.warning(
-                "plugin discovery failed at gateway startup", exc_info=True,
-            )
+        _discover_gateway_plugins()
 
         # Register declarative shell hooks from cli-config.yaml.  Gateway
         # has no TTY, so consent has to come from one of the three opt-in
