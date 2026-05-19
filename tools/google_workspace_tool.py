@@ -7,10 +7,14 @@ projects are profiles in configuration; the tool code stays shared.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
+import stat
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -24,8 +28,11 @@ READONLY_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 READONLY_GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 FORBIDDEN_GMAIL_SCOPES = {"gmail.send", "gmail.modify", "gmail.compose"}
 FORBIDDEN_DRIVE_SCOPES = {"drive", "drive.file", "drive.appdata"}
+_ALLOWED_GOOGLE_WORKSPACE_SCOPES = {READONLY_DRIVE_SCOPE, READONLY_GMAIL_SCOPE}
 _PROFILE_RE = re.compile(r"^[a-zA-Z0-9_.-]+$")
 _IDENTIFIER_RE = re.compile(r"^[a-zA-Z0-9_.@:+/=-]+$")
+_BWS_REF_RE = re.compile(r"^[a-zA-Z0-9_.@:+/=-]+$")
+BWS_TIMEOUT_SECONDS = 15
 
 
 class GoogleWorkspaceError(RuntimeError):
@@ -138,6 +145,8 @@ def _require_drive_policy(profile: WorkspaceProfile, *, folder: str | None = Non
     scopes = {str(s).lower().removeprefix("https://www.googleapis.com/auth/") for s in _as_list(profile.drive.get("scopes"))}
     if scopes & FORBIDDEN_DRIVE_SCOPES:
         raise GoogleWorkspaceError("drive_forbidden_scope_configured")
+    if scopes and not scopes <= {"drive.readonly"}:
+        raise GoogleWorkspaceError("drive_forbidden_scope_configured")
     if folder:
         if folder not in allowed_folders:
             raise GoogleWorkspaceError("drive_folder_forbidden")
@@ -152,6 +161,8 @@ def _require_gmail_policy(profile: WorkspaceProfile, *, mailbox: str | None = No
         raise GoogleWorkspaceError("gmail_mailbox_allowlist_required")
     scopes = {str(s).lower().removeprefix("https://www.googleapis.com/auth/") for s in _as_list(profile.gmail.get("scopes"))}
     if scopes & FORBIDDEN_GMAIL_SCOPES:
+        raise GoogleWorkspaceError("gmail_forbidden_scope_configured")
+    if scopes and not scopes <= {"gmail.readonly"}:
         raise GoogleWorkspaceError("gmail_forbidden_scope_configured")
     if mailbox:
         if mailbox not in allowed_mailboxes:
@@ -203,9 +214,201 @@ def _require_drive_item_allowed(service: Any, profile: WorkspaceProfile, meta: d
     raise GoogleWorkspaceError("drive_item_outside_allowlist")
 
 
-def _resolve_secret_path(auth_ref: str) -> Path:
+def _validate_bws_ref(secret_ref: str) -> str:
+    ref = str(secret_ref or "").strip()
+    if not ref:
+        raise GoogleWorkspaceError("auth_bws_ref_invalid")
+    if any(ch in ref for ch in ("\x00", "\n", "\r")) or ".." in ref or not _BWS_REF_RE.fullmatch(ref):
+        raise GoogleWorkspaceError("auth_bws_ref_invalid")
+    return ref
+
+
+def _bws_binary() -> str:
+    raw = (_workspace_config().get("bws") or {}).get("path") if isinstance(_workspace_config().get("bws"), dict) else None
+    path = str(raw).strip() if raw else shutil.which("bws")
+    if not path:
+        raise GoogleWorkspaceError("auth_bws_binary_missing")
+    resolved = Path(path).expanduser()
+    if not resolved.is_absolute() or not resolved.exists() or not os.access(resolved, os.X_OK):
+        raise GoogleWorkspaceError("auth_bws_binary_missing")
+    try:
+        mode = resolved.stat().st_mode
+    except OSError as exc:
+        raise GoogleWorkspaceError("auth_bws_binary_missing") from exc
+    if mode & stat.S_IWOTH:
+        raise GoogleWorkspaceError("auth_bws_binary_missing")
+    return str(resolved)
+
+
+def _run_bws_json(args: list[str]) -> Any:
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=BWS_TIMEOUT_SECONDS, check=False, shell=False)
+    except subprocess.TimeoutExpired as exc:
+        raise GoogleWorkspaceError("auth_bws_unavailable") from exc
+    except OSError as exc:
+        raise GoogleWorkspaceError("auth_bws_unavailable") from exc
+    if proc.returncode != 0:
+        raise GoogleWorkspaceError("auth_bws_unavailable")
+    try:
+        return json.loads(proc.stdout or "")
+    except Exception as exc:
+        raise GoogleWorkspaceError("auth_bws_unavailable") from exc
+
+
+def _extract_bws_secret_value(secret: Any) -> str:
+    if not isinstance(secret, dict):
+        raise GoogleWorkspaceError("auth_bws_value_empty")
+    candidates = [secret.get("value")]
+    data = secret.get("data")
+    if isinstance(data, dict):
+        candidates.extend([data.get("value"), data.get("text"), data.get("secret")])
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    raise GoogleWorkspaceError("auth_bws_value_empty")
+
+
+def _bws_secret_matches(secret: Any, selector: str) -> bool:
+    if not isinstance(secret, dict):
+        return False
+    for key in ("id", "key", "name"):
+        if str(secret.get(key) or "") == selector:
+            return True
+    data = secret.get("data")
+    if isinstance(data, dict):
+        return any(str(data.get(key) or "") == selector for key in ("id", "key", "name"))
+    return False
+
+
+def _get_bws_secret(selector: str) -> dict[str, Any]:
+    bws = _bws_binary()
+    try:
+        secret = _run_bws_json([bws, "secret", "get", selector, "--output", "json"])
+        if isinstance(secret, dict):
+            return secret
+    except GoogleWorkspaceError:
+        pass
+    secrets = _run_bws_json([bws, "secret", "list", "--output", "json"])
+    if not isinstance(secrets, list):
+        raise GoogleWorkspaceError("auth_bws_unavailable")
+    matches = [item for item in secrets if _bws_secret_matches(item, selector)]
+    if not matches:
+        raise GoogleWorkspaceError("auth_bws_secret_missing")
+    if len(matches) > 1:
+        raise GoogleWorkspaceError("auth_bws_secret_ambiguous")
+    secret_id = str(matches[0].get("id") or (matches[0].get("data") or {}).get("id") or "")
+    if not secret_id:
+        raise GoogleWorkspaceError("auth_bws_secret_missing")
+    secret = _run_bws_json([bws, "secret", "get", secret_id, "--output", "json"])
+    if not isinstance(secret, dict):
+        raise GoogleWorkspaceError("auth_bws_unavailable")
+    return secret
+
+
+def _configured_scopes(profile: WorkspaceProfile) -> set[str]:
+    scopes = set(_as_list(profile.drive.get("scopes"))) | set(_as_list(profile.gmail.get("scopes")))
+    scopes = {s if s.startswith("https://") else f"https://www.googleapis.com/auth/{s}" for s in scopes}
+    return scopes or _ALLOWED_GOOGLE_WORKSPACE_SCOPES
+
+
+def _normalize_credential_scopes(value: Any) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        return {s for s in value.replace(",", " ").split() if s}
+    if isinstance(value, Iterable):
+        return {str(s) for s in value if str(s).strip()}
+    return set()
+
+
+def _validate_google_credential_json(data: Any, profile: WorkspaceProfile) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise GoogleWorkspaceError("auth_bws_value_not_json")
+    cred_type = data.get("type")
+    scopes = _normalize_credential_scopes(data.get("scopes") or data.get("scope"))
+    if scopes and not scopes <= (_configured_scopes(profile) & _ALLOWED_GOOGLE_WORKSPACE_SCOPES):
+        raise GoogleWorkspaceError("auth_bws_metadata_mismatch")
+    if cred_type == "authorized_user":
+        required = {"client_id", "client_secret", "refresh_token", "token_uri"}
+    elif cred_type == "service_account":
+        if _bool_enabled(profile.gmail):
+            raise GoogleWorkspaceError("auth_bws_credential_forbidden_for_gmail")
+        required = {"project_id", "private_key", "client_email", "token_uri"}
+    else:
+        raise GoogleWorkspaceError("auth_bws_credential_incomplete")
+    if any(not str(data.get(key) or "").strip() for key in required):
+        raise GoogleWorkspaceError("auth_bws_credential_incomplete")
+    return data
+
+
+def _materialize_bws_credential(profile: WorkspaceProfile, selector: str, credential: dict[str, Any], metadata: dict[str, Any]) -> Path:
+    directory = get_hermes_home() / "secrets" / "google-workspace" / profile.name
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
+        digest = hashlib.sha256(f"{profile.name}\0{selector}".encode("utf-8")).hexdigest()[:16]
+        path = directory / f"credential-{digest}.json"
+        meta_path = directory / f"credential-{digest}.meta.json"
+        body = json.dumps(credential, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        marker = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        old_umask = os.umask(0o177)
+        try:
+            tmp_path = directory / f".{path.name}.tmp-{os.getpid()}"
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(body)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_path, path)
+            os.chmod(path, 0o600)
+            meta = {
+                "profile": profile.name,
+                "scheme": "bws",
+                "selector_sha256": hashlib.sha256(selector.encode("utf-8")).hexdigest(),
+                "credential_sha256": marker,
+                "revision": metadata.get("revisionDate") or metadata.get("updatedAt") or metadata.get("revision") or None,
+                "cache_policy": "stable projection; rewritten on each resolution and usable only with mode 0600 under a 0700 directory",
+            }
+            meta_tmp = directory / f".{meta_path.name}.tmp-{os.getpid()}"
+            fd = os.open(meta_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(meta, ensure_ascii=False, sort_keys=True))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(meta_tmp, meta_path)
+            os.chmod(meta_path, 0o600)
+        finally:
+            os.umask(old_umask)
+        if stat.S_IMODE(path.stat().st_mode) != 0o600:
+            raise GoogleWorkspaceError("auth_materialization_insecure")
+        return path
+    except GoogleWorkspaceError:
+        raise
+    except Exception as exc:
+        raise GoogleWorkspaceError("auth_materialization_failed") from exc
+
+
+def _resolve_bws_auth_ref(secret_ref: str, profile: WorkspaceProfile) -> Path:
+    selector = _validate_bws_ref(secret_ref)
+    secret = _get_bws_secret(selector)
+    value = _extract_bws_secret_value(secret)
+    if value.startswith("encrypted:"):
+        raise GoogleWorkspaceError("auth_bws_value_not_json")
+    try:
+        data = json.loads(value)
+    except Exception as exc:
+        raise GoogleWorkspaceError("auth_bws_value_not_json") from exc
+    credential = _validate_google_credential_json(data, profile)
+    return _materialize_bws_credential(profile, selector, credential, secret)
+
+
+def _resolve_secret_path(auth_ref: str, profile: WorkspaceProfile | None = None) -> Path:
     """Resolve a non-secret auth reference to a local credential/token file path."""
     ref = auth_ref.strip()
+    if ref.startswith("bws:"):
+        if profile is None:
+            raise GoogleWorkspaceError("auth_bws_ref_invalid")
+        return _resolve_bws_auth_ref(ref.split(":", 1)[1], profile)
     if ref.startswith("env:"):
         env_name = ref.split(":", 1)[1].strip()
         value = os.environ.get(env_name, "").strip()
@@ -224,7 +427,7 @@ def _resolve_secret_path(auth_ref: str) -> Path:
 
 
 def _google_credentials(profile: WorkspaceProfile, scopes: list[str]) -> Any:
-    path = _resolve_secret_path(profile.auth_ref)
+    path = _resolve_secret_path(profile.auth_ref, profile)
     if not path.exists():
         raise GoogleWorkspaceError("auth_file_missing")
     try:
@@ -292,7 +495,11 @@ def _audit(operation: str, profile: str, surface: str, **details: Any) -> None:
     audit_cfg = _workspace_config().get("audit") or {}
     if isinstance(audit_cfg, dict) and audit_cfg.get("log_reads", True) is False:
         return
-    path = get_hermes_home() / "google-workspace" / "audit.log"
+    configured_path = audit_cfg.get("path") if isinstance(audit_cfg, dict) else None
+    if configured_path:
+        path = Path(str(configured_path)).expanduser()
+    else:
+        path = get_hermes_home() / "google-workspace" / "audit.log"
     path.parent.mkdir(parents=True, exist_ok=True)
     safe_details = {k: _mask(v) for k, v in details.items()}
     entry = {
