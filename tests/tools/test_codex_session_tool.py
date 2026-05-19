@@ -69,3 +69,22 @@ def test_codex_session_tool_schema_documents_hermes_worktree_write_profile():
     profile_description = tool.CODEX_SESSION_SCHEMA["parameters"]["properties"]["permission_profile"]["description"]
 
     assert "hermes-worktree-write" in profile_description
+
+
+def test_codex_session_tool_schema_smoke_preserves_evidence_only_contract(monkeypatch):
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
+
+    from model_tools import get_tool_definitions
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+    tools = get_tool_definitions(enabled_toolsets=["codex"], quiet_mode=True)
+    schema = next(tool["function"] for tool in tools if tool["function"]["name"] == "codex_session")
+
+    assert schema["description"]
+    assert "structured execution evidence" in schema["description"]
+    assert "not a user-facing final answer" in schema["description"]
+    assert schema["parameters"]["required"] == ["task"]
+    assert set(schema["parameters"]["properties"]) == {"task", "cwd", "turn_timeout", "permission_profile"}
