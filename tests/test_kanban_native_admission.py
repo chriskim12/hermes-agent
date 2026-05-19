@@ -275,3 +275,85 @@ def test_native_admission_parent_validation_is_no_write(monkeypatch, tmp_path):
         count = conn.execute("SELECT COUNT(*) AS c FROM tasks").fetchone()["c"]
 
     assert count == 0
+
+
+def test_seed_admission_card_body_renderer_preserves_bo_053_authority_boundary():
+    payload = {
+        "idempotency_key": "kanban:BO-053",
+        "public_id": "BO-053",
+        "tenant": "kanban",
+        "source": "kanban_native",
+        "parents": [
+            {
+                "task_id": "t_25f3edcf",
+                "public_id": "BO-051",
+                "relation_type": "hierarchy",
+            }
+        ],
+        "repo_intent": {
+            "repo_full_name": "NousResearch/hermes-agent",
+            "base_branch": None,
+            "workspace_kind": "worktree",
+            "workspace_path": None,
+            "worktree_branch": None,
+        },
+        "routing": {
+            "status": "proposed_only",
+            "verdict": "hermes-direct",
+            "approval_boundary": "human_approval_required",
+            "reason": "native admission captures requested executor; dispatch remains forbidden until live preflight",
+            "execution_hints": {
+                "executor": "hermes-direct",
+                "profile": "default",
+                "skills": ["kanban-native-work-execution"],
+            },
+        },
+        "admission": {
+            "mode": "native_dry_run_or_triage_admission",
+            "approval_boundary": "human_approval_required",
+            "executor_dispatch": "forbidden_during_admission",
+            "linear_required": False,
+        },
+        "closeout": {
+            "policy": "admission_only_no_execution",
+            "worker_done_review_ready_closed_are_distinct": True,
+        },
+        "suggested_children": [
+            {"title": "Implement admission writer", "profile": "default"},
+            {"title": "Verify readback", "profile": "reviewer"},
+        ],
+    }
+
+    body = native.render_seed_admission_card_body(payload)
+    source_payload_text = body.split("```json source_payload\n", 1)[1].split("\n```", 1)[0]
+    rendered_payload = json.loads(source_payload_text)
+
+    assert "STATUS: BLOCKED / ADMISSION-ONLY" in body
+    assert "Chris must approve execution" in body
+    assert "source=kanban_native" in body
+    assert "approval_boundary=human_approval_required" in body
+    assert "executor_dispatch=forbidden_during_admission" in body
+    assert "linear_required=false" in body
+    assert "closeout.policy=admission_only_no_execution" in body
+    assert "admission metadata" in body
+    assert "does not authorize dispatch" in body
+    assert "parent suggestion 1" in body
+    assert "public_id=BO-051" in body
+    assert "relation_type=hierarchy" in body
+    assert "executable_gate=false" in body
+    assert "suggestion_only=true" in body
+    assert "not ready executable tasks" in body
+    assert "Done:" in body
+    assert "Review Ready:" in body
+    assert "Closed:" in body
+    assert "Executable Ready: forbidden" in body
+    assert rendered_payload["source"] == "kanban_native"
+    assert rendered_payload["admission"] == {
+        "mode": "native_dry_run_or_triage_admission",
+        "approval_boundary": "human_approval_required",
+        "executor_dispatch": "forbidden_during_admission",
+        "linear_required": False,
+    }
+    assert rendered_payload["routing"]["status"] == "proposed_only"
+    assert rendered_payload["closeout"]["policy"] == "admission_only_no_execution"
+    assert rendered_payload["closeout"]["worker_done_review_ready_closed_are_distinct"] is True

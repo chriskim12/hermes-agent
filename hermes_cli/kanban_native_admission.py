@@ -139,6 +139,193 @@ def existing_native_task_id(conn: Any, public_id: str) -> Optional[str]:
     return row["id"] if row else None
 
 
+def _as_bool_text(value: Any) -> str:
+    return "true" if value is True else "false" if value is False else str(value)
+
+
+def _get_nested(payload: dict[str, Any], path: tuple[str, ...], default: Any = None) -> Any:
+    current: Any = payload
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return default
+        current = current[key]
+    return current
+
+
+def _format_metadata_value(value: Any) -> str:
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    if isinstance(value, bool):
+        return _as_bool_text(value)
+    if value is None:
+        return "null"
+    return str(value)
+
+
+def _iter_suggested_breakdown(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return child/parent breakdown suggestions from common seed payload shapes.
+
+    Suggestions are display-only during admission.  This renderer deliberately
+    does not translate them into ready tasks or dependency gates.
+    """
+    candidates = (
+        payload.get("suggested_breakdown"),
+        payload.get("suggested_children"),
+        payload.get("children"),
+        _get_nested(payload, ("seed_contract", "suggested_breakdown")),
+        _get_nested(payload, ("seed_contract", "suggested_children")),
+        _get_nested(payload, ("seed_contract", "children")),
+    )
+    suggestions: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if isinstance(candidate, dict):
+            iterable = candidate.get("items") or candidate.get("suggestions") or candidate.get("children") or []
+        else:
+            iterable = candidate
+        if not isinstance(iterable, list):
+            continue
+        for item in iterable:
+            if isinstance(item, dict):
+                suggestions.append(item)
+            else:
+                suggestions.append({"title": str(item)})
+    return suggestions
+
+
+def render_seed_admission_card_body(payload: dict[str, Any], *, card_kind: str = "admission") -> str:
+    """Render a Seed Contract/admission payload as a Kanban-native card body.
+
+    The output is intentionally verbose about authority boundaries because this
+    body may be read by humans and later agents.  Routing/executor fields are
+    preserved as admission metadata only; the rendered text must not imply that
+    workers may be claimed or dispatched before Chris approves execution.
+    """
+    if not isinstance(payload, dict):
+        raise TypeError("payload must be a dict")
+    kind = (card_kind or "admission").strip().lower().replace("_", "-")
+    if kind not in {"admission", "decision-gate"}:
+        raise ValueError("card_kind must be 'admission' or 'decision-gate'")
+
+    public_id = str(payload.get("public_id") or "UNKNOWN").strip()
+    idempotency_key = str(payload.get("idempotency_key") or "").strip() or None
+    tenant = str(payload.get("tenant") or "").strip() or None
+    source = str(payload.get("source") or "kanban_native").strip()
+    admission = dict(payload.get("admission") or {})
+    routing = dict(payload.get("routing") or {})
+    repo_intent = dict(payload.get("repo_intent") or {})
+    closeout = dict(payload.get("closeout") or {})
+    execution_hints = dict(routing.get("execution_hints") or payload.get("execution_hints") or {})
+    parents = payload.get("parents") if isinstance(payload.get("parents"), list) else []
+    link_intent = payload.get("link_intent") if isinstance(payload.get("link_intent"), list) else []
+    suggestions = _iter_suggested_breakdown(payload)
+
+    normalized_payload = dict(payload)
+    normalized_payload["source"] = source
+    normalized_payload["admission"] = {
+        **admission,
+        "approval_boundary": "human_approval_required",
+        "executor_dispatch": "forbidden_during_admission",
+        "linear_required": False,
+    }
+    normalized_payload["routing"] = {
+        **routing,
+        "status": "proposed_only",
+        "approval_boundary": "human_approval_required",
+    }
+    normalized_payload["closeout"] = {
+        **closeout,
+        "policy": "admission_only_no_execution",
+        "worker_done_review_ready_closed_are_distinct": True,
+    }
+
+    lines = [
+        f"# {public_id} Kanban-native {kind} card",
+        "",
+        "STATUS: BLOCKED / ADMISSION-ONLY. Chris must approve execution before any executor, profile, worker, or routing hint may dispatch.",
+        "",
+        "## Authority boundary (hard requirements)",
+        "- source=kanban_native",
+        "- approval_boundary=human_approval_required",
+        "- executor_dispatch=forbidden_during_admission",
+        "- linear_required=false",
+        "- closeout.policy=admission_only_no_execution",
+        "- closeout.admission_only_no_execution=true",
+        "",
+        "## Visible evidence / comment text",
+        "This card is an admission or decision-gate record only. Any executor, profile, skills, repo, parent, child, or routing metadata below is admission metadata and future intent; it does not authorize dispatch, worker claims, run rows, ready tasks, repo mutation, PR activity, deployment, gateway restart, secret changes, billing/customer-visible actions, or Linear work.",
+        "",
+        "## Identity",
+    ]
+    for label, value in (
+        ("public_id", public_id),
+        ("idempotency_key", idempotency_key),
+        ("tenant", tenant),
+        ("source", "kanban_native"),
+    ):
+        lines.append(f"- {label}={_format_metadata_value(value)}")
+
+    lines.extend(["", "## Proposed routing (not executable)"])
+    for label, value in (
+        ("routing.status", "proposed_only"),
+        ("routing.verdict", routing.get("verdict")),
+        ("routing.reason", routing.get("reason")),
+        ("routing.approval_boundary", "human_approval_required"),
+        ("execution_hints", execution_hints),
+    ):
+        lines.append(f"- {label}={_format_metadata_value(value)}")
+    lines.append("- dispatch_authority=none_during_admission")
+
+    lines.extend(["", "## Repository intent (descriptive only)"])
+    if repo_intent:
+        for key in sorted(repo_intent):
+            lines.append(f"- repo_intent.{key}={_format_metadata_value(repo_intent.get(key))}")
+    else:
+        lines.append("- repo_intent=null")
+    lines.append("- repo intent may inform future approved worktree setup, but this admission card does not create or mutate any repository state.")
+
+    lines.extend(["", "## Parent/link intent (suggestions and hierarchy only unless explicitly approved)"])
+    if parents:
+        for index, parent in enumerate(parents, 1):
+            if isinstance(parent, dict):
+                relation = parent.get("relation_type") or "hierarchy"
+                executable_gate = parent.get("executable_gate") if "executable_gate" in parent else False
+                rendered = ", ".join(f"{key}={_format_metadata_value(parent.get(key))}" for key in sorted(parent))
+                lines.append(f"- parent suggestion {index}: {rendered}, relation_type={relation}, executable_gate={_as_bool_text(bool(executable_gate))}")
+            else:
+                lines.append(f"- parent suggestion {index}: {_format_metadata_value(parent)}, relation_type=hierarchy, executable_gate=false")
+    else:
+        lines.append("- no parent suggestions supplied")
+    if link_intent:
+        for index, link in enumerate(link_intent, 1):
+            lines.append(f"- link suggestion {index}: {_format_metadata_value(link)}; suggestion_only=true")
+    lines.append("- Parent/child breakdowns shown here are suggestions only; they are not ready executable tasks and do not gate readiness unless Chris later approves a dependency edge.")
+
+    lines.extend(["", "## Suggested child breakdown (not ready tasks)"])
+    if suggestions:
+        for index, suggestion in enumerate(suggestions, 1):
+            title = suggestion.get("title") or suggestion.get("public_id") or f"suggestion {index}"
+            rendered = ", ".join(f"{key}={_format_metadata_value(suggestion.get(key))}" for key in sorted(suggestion))
+            lines.append(f"- suggestion {index}: {title} — {rendered}; executable_ready=false; suggestion_only=true")
+    else:
+        lines.append("- no child breakdown suggestions supplied")
+
+    lines.extend([
+        "",
+        "## Done / Review Ready / Closed semantics",
+        "- Done: admission renderer/card body exists and preserves authority evidence; this does not mean implementation execution is complete.",
+        "- Review Ready: Chris has enough admission evidence to approve, reject, or revise execution; no executor dispatch is implied.",
+        "- Closed: the admission or decision gate is resolved or superseded; closing admission is distinct from executable work being finished.",
+        "- Executable Ready: forbidden from this card body until a separate human approval creates or promotes executable work.",
+        "",
+        "```json source_payload",
+        json.dumps(normalized_payload, indent=2, sort_keys=True, ensure_ascii=False),
+        "```",
+    ])
+    return "\n".join(lines).strip() + "\n"
+
+
 def build_native_body(req: NativeAdmissionRequest, public_id: str, idempotency_key: str) -> str:
     payload = {
         "source": "kanban_native",
