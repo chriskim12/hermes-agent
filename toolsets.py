@@ -154,6 +154,20 @@ TOOLSETS = {
         "tools": ["terminal", "process"],
         "includes": []
     },
+
+    "google_workspace": {
+        "description": (
+            "Profile-scoped read-only Google Workspace retrieval tools for Drive "
+            "and Gmail. Profiles enforce tenant/mailbox/folder boundaries and "
+            "fail closed on missing policy."
+        ),
+        "tools": [
+            "google_workspace_profiles",
+            "google_drive_search", "google_drive_read", "google_drive_recent",
+            "google_mail_search", "google_mail_read", "google_mail_thread",
+        ],
+        "includes": []
+    },
     
     "moa": {
         "description": "Advanced reasoning and problem-solving tools",
