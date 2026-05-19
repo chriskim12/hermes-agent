@@ -152,11 +152,14 @@ def worker_env(monkeypatch, tmp_path):
     after we've created the task."""
     home = tmp_path / ".hermes"
     home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
-    from pathlib import Path as _Path
-    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    # The live Kanban dispatcher injects run/claim tokens into real worker
+    # processes. Unit tests create their own synthetic worker/task rows below,
+    # so inherited dispatcher tokens from the outer test runner would make
+    # lifecycle handlers fail their expected_run_id / claimer checks.
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_LOCK", raising=False)
+
 
     from hermes_cli import kanban_db as kb
     kb._INITIALIZED_PATHS.clear()
