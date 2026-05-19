@@ -138,10 +138,17 @@ class TestStdioPidTracking:
              patch("tools.mcp_tool.time.sleep") as mock_sleep:
             _kill_orphaned_mcp_children()
 
-        # SIGTERM then SIGKILL; the alive check no longer touches os.kill.
+        # SIGTERM then SIGKILL for this test's PID. Under xdist/full-suite
+        # teardown, unrelated tracked MCP PIDs may be reaped in the same helper
+        # call, so assert the contract for fake_pid rather than global call
+        # count.
         mock_kill.assert_any_call(fake_pid, signal.SIGTERM)
         mock_kill.assert_any_call(fake_pid, fake_sigkill)
-        assert mock_kill.call_count == 2
+        fake_pid_calls = [call for call in mock_kill.call_args_list if call.args and call.args[0] == fake_pid]
+        assert fake_pid_calls == [
+            ((fake_pid, signal.SIGTERM),),
+            ((fake_pid, fake_sigkill),),
+        ]
         mock_sleep.assert_called_once_with(2)
 
         with _lock:
