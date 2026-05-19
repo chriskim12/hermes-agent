@@ -1083,7 +1083,7 @@ def _get_env_config(requested_workdir: Optional[str] = None) -> Dict[str, Any]:
     host_cwd = None
     host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
     if env_type == "docker" and mount_docker_cwd:
-        docker_cwd_source = os.getenv("TERMINAL_CWD") or _resolve_start_cwd(requested_workdir)
+        docker_cwd_source = _valid_dir(os.getenv("TERMINAL_CWD")) or _resolve_start_cwd(requested_workdir)
         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
         if (
             any(candidate.startswith(p) for p in host_prefixes)
@@ -1931,6 +1931,7 @@ def terminal_tool(
                         "command": approval.get("command", command),
                         "description": approval.get("description", "command flagged"),
                         "pattern_key": approval.get("pattern_key", ""),
+                        "pattern_keys": approval.get("pattern_keys", []),
                     }, ensure_ascii=False)
                 # Command was blocked
                 desc = approval.get("description", "command flagged")

@@ -1624,7 +1624,7 @@ def _resolve_child_cwd(mode: str, staging_dir: str) -> str:
 
     - ``strict``: the staging tmpdir (today's behavior).
     - ``project``: the session's TERMINAL_CWD (same as the terminal tool), or
-      ``os.getcwd()`` if TERMINAL_CWD is unset or doesn't point at a real dir.
+      the terminal tool's safe cwd if TERMINAL_CWD is unset or invalid.
       Falls back to the staging tmpdir as a last resort so we never invoke
       Popen with a nonexistent cwd.
     """
