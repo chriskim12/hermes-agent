@@ -848,6 +848,60 @@ def _format_queue_message(decision: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _closed_loop_dry_run_decision(command: AutopilotCommand, *, actor: Optional[str], candidates: Optional[list[dict[str, Any]]]) -> dict[str, Any]:
+    closed_loop = simulate_closed_loop_ticks(candidates or [])
+    return {
+        "action": command.action,
+        "actor": actor,
+        "read_only": True,
+        "status": "DRY_RUN",
+        "reason": "closed_loop_simulator_no_execution_authority",
+        "closed_loop": closed_loop,
+        "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
+        "mutations_attempted": list(_MUTATIONS_ATTEMPTED),
+    }
+
+
+def _format_closed_loop_dry_run_message(decision: dict[str, Any]) -> str:
+    report = decision.get("closed_loop") or {}
+    return "\n".join([
+        "Autopilot closed-loop dry-run",
+        f"would_select={len(report.get('would_select') or [])}",
+        f"would_skip={len(report.get('would_skip') or [])}",
+        f"would_pause={len(report.get('would_pause') or [])}",
+        f"next_state={report.get('next_state')}",
+        "No dispatch, claim, worker spawn, or Kanban mutation was attempted.",
+    ])
+
+
+def _once_decision(command: AutopilotCommand, *, actor: Optional[str], candidates: Optional[list[dict[str, Any]]]) -> dict[str, Any]:
+    single_flight = activate_single_flight(candidates or [])
+    status = "CHECK_ONLY_HANDOFF_READY" if single_flight.get("status") == "handoff_check_passed" else "CHECK_ONLY_HANDOFF_BLOCKED"
+    return {
+        "action": command.action,
+        "actor": actor,
+        "read_only": False,
+        "status": status,
+        "reason": "single_flight_check_only_no_dispatch",
+        "single_flight": single_flight,
+        "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
+        "mutations_attempted": list(_MUTATIONS_ATTEMPTED),
+    }
+
+
+def _format_once_message(decision: dict[str, Any]) -> str:
+    sf = decision.get("single_flight") or {}
+    selected = sf.get("selected") or {}
+    return "\n".join([
+        "Autopilot single-flight check-only",
+        f"status={decision.get('status')}",
+        f"selected={selected.get('public_id') or selected.get('task_id')}",
+        f"worker_done_observed={sf.get('worker_done_observed')}",
+        "handoff_success_is_worker_completion=False",
+        "No dispatch, claim, worker spawn, or Kanban mutation was attempted.",
+    ])
+
+
 def _status_decision(command: AutopilotCommand, *, actor: Optional[str] = None) -> dict[str, Any]:
     state = _read_state()
     desired_mode = str(state.get("desired_mode") or "disabled")
@@ -998,9 +1052,17 @@ def handle_autopilot_command(
         decision = _queue_decision(command, actor=actor, candidates=candidates)
         return AutopilotResult(True, command, _format_queue_message(decision), decision, False)
 
-    if command.action in _READ_ONLY_ACTIONS:
+    if command.action == "dry-run":
+        decision = _closed_loop_dry_run_decision(command, actor=actor, candidates=candidates)
+        return AutopilotResult(True, command, _format_closed_loop_dry_run_message(decision), decision, False)
+
+    if command.action in {"status"}:
         decision = _status_decision(command, actor=actor)
         return AutopilotResult(True, command, _format_status_message(decision), decision, False)
+
+    if command.action == "once":
+        decision = _once_decision(command, actor=actor, candidates=candidates)
+        return AutopilotResult(True, command, _format_once_message(decision), decision, False)
 
     if command.action in _CONTROL_ACTIONS:
         decision = _control_decision(command, actor=actor)

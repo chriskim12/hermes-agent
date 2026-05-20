@@ -718,3 +718,34 @@ def test_recovery_drill_fails_unknown_trigger_closed():
     assert result["passed"] is False
     assert result["drills"][0]["action"] == "hard_stop_and_require_human_triage"
     assert result["next_state"] == "needs_human"
+
+
+def test_autopilot_dry_run_command_uses_closed_loop_simulator(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import handle_autopilot_command
+
+    handle_autopilot_command("on", actor="tester")
+    result = handle_autopilot_command("dry-run", actor="tester", candidates=[_ready_candidate("BO-090")])
+
+    assert result.ok is True
+    assert result.decision["status"] == "DRY_RUN"
+    assert result.decision["closed_loop"]["would_select"][0]["public_id"] == "BO-090"
+    assert result.decision["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0}
+    assert "would_select=1" in result.message
+
+
+def test_autopilot_once_command_uses_single_flight_check_only_not_completion(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import handle_autopilot_command
+
+    handle_autopilot_command("on", actor="tester")
+    result = handle_autopilot_command("once", actor="tester", candidates=[_ready_candidate("BO-090"), _ready_candidate("BO-091")])
+
+    assert result.ok is True
+    assert result.decision["status"] == "CHECK_ONLY_HANDOFF_READY"
+    assert result.decision["single_flight"]["selected"]["public_id"] == "BO-090"
+    assert result.decision["single_flight"]["handoff_success_is_worker_completion"] is False
+    assert result.decision["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0}
+    assert "worker_done_observed=False" in result.message
