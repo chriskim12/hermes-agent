@@ -185,15 +185,53 @@ def evaluate_autopilot_ready_gate(candidate: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def evaluate_dispatcher_eligibility(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    """Dry-run which Ready-gate-passing tasks could later reach dispatcher.
+
+    This is a bridge to the existing Kanban dispatcher, not a second dispatcher.
+    It returns handoff-shaped facts but performs no claim/spawn/DB transition.
+    """
+
+    state = _read_state()
+    effective = _effective_mode(str(state.get("desired_mode") or "disabled"), state)
+    eligible: list[dict[str, Any]] = []
+    ineligible: list[dict[str, Any]] = []
+    for candidate in candidates:
+        gate = evaluate_autopilot_ready_gate(candidate)
+        if effective != "blocked":
+            gate = {
+                **gate,
+                "autopilot_ready": False,
+                "status": "rejected",
+                "reason_codes": ["autopilot_effective_mode_not_blocked_pending_dispatch_gate"],
+                "human_reason": "Autopilot controller is not in desired=on/effective=blocked pending-dispatch-gate mode.",
+            }
+        if gate["autopilot_ready"]:
+            eligible.append(gate)
+        else:
+            ineligible.append(gate)
+    return {
+        "controller_effective_mode": effective,
+        "handoff_target": "existing_kanban_dispatcher",
+        "second_dispatcher_created": False,
+        "eligible": eligible,
+        "ineligible": ineligible,
+        "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0},
+    }
+
+
 def _queue_decision(command: AutopilotCommand, *, actor: Optional[str], candidates: Optional[list[dict[str, Any]]]) -> dict[str, Any]:
-    results = [evaluate_autopilot_ready_gate(candidate) for candidate in (candidates or [])]
+    candidate_list = candidates or []
+    results = [evaluate_autopilot_ready_gate(candidate) for candidate in candidate_list]
+    dispatcher_eligibility = evaluate_dispatcher_eligibility(candidate_list)
     return {
         "action": command.action,
         "actor": actor,
         "read_only": True,
         "status": "DRY_RUN",
-        "reason": "phase2_ready_gate_dry_run_no_execution_authority",
+        "reason": "phase3_dispatcher_eligibility_bridge_no_execution_authority",
         "candidates": results,
+        "dispatcher_eligibility": dispatcher_eligibility,
         "accepted_count": sum(1 for result in results if result["autopilot_ready"]),
         "rejected_count": sum(1 for result in results if not result["autopilot_ready"]),
         "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0},

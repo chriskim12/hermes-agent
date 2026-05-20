@@ -196,3 +196,73 @@ def test_autopilot_queue_dry_run_reports_gate_results_without_spawning(tmp_path,
     assert result.decision["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0}
     assert result.decision["candidates"][0]["autopilot_ready"] is False
     assert "missing_goal" in result.decision["candidates"][0]["reason_codes"]
+
+
+def _ready_candidate(public_id: str = "BO-100") -> dict:
+    return {
+        "id": "t_good",
+        "public_id": public_id,
+        "status": "ready",
+        "title": "Implement bounded thing",
+        "body": """
+Goal: implement a bounded local validator.
+End-state/output: local commit candidate and Kanban evidence.
+Scope/non-goals: no gateway restart and no production action.
+Acceptance criteria: validator returns machine-readable reason codes.
+Verification requirements: focused tests and git diff --check.
+Authority boundary: Kanban controls execution; PR/push forbidden.
+Repo/lane truth: chriskim12/hermes-agent on a task branch.
+Risk flags: no env, secret, prod, billing, customer-visible, or restart action.
+Dependencies/blockers: none.
+Review package expectation: changed files, tests, commit, boundaries.
+""",
+        "routing_verdict": {"verdict": "Hermes direct"},
+        "admission_snapshot": {"repo_full_name": "chriskim12/hermes-agent"},
+    }
+
+
+def test_dispatcher_eligibility_bridge_requires_controller_on_and_ready_gate(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import evaluate_dispatcher_eligibility, handle_autopilot_command
+
+    stopped = evaluate_dispatcher_eligibility([_ready_candidate()])
+    assert stopped["eligible"] == []
+    assert stopped["ineligible"][0]["reason_codes"] == ["autopilot_effective_mode_not_blocked_pending_dispatch_gate"]
+
+    handle_autopilot_command("on", actor="tester")
+    verdict = evaluate_dispatcher_eligibility([_ready_candidate(), {"id": "t_raw", "public_id": "BO-999", "status": "ready", "body": "raw"}])
+
+    assert [item["public_id"] for item in verdict["eligible"]] == ["BO-100"]
+    assert verdict["ineligible"][0]["public_id"] == "BO-999"
+    assert "missing_goal" in verdict["ineligible"][0]["reason_codes"]
+    assert verdict["handoff_target"] == "existing_kanban_dispatcher"
+    assert verdict["second_dispatcher_created"] is False
+    assert verdict["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0}
+
+
+def test_autopilot_queue_includes_dispatcher_eligibility_without_dispatching(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway import kanban_autopilot
+
+    calls: list[str] = []
+
+    def forbidden(*_args, **_kwargs):
+        calls.append("forbidden")
+        raise AssertionError("eligibility bridge must not call the dispatcher")
+
+    monkeypatch.setattr(kanban_autopilot, "dispatch_once", forbidden, raising=False)
+    monkeypatch.setattr(kanban_autopilot, "claim_task", forbidden, raising=False)
+    monkeypatch.setattr(kanban_autopilot, "spawn_worker", forbidden, raising=False)
+    monkeypatch.setattr(kanban_autopilot, "mutate_kanban", forbidden, raising=False)
+
+    kanban_autopilot.handle_autopilot_command("on", actor="tester")
+    result = kanban_autopilot.handle_autopilot_command("queue", actor="tester", candidates=[_ready_candidate("BO-101")])
+
+    assert result.ok is True
+    assert result.decision["dispatcher_eligibility"]["eligible"][0]["public_id"] == "BO-101"
+    assert result.decision["dispatcher_eligibility"]["handoff_target"] == "existing_kanban_dispatcher"
+    assert result.decision["dispatcher_eligibility"]["second_dispatcher_created"] is False
+    assert result.decision["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0}
+    assert calls == []
