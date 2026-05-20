@@ -964,3 +964,52 @@ def test_bo062_runtime_question_generator_drives_plain_reply_next_question(herme
     question = sessions[started.session_id]["last_question"]
     assert question["source"] == "hermes_runtime_from_upstream_question_contract"
     assert question["fallback_text"]
+
+
+def test_bo062_question_contract_uses_vendored_upstream_interview_skill_as_ux_authority(hermes_home):
+    from gateway.ouro_intake import handle_ouro_intake_command
+
+    started = handle_ouro_intake_command(
+        'goal:"Stabilize brownfield payroll admin UX" project:ws tenant:payroll context:"existing WhyStarve admin"',
+        actor="tester",
+    )
+
+    sessions = json.loads((hermes_home / "ouro_intake_sessions.json").read_text())
+    contract = sessions[started.session_id]["upstream_question_contract"]
+    prompt = contract["system_prompt"]
+
+    assert contract["ux_authority"] == "vendored_upstream_interview_skill"
+    assert contract["skill_contract_source"].endswith("skills/interview/SKILL.md")
+    assert contract["socratic_interviewer_source"].endswith("agents/socratic-interviewer.md")
+    assert contract["seed_closer_source"].endswith("agents/seed-closer.md")
+    assert "## Upstream Interview Skill — UX Authority" in prompt
+    assert "Required Skill Capabilities" in prompt
+    assert "Refine before forwarding" in prompt
+    assert "Seed-ready Acceptance Guard" in prompt
+    assert "## Upstream Socratic Interviewer" in prompt
+    assert "You are ONLY an interviewer" in prompt
+    assert "## Upstream Seed Closer" in prompt
+    assert "A good interview ends on time" in prompt
+
+
+def test_bo062_live_runtime_generator_receives_upstream_skill_authority_prompt(hermes_home):
+    from gateway.ouro_intake import handle_ouro_intake_command
+
+    seen_prompts = []
+
+    def fake_runtime_generator(contract, *, session, values, review):
+        seen_prompts.append(contract["system_prompt"])
+        return "What single human decision would most change the implementation path?"
+
+    handle_ouro_intake_command(
+        'goal:"Improve existing gateway intake" project:bo tenant:kanban context:"Hermes gateway existing runtime"',
+        actor="tester",
+        question_generator=fake_runtime_generator,
+    )
+
+    assert len(seen_prompts) == 1
+    prompt = seen_prompts[0]
+    assert "## Upstream Interview Skill — UX Authority" in prompt
+    assert "MCP (question generator) ←→ You (answerer + router) ←→ User (human judgment only)" in prompt
+    assert "When in doubt, use PATH 2" in prompt
+    assert "## Upstream Seed Closer" in prompt

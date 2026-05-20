@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -201,7 +202,37 @@ def _build_perspective_panel_prompt(state: InterviewState) -> str:
     ])
 
 
-def build_toolless_question_prompt(state: InterviewState, *, max_chars: int = 3500) -> dict[str, Any]:
+def _vendored_text(relative_path: str) -> tuple[str, str]:
+    """Read a vendored upstream interview UX authority document."""
+
+    root = Path(__file__).resolve().parents[1]
+    path = root / relative_path
+    return str(path), path.read_text(encoding="utf-8")
+
+
+def _upstream_interview_ux_authority_prompt() -> tuple[str, dict[str, str]]:
+    """Return the actual vendored upstream interview skill/prompt assets."""
+
+    skill_path, skill_text = _vendored_text("skills/interview/SKILL.md")
+    interviewer_path, interviewer_text = _vendored_text("agents/socratic-interviewer.md")
+    closer_path, closer_text = _vendored_text("agents/seed-closer.md")
+    prompt = (
+        "## Upstream Interview Skill — UX Authority\n"
+        "The interview UX must follow this vendored upstream skill contract. Hermes may adapt IO and authority boundaries, but should not invent a separate local interview policy.\n\n"
+        f"```markdown\n{skill_text}\n```\n\n"
+        "## Upstream Socratic Interviewer\n"
+        f"```markdown\n{interviewer_text}\n```\n\n"
+        "## Upstream Seed Closer\n"
+        f"```markdown\n{closer_text}\n```"
+    )
+    return prompt, {
+        "skill_contract_source": skill_path,
+        "socratic_interviewer_source": interviewer_path,
+        "seed_closer_source": closer_path,
+    }
+
+
+def build_toolless_question_prompt(state: InterviewState, *, max_chars: int = 60000) -> dict[str, Any]:
     """Build the vendored upstream question-generation contract without calling an LLM.
 
     This is the safe Hermes gateway equivalent of upstream `InterviewEngine.ask_next_question`'s
@@ -231,11 +262,14 @@ def build_toolless_question_prompt(state: InterviewState, *, max_chars: int = 35
     ambiguity = _build_ambiguity_snapshot_prompt(state)
     if ambiguity:
         dynamic_header += f"\n\n{ambiguity}"
-    prompt = f"{dynamic_header}\n{_TOOLLESS_INTERVIEW_BASE_PROMPT}\n\n{_build_perspective_panel_prompt(state)}"
+    upstream_ux_prompt, upstream_sources = _upstream_interview_ux_authority_prompt()
+    prompt = f"{dynamic_header}\n{upstream_ux_prompt}\n\n{_TOOLLESS_INTERVIEW_BASE_PROMPT}\n\n{_build_perspective_panel_prompt(state)}"
     if len(prompt) > max_chars:
         prompt = prompt[:max_chars]
     return {
         "source": "vendored_q00_ouroboros_interview_prompt_contract",
+        "ux_authority": "vendored_upstream_interview_skill",
+        **upstream_sources,
         "round_number": effective_round_number,
         "is_brownfield": state.is_brownfield,
         "system_prompt": prompt,
