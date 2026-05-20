@@ -17,10 +17,22 @@ from hermes_constants import get_hermes_home
 
 AUTOPILOT_STATE_FILE = "gateway_autopilot_state.json"
 AUTOPILOT_STATE_VERSION = 2
-AUTOPILOT_USAGE = "/autopilot [status|dry-run|on|pause [reason]|off|stop|focus <BO-123>]"
-_READ_ONLY_ACTIONS = {"status", "dry-run", "dry_run"}
+AUTOPILOT_USAGE = "/autopilot [status|dry-run|queue|on|pause [reason]|off|stop|focus <BO-123>]"
+_READ_ONLY_ACTIONS = {"status", "dry-run", "dry_run", "queue"}
 _CONTROL_ACTIONS = {"on", "off", "stop", "pause", "focus", "once"}
 _MUTATIONS_ATTEMPTED: list[str] = []
+_READY_GATE_REQUIREMENTS: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    ("missing_goal", ("goal:", "goal -", "objective:"), "goal"),
+    ("missing_end_state", ("end-state", "end state", "output:", "deliverable"), "end-state/output"),
+    ("missing_scope_non_goals", ("scope/non-goals", "non-goals", "non goals", "out of scope"), "scope/non-goals"),
+    ("missing_acceptance_criteria", ("acceptance criteria", "acceptance:"), "acceptance criteria"),
+    ("missing_verification_requirements", ("verification requirements", "verification:", "tests_run", "test:"), "verification requirements"),
+    ("missing_authority_boundary", ("authority boundary", "authority:", "kanban"), "authority boundary"),
+    ("missing_repo_lane_truth", ("repo/lane truth", "repo_full_name", "repository", "branch"), "repo/lane truth"),
+    ("missing_risk_flags", ("risk flags", "risk:", "env", "secret", "prod", "customer-visible", "restart"), "risk flags"),
+    ("missing_dependencies_blockers", ("dependencies/blockers", "dependencies:", "blockers:", "none"), "dependencies/blockers"),
+    ("missing_review_package_expectation", ("review package", "review_ready", "changed files", "commit"), "review package expectation"),
+)
 
 
 @dataclass(frozen=True)
@@ -110,7 +122,7 @@ def parse_autopilot_args(raw_args: str) -> AutopilotCommand:
     value = parts[1].strip() if len(parts) > 1 else ""
     if action == "dry_run":
         action = "dry-run"
-    if action in {"status", "dry-run", "on", "off", "stop", "pause", "focus", "once"}:
+    if action in {"status", "dry-run", "queue", "on", "off", "stop", "pause", "focus", "once"}:
         return AutopilotCommand(action=action, raw_args=raw, value=value)
     raise ValueError(f"unsupported /autopilot command: {raw_args!r}; usage: {AUTOPILOT_USAGE}")
 
@@ -128,6 +140,81 @@ def _effective_mode(desired_mode: str, state: dict[str, Any]) -> str:
     if state.get("read_error"):
         return "degraded"
     return "degraded"
+
+
+def evaluate_autopilot_ready_gate(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Return a dry-run Ready-gate verdict for one Kanban candidate.
+
+    This deliberately treats raw Kanban ``status=ready`` as insufficient.  The
+    candidate must carry an executable contract before a later autopilot phase
+    may even consider selection.  The function is pure/read-only: no dispatcher,
+    claim, spawn, or Kanban mutation calls are made here.
+    """
+
+    body = str(candidate.get("body") or "")
+    title = str(candidate.get("title") or "")
+    haystack = "\n".join([title, body, json.dumps(candidate, ensure_ascii=False, sort_keys=True)]).lower()
+    reason_codes: list[str] = []
+    missing_labels: list[str] = []
+    if str(candidate.get("status") or "").lower() != "ready":
+        reason_codes.append("kanban_status_not_ready")
+        missing_labels.append("Kanban status=ready")
+    for code, markers, label in _READY_GATE_REQUIREMENTS:
+        if not any(marker in haystack for marker in markers):
+            reason_codes.append(code)
+            missing_labels.append(label)
+    routing = candidate.get("routing_verdict") or {}
+    if isinstance(routing, str):
+        try:
+            routing = json.loads(routing)
+        except json.JSONDecodeError:
+            routing = {"raw": routing}
+    verdict = str((routing or {}).get("verdict") or "").strip().lower()
+    if not verdict:
+        reason_codes.append("missing_routing_verdict")
+        missing_labels.append("routing verdict")
+    accepted = not reason_codes
+    return {
+        "task_id": candidate.get("id"),
+        "public_id": candidate.get("public_id"),
+        "autopilot_ready": accepted,
+        "status": "accepted" if accepted else "rejected",
+        "reason_codes": reason_codes,
+        "human_reason": "ready for autopilot dry-run selection" if accepted else "Missing executable contract fields: " + ", ".join(missing_labels),
+        "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0},
+    }
+
+
+def _queue_decision(command: AutopilotCommand, *, actor: Optional[str], candidates: Optional[list[dict[str, Any]]]) -> dict[str, Any]:
+    results = [evaluate_autopilot_ready_gate(candidate) for candidate in (candidates or [])]
+    return {
+        "action": command.action,
+        "actor": actor,
+        "read_only": True,
+        "status": "DRY_RUN",
+        "reason": "phase2_ready_gate_dry_run_no_execution_authority",
+        "candidates": results,
+        "accepted_count": sum(1 for result in results if result["autopilot_ready"]),
+        "rejected_count": sum(1 for result in results if not result["autopilot_ready"]),
+        "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0},
+        "mutations_attempted": list(_MUTATIONS_ATTEMPTED),
+        "state_file_enabled_is_execution_proof": False,
+    }
+
+
+def _format_queue_message(decision: dict[str, Any]) -> str:
+    lines = [
+        "Autopilot queue dry-run: READY-GATE ONLY",
+        f"accepted={decision['accepted_count']}",
+        f"rejected={decision['rejected_count']}",
+        "No dispatch, claim, worker spawn, or Kanban mutation was attempted.",
+    ]
+    for candidate in decision.get("candidates") or []:
+        lines.append(
+            f"- {candidate.get('public_id') or candidate.get('task_id')}: {candidate['status']} "
+            f"({', '.join(candidate['reason_codes']) or 'ok'})"
+        )
+    return "\n".join(lines)
 
 
 def _status_decision(command: AutopilotCommand, *, actor: Optional[str] = None) -> dict[str, Any]:
@@ -229,8 +316,13 @@ def _control_decision(command: AutopilotCommand, *, actor: Optional[str] = None)
     }
 
 
-def handle_autopilot_command(raw_args: str = "", *, actor: Optional[str] = None) -> AutopilotResult:
-    """Handle /autopilot without execution authority in Phase 1."""
+def handle_autopilot_command(
+    raw_args: str = "",
+    *,
+    actor: Optional[str] = None,
+    candidates: Optional[list[dict[str, Any]]] = None,
+) -> AutopilotResult:
+    """Handle /autopilot without execution authority in Phase 2."""
 
     try:
         command = parse_autopilot_args(raw_args)
@@ -242,6 +334,10 @@ def handle_autopilot_command(raw_args: str = "", *, actor: Optional[str] = None)
             decision={"status": "BLOCKED", "reason": "parse_error", "mutations_attempted": []},
             fail_closed=True,
         )
+
+    if command.action == "queue":
+        decision = _queue_decision(command, actor=actor, candidates=candidates)
+        return AutopilotResult(True, command, _format_queue_message(decision), decision, False)
 
     if command.action in _READ_ONLY_ACTIONS:
         decision = _status_decision(command, actor=actor)

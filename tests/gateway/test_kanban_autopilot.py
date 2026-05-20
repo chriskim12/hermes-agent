@@ -116,3 +116,83 @@ def test_autopilot_stop_clears_enabled_without_claiming_runtime_proof(tmp_path, 
     state = json.loads((tmp_path / "gateway_autopilot_state.json").read_text(encoding="utf-8"))
     assert state["desired_mode"] == "stopped"
     assert state["enabled"] is False
+
+
+def test_ready_gate_rejects_raw_kanban_ready_without_executable_contract():
+    from gateway.kanban_autopilot import evaluate_autopilot_ready_gate
+
+    candidate = {
+        "id": "t_raw",
+        "public_id": "BO-999",
+        "status": "ready",
+        "title": "raw ready task",
+        "body": "Please handle this later.",
+    }
+
+    result = evaluate_autopilot_ready_gate(candidate)
+
+    assert result["autopilot_ready"] is False
+    assert result["status"] == "rejected"
+    assert "missing_goal" in result["reason_codes"]
+    assert "missing_acceptance_criteria" in result["reason_codes"]
+    assert "missing_verification_requirements" in result["reason_codes"]
+    assert result["human_reason"]
+
+
+def test_ready_gate_accepts_native_contract_but_never_claims_or_spawns(monkeypatch):
+    from gateway import kanban_autopilot
+
+    calls: list[str] = []
+
+    def forbidden(*_args, **_kwargs):
+        calls.append("forbidden")
+        raise AssertionError("ready-gate dry-run must not claim, spawn, dispatch, or mutate Kanban")
+
+    monkeypatch.setattr(kanban_autopilot, "dispatch_once", forbidden, raising=False)
+    monkeypatch.setattr(kanban_autopilot, "claim_task", forbidden, raising=False)
+    monkeypatch.setattr(kanban_autopilot, "spawn_worker", forbidden, raising=False)
+    monkeypatch.setattr(kanban_autopilot, "mutate_kanban", forbidden, raising=False)
+    candidate = {
+        "id": "t_good",
+        "public_id": "BO-100",
+        "status": "ready",
+        "title": "Implement bounded thing",
+        "body": """
+Goal: implement a bounded local validator.
+End-state/output: local commit candidate and Kanban evidence.
+Scope/non-goals: no gateway restart and no production action.
+Acceptance criteria: validator returns machine-readable reason codes.
+Verification requirements: focused tests and git diff --check.
+Authority boundary: Kanban BO-100 controls execution; PR/push forbidden.
+Repo/lane truth: chriskim12/hermes-agent on a task branch.
+Risk flags: no env, secret, prod, billing, customer-visible, or restart action.
+Dependencies/blockers: none.
+Review package expectation: changed files, tests, commit, boundaries.
+""",
+        "routing_verdict": {"verdict": "Hermes direct"},
+        "admission_snapshot": {"repo_full_name": "chriskim12/hermes-agent"},
+    }
+
+    result = kanban_autopilot.evaluate_autopilot_ready_gate(candidate)
+
+    assert result["autopilot_ready"] is True
+    assert result["status"] == "accepted"
+    assert result["reason_codes"] == []
+    assert result["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0}
+    assert calls == []
+
+
+def test_autopilot_queue_dry_run_reports_gate_results_without_spawning(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import handle_autopilot_command
+
+    result = handle_autopilot_command("queue", actor="tester", candidates=[
+        {"id": "t_raw", "public_id": "BO-999", "status": "ready", "title": "raw", "body": "raw"}
+    ])
+
+    assert result.ok is True
+    assert result.decision["read_only"] is True
+    assert result.decision["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0}
+    assert result.decision["candidates"][0]["autopilot_ready"] is False
+    assert "missing_goal" in result.decision["candidates"][0]["reason_codes"]
