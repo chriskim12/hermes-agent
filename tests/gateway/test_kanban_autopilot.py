@@ -674,3 +674,47 @@ def test_operator_report_explains_zero_work():
     assert report["summary"]["zero_work"] is True
     assert "zero work" in report["text"].lower()
     assert "no_progress" in report["text"]
+
+
+def test_policy_hardening_rejects_forbidden_authority_expansion():
+    from gateway.kanban_autopilot import get_closed_loop_operating_contract, harden_autopilot_policy
+
+    contract = get_closed_loop_operating_contract()
+    unsafe = {
+        **contract,
+        "authority_ceiling": "merge_release_deploy",
+        "dispatcher_boundary": {**contract["dispatcher_boundary"], "autopilot_may_directly_claim_or_spawn": True},
+        "forbidden_without_current_approval": [],
+    }
+
+    result = harden_autopilot_policy(unsafe)
+
+    assert result["accepted"] is False
+    assert result["next_state"] == "hard_stopped"
+    assert "authority_ceiling_must_be_review_ready_pr" in result["reason_codes"]
+    assert "direct_claim_or_spawn_not_allowed" in result["reason_codes"]
+    assert result["recovery_required"] is True
+
+
+def test_recovery_drill_covers_stale_state_worker_failure_and_policy_violation():
+    from gateway.kanban_autopilot import run_autopilot_recovery_drill
+
+    result = run_autopilot_recovery_drill([
+        {"name": "stale_kanban", "trigger": "stale_kanban_state"},
+        {"name": "worker_timeout", "trigger": "worker_crash_or_timeout_repeated"},
+        {"name": "policy", "trigger": "policy_file_invalid_or_stale"},
+    ])
+
+    assert result["passed"] is True
+    assert [item["action"] for item in result["drills"]] == ["pause_and_reread_kanban", "pause_and_require_worker_evidence", "hard_stop_and_require_recovery_ack"]
+    assert result["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0}
+
+
+def test_recovery_drill_fails_unknown_trigger_closed():
+    from gateway.kanban_autopilot import run_autopilot_recovery_drill
+
+    result = run_autopilot_recovery_drill([{"name": "surprise", "trigger": "unknown_escape"}])
+
+    assert result["passed"] is False
+    assert result["drills"][0]["action"] == "hard_stop_and_require_human_triage"
+    assert result["next_state"] == "needs_human"

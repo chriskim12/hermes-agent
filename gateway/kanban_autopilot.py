@@ -491,6 +491,61 @@ def generate_autopilot_run_report(run: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def harden_autopilot_policy(contract: dict[str, Any]) -> dict[str, Any]:
+    """Fail-closed policy hardening gate for closed-loop Autopilot."""
+
+    validation = validate_closed_loop_policy_contract(contract)
+    accepted = bool(validation.get("ok"))
+    return {
+        "accepted": accepted,
+        "reason_codes": validation.get("reason_codes") or [],
+        "next_state": "continue" if accepted else "hard_stopped",
+        "recovery_required": not accepted,
+        "merge_allowed": False,
+        "release_allowed": False,
+        "prod_customer_visible_allowed": False,
+        "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
+    }
+
+
+_RECOVERY_ACTIONS = {
+    "stale_kanban_state": "pause_and_reread_kanban",
+    "kanban_read_unavailable": "pause_and_reread_kanban",
+    "worker_crash_or_timeout_repeated": "pause_and_require_worker_evidence",
+    "worker_completion_evidence_missing": "pause_and_require_worker_evidence",
+    "policy_file_invalid_or_stale": "hard_stop_and_require_recovery_ack",
+    "forbidden_action_requested": "hard_stop_and_require_recovery_ack",
+    "scope_ambiguity": "pause_and_require_scope_confirmation",
+    "budget_or_cap_exceeded": "pause_and_report_cap",
+    "pr_backlog_cap_exceeded": "pause_and_report_pr_backlog",
+}
+
+
+def run_autopilot_recovery_drill(scenarios: list[dict[str, Any]]) -> dict[str, Any]:
+    """Exercise fail-closed recovery decisions without executing side effects."""
+
+    drills: list[dict[str, Any]] = []
+    passed = True
+    for scenario in scenarios:
+        trigger = str(scenario.get("trigger") or "")
+        action = _RECOVERY_ACTIONS.get(trigger)
+        if action is None:
+            passed = False
+            action = "hard_stop_and_require_human_triage"
+        drills.append({
+            "name": scenario.get("name"),
+            "trigger": trigger,
+            "action": action,
+            "side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
+        })
+    return {
+        "passed": passed,
+        "drills": drills,
+        "next_state": "recovered" if passed else "needs_human",
+        "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
+    }
+
+
 @dataclass(frozen=True)
 class AutopilotCommand:
     """Parsed /autopilot command shape."""
