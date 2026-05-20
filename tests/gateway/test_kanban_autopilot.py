@@ -644,3 +644,33 @@ def test_scope_filter_marks_ambiguous_dependency_or_missing_scope_as_needs_human
     assert result["in_scope"] == []
     assert result["out_of_scope"][0]["reason_codes"] == ["hierarchy_dependency_ambiguous"]
     assert result["next_state"] == "needs_human"
+
+
+def test_operator_report_includes_selected_skipped_blocked_caps_and_next_state():
+    from gateway.kanban_autopilot import generate_autopilot_run_report
+
+    report = generate_autopilot_run_report({
+        "executed": [{"public_id": "BO-097"}],
+        "skipped": [{"public_id": "BO-098", "reason_codes": ["max_tasks_per_run_reached"]}],
+        "would_pause": [{"reason_code": "closeout_blocked"}],
+        "open_prs": ["https://github.com/chriskim12/hermes-agent/pull/1"],
+        "next_state": "needs_human",
+        "caps": {"max_tasks_per_run": 2},
+    })
+
+    assert report["summary"]["executed_count"] == 1
+    assert report["summary"]["skipped_count"] == 1
+    assert report["summary"]["blocked_count"] == 1
+    assert report["summary"]["next_state"] == "needs_human"
+    assert "BO-097" in report["text"]
+    assert "max_tasks_per_run_reached" in report["text"]
+
+
+def test_operator_report_explains_zero_work():
+    from gateway.kanban_autopilot import generate_autopilot_run_report
+
+    report = generate_autopilot_run_report({"executed": [], "skipped": [], "would_pause": [{"reason_code": "no_progress"}], "next_state": "needs_human"})
+
+    assert report["summary"]["zero_work"] is True
+    assert "zero work" in report["text"].lower()
+    assert "no_progress" in report["text"]

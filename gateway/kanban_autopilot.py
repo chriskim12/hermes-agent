@@ -457,6 +457,40 @@ def filter_candidates_for_scope(candidates: list[dict[str, Any]], scope: dict[st
     }
 
 
+def generate_autopilot_run_report(run: dict[str, Any]) -> dict[str, Any]:
+    """Generate a compact operator-readable Autopilot run report."""
+
+    executed = run.get("executed") or run.get("would_select") or []
+    skipped = run.get("skipped") or run.get("would_skip") or []
+    blocked = run.get("would_pause") or []
+    open_prs = run.get("open_prs") or []
+    next_state = run.get("next_state") or "unknown"
+    lines = ["Autopilot run report", f"next_state={next_state}"]
+    if executed:
+        lines.append("executed=" + ",".join(str(item.get("public_id") or item.get("task_id")) for item in executed))
+    else:
+        lines.append("zero work executed")
+    if skipped:
+        lines.append("skipped=" + ",".join(f"{item.get('public_id') or item.get('task_id')}:{'/'.join(item.get('reason_codes') or [])}" for item in skipped))
+    if blocked:
+        lines.append("blocked=" + ",".join(str(item.get("reason_code")) for item in blocked))
+    if open_prs:
+        lines.append("open_prs=" + ",".join(open_prs))
+    if run.get("caps"):
+        lines.append("caps=" + json.dumps(run.get("caps"), sort_keys=True))
+    return {
+        "summary": {
+            "executed_count": len(executed),
+            "skipped_count": len(skipped),
+            "blocked_count": len(blocked),
+            "open_pr_count": len(open_prs),
+            "next_state": next_state,
+            "zero_work": len(executed) == 0,
+        },
+        "text": "\n".join(lines),
+    }
+
+
 @dataclass(frozen=True)
 class AutopilotCommand:
     """Parsed /autopilot command shape."""
