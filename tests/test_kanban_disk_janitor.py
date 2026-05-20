@@ -315,8 +315,9 @@ def test_kanban_db_done_workspace_with_evidence_can_make_allowlisted_artifact_sa
     hermes_home = tmp_path / ".hermes"
     workspaces = hermes_home / "kanban" / "workspaces"
     workspace = workspaces / "BO-075"
+    (workspace / ".git").mkdir(parents=True)
     artifact = workspace / "node_modules"
-    artifact.mkdir(parents=True)
+    artifact.mkdir()
     (artifact / "pkg.js").write_text("x")
     db_path = tmp_path / "kanban.db"
     create_kanban_db(
@@ -477,8 +478,9 @@ def test_kanban_db_fallback_name_mapping_is_explanatory_not_auto_cleanable(tmp_p
     mod = load_janitor()
     workspaces = tmp_path / "workspaces"
     workspace = workspaces / "BO-080"
+    (workspace / ".git").mkdir(parents=True)
     artifact = workspace / "node_modules"
-    artifact.mkdir(parents=True)
+    artifact.mkdir()
     db_path = tmp_path / "kanban.db"
     create_kanban_db(
         db_path,
@@ -522,3 +524,220 @@ def test_archived_task_state_does_not_satisfy_terminal_cleanup_gate(tmp_path, mo
 
     assert result.state == "blocked-active"
     assert result.gates["task_terminal_state_done_cancelled_superseded"] is False
+
+
+def test_nested_repo_node_modules_can_be_safe_artifact_candidate(tmp_path, monkeypatch):
+    mod = load_janitor()
+    hermes_home = tmp_path / ".hermes"
+    workspaces = hermes_home / "kanban" / "workspaces"
+    workspace = workspaces / "BO-081"
+    repo = workspace / "dailychingu"
+    (repo / ".git").mkdir(parents=True)
+    artifact = repo / "node_modules"
+    artifact.mkdir()
+    (artifact / "pkg.js").write_text("x")
+    db_path = tmp_path / "kanban.db"
+    create_kanban_db(
+        db_path,
+        [{
+            "id": "task-81",
+            "public_id": "BO-081",
+            "status": "done",
+            "completed_at": 1_778_342_400,
+            "workspace_path": str(workspace),
+            "closeout_evidence": {"final_summary": "done", "tests": ["unit"]},
+        }],
+    )
+
+    git_paths = []
+
+    def fake_git_state(path):
+        git_paths.append(path)
+        return False, False
+
+    monkeypatch.setattr(mod, "git_state", fake_git_state)
+
+    args = mod.build_parser().parse_args([
+        "--format", "json",
+        "--hermes-home", str(hermes_home),
+        "--workspaces-root", str(workspaces),
+        "--worktrees-root", str(tmp_path / "worktrees"),
+        "--sessions-root", str(tmp_path / "sessions"),
+        "--tmp-root", str(tmp_path / "tmp"),
+        "--docker-root", str(tmp_path / "docker"),
+        "--containerd-root", str(tmp_path / "containerd"),
+        "--kanban-db", str(db_path),
+        "--now", "2026-05-20T00:00:00Z",
+        "--no-live-checks",
+    ])
+
+    report = mod.build_report(args)
+
+    workspace_report = report["kanban_workspaces"][0]
+    assert git_paths == [repo]
+    assert workspace_report["repo_discovery"]["selected_repo_root"] == str(repo)
+    assert workspace_report["metadata_evidence"]["git_state_source"] == str(repo)
+    assert workspace_report["artifact_discovery"]["artifact_paths"] == [str(artifact)]
+    assert workspace_report["artifact_candidates"][0]["path"] == str(artifact)
+    assert workspace_report["artifact_candidates"][0]["state"] == "safe-artifact-candidate"
+    assert report["candidate_counts"]["safe-artifact-candidate"] == 1
+
+
+def test_multiple_nested_repos_make_git_state_unknown_and_approval_required(tmp_path, monkeypatch):
+    mod = load_janitor()
+    hermes_home = tmp_path / ".hermes"
+    workspaces = hermes_home / "kanban" / "workspaces"
+    workspace = workspaces / "BO-082"
+    (workspace / "repo-a" / ".git").mkdir(parents=True)
+    (workspace / "repo-b" / ".git").mkdir(parents=True)
+    artifact = workspace / "node_modules"
+    artifact.mkdir()
+    db_path = tmp_path / "kanban.db"
+    create_kanban_db(
+        db_path,
+        [{
+            "id": "task-82",
+            "public_id": "BO-082",
+            "status": "done",
+            "completed_at": 1_778_342_400,
+            "workspace_path": str(workspace),
+            "closeout_evidence": {"final_summary": "done"},
+        }],
+    )
+
+    def fail_if_called(path):  # pragma: no cover - asserted by no call
+        raise AssertionError(f"git_state should not be called for ambiguous repos: {path}")
+
+    monkeypatch.setattr(mod, "git_state", fail_if_called)
+
+    args = mod.build_parser().parse_args([
+        "--format", "json",
+        "--hermes-home", str(hermes_home),
+        "--workspaces-root", str(workspaces),
+        "--worktrees-root", str(tmp_path / "worktrees"),
+        "--sessions-root", str(tmp_path / "sessions"),
+        "--tmp-root", str(tmp_path / "tmp"),
+        "--docker-root", str(tmp_path / "docker"),
+        "--containerd-root", str(tmp_path / "containerd"),
+        "--kanban-db", str(db_path),
+        "--now", "2026-05-20T00:00:00Z",
+        "--no-live-checks",
+    ])
+
+    report = mod.build_report(args)
+
+    workspace_report = report["kanban_workspaces"][0]
+    assert workspace_report["repo_discovery"]["status"] == "multiple"
+    assert workspace_report["metadata"]["git_dirty"] is None
+    assert workspace_report["metadata"]["important_untracked"] is None
+    assert (
+        workspace_report["metadata_evidence"]["git_state_reason"]
+        == "multiple repository roots found; git state is ambiguous"
+    )
+    artifact_candidate = workspace_report["artifact_candidates"][0]
+    assert artifact_candidate["path"] == str(artifact)
+    assert artifact_candidate["state"] == "approval-required"
+    assert "git dirty state is dirty or unknown" in "; ".join(artifact_candidate["reasons"])
+
+
+def test_missing_repo_root_keeps_git_state_unknown_and_approval_required(tmp_path, monkeypatch):
+    mod = load_janitor()
+    hermes_home = tmp_path / ".hermes"
+    workspaces = hermes_home / "kanban" / "workspaces"
+    workspace = workspaces / "BO-084"
+    artifact = workspace / "node_modules"
+    artifact.mkdir(parents=True)
+    db_path = tmp_path / "kanban.db"
+    create_kanban_db(
+        db_path,
+        [{
+            "id": "task-84",
+            "public_id": "BO-084",
+            "status": "done",
+            "completed_at": 1_778_342_400,
+            "workspace_path": str(workspace),
+            "closeout_evidence": {"final_summary": "done"},
+        }],
+    )
+
+    def fail_if_called(path):  # pragma: no cover - asserted by no call
+        raise AssertionError(f"git_state should not be called without a repo root: {path}")
+
+    monkeypatch.setattr(mod, "git_state", fail_if_called)
+
+    args = mod.build_parser().parse_args([
+        "--format", "json",
+        "--hermes-home", str(hermes_home),
+        "--workspaces-root", str(workspaces),
+        "--worktrees-root", str(tmp_path / "worktrees"),
+        "--sessions-root", str(tmp_path / "sessions"),
+        "--tmp-root", str(tmp_path / "tmp"),
+        "--docker-root", str(tmp_path / "docker"),
+        "--containerd-root", str(tmp_path / "containerd"),
+        "--kanban-db", str(db_path),
+        "--now", "2026-05-20T00:00:00Z",
+        "--no-live-checks",
+    ])
+
+    report = mod.build_report(args)
+
+    workspace_report = report["kanban_workspaces"][0]
+    assert workspace_report["repo_discovery"]["status"] == "none"
+    assert workspace_report["metadata"]["git_dirty"] is None
+    assert workspace_report["metadata"]["important_untracked"] is None
+    assert (
+        workspace_report["metadata_evidence"]["git_state_reason"]
+        == "no repository root found at workspace root or direct children"
+    )
+    artifact_candidate = workspace_report["artifact_candidates"][0]
+    assert artifact_candidate["state"] == "approval-required"
+    assert "git dirty state is dirty or unknown" in "; ".join(artifact_candidate["reasons"])
+
+
+def test_large_nested_non_allowlisted_dir_is_not_artifact_candidate(tmp_path, monkeypatch):
+    mod = load_janitor()
+    hermes_home = tmp_path / ".hermes"
+    workspaces = hermes_home / "kanban" / "workspaces"
+    workspace = workspaces / "BO-083"
+    repo = workspace / "dailychingu"
+    (repo / ".git").mkdir(parents=True)
+    non_allowlisted = repo / "uploaded-assets"
+    non_allowlisted.mkdir()
+    (non_allowlisted / "blob.bin").write_text("x" * 1024)
+    db_path = tmp_path / "kanban.db"
+    create_kanban_db(
+        db_path,
+        [{
+            "id": "task-83",
+            "public_id": "BO-083",
+            "status": "done",
+            "completed_at": 1_778_342_400,
+            "workspace_path": str(workspace),
+            "closeout_evidence": {"final_summary": "done"},
+        }],
+    )
+    monkeypatch.setattr(mod, "git_state", lambda path: (False, False))
+
+    args = mod.build_parser().parse_args([
+        "--format", "json",
+        "--hermes-home", str(hermes_home),
+        "--workspaces-root", str(workspaces),
+        "--worktrees-root", str(tmp_path / "worktrees"),
+        "--sessions-root", str(tmp_path / "sessions"),
+        "--tmp-root", str(tmp_path / "tmp"),
+        "--docker-root", str(tmp_path / "docker"),
+        "--containerd-root", str(tmp_path / "containerd"),
+        "--kanban-db", str(db_path),
+        "--large-threshold-bytes", "1",
+        "--now", "2026-05-20T00:00:00Z",
+        "--no-live-checks",
+    ])
+
+    report = mod.build_report(args)
+
+    workspace_report = report["kanban_workspaces"][0]
+    assert workspace_report["artifact_discovery"]["artifact_paths"] == []
+    assert workspace_report["artifact_candidates"] == []
+    assert non_allowlisted.name not in {
+        Path(path).name for path in workspace_report["artifact_discovery"]["artifact_paths"]
+    }

@@ -103,6 +103,9 @@ class WorkspaceMetadata:
     mapping_reasons: list[str] = field(default_factory=list)
     matched_task_count: int = 0
     non_allowlisted_large_files: bool = False
+    git_state_source: str | None = None
+    git_state_reason: str | None = None
+    repo_root: str | None = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +135,17 @@ class SizeBreakdown:
     build_test_cache_bytes: int = 0
     other_large_entries: list[dict[str, Any]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class RepoDiscovery:
+    """Bounded repository discovery evidence for a workspace envelope."""
+
+    workspace_path: str
+    repo_roots: list[str]
+    selected_repo_root: str | None
+    status: str
+    reason: str
 
 
 @dataclass
@@ -269,6 +283,79 @@ def workspace_size_breakdown(path: Path, *, large_threshold_bytes: int = 100 * 1
                 "bytes": size,
             })
     return breakdown
+
+
+def discover_repo_roots(workspace: Path) -> RepoDiscovery:
+    """Detect only the workspace root or direct-child repository roots.
+
+    Kanban workspaces are often envelopes containing a single checkout. This is
+    intentionally not a recursive search: deep repo discovery can be expensive
+    and could accidentally bind cleanup decisions to an unrelated nested repo.
+    """
+    repo_roots: list[Path] = []
+    if (workspace / ".git").exists():
+        repo_roots.append(workspace)
+    try:
+        children = list(workspace.iterdir())
+    except OSError as exc:
+        return RepoDiscovery(
+            workspace_path=str(workspace),
+            repo_roots=[],
+            selected_repo_root=None,
+            status="unreadable",
+            reason=f"workspace children unreadable: {exc}",
+        )
+
+    for child in children:
+        if child.is_dir() and not child.is_symlink() and (child / ".git").exists():
+            repo_roots.append(child)
+
+    unique_roots = sorted({_path_key(root): root for root in repo_roots}.values(), key=lambda item: str(item))
+    if len(unique_roots) == 1:
+        selected = unique_roots[0]
+        return RepoDiscovery(
+            workspace_path=str(workspace),
+            repo_roots=[str(selected)],
+            selected_repo_root=str(selected),
+            status="single",
+            reason="exactly one repository root found at workspace root or direct child",
+        )
+    if not unique_roots:
+        return RepoDiscovery(
+            workspace_path=str(workspace),
+            repo_roots=[],
+            selected_repo_root=None,
+            status="none",
+            reason="no repository root found at workspace root or direct children",
+        )
+    return RepoDiscovery(
+        workspace_path=str(workspace),
+        repo_roots=[str(root) for root in unique_roots],
+        selected_repo_root=None,
+        status="multiple",
+        reason="multiple repository roots found; git state is ambiguous",
+    )
+
+
+def discover_artifact_paths(workspace: Path, repo_discovery: RepoDiscovery) -> list[Path]:
+    """Return existing allowlisted artifacts at the envelope and selected repo root."""
+    artifacts: dict[str, Path] = {}
+    for root in artifact_search_roots(workspace, repo_discovery):
+        for name in sorted(ALLOWLISTED_ARTIFACT_NAMES):
+            artifact = root / name
+            if artifact.exists() and not artifact.is_symlink():
+                artifacts[_path_key(artifact)] = artifact
+    return sorted(artifacts.values(), key=lambda item: str(item))
+
+
+def artifact_search_roots(workspace: Path, repo_discovery: RepoDiscovery) -> list[Path]:
+    roots = [workspace]
+    if not repo_discovery.selected_repo_root:
+        return roots
+    repo_root = Path(repo_discovery.selected_repo_root)
+    if _path_key(repo_root) != _path_key(workspace):
+        roots.append(repo_root)
+    return roots
 
 
 def load_metadata(path: Path | None) -> dict[str, WorkspaceMetadata]:
@@ -678,6 +765,9 @@ def classify_candidate(
         "active_run_status": metadata.active_run_status,
         "allowlisted_reproducible_artifact": is_allowlisted_artifact,
         "non_allowlisted_large_files": metadata.non_allowlisted_large_files,
+        "git_state_source": metadata.git_state_source,
+        "git_state_reason": metadata.git_state_reason,
+        "repo_root": metadata.repo_root,
     }
 
     reasons: list[str] = []
@@ -717,7 +807,7 @@ def classify_candidate(
         approval_reasons.append("artifact TTL below 48h")
     if kind == "workspace" and terminal_age is not None and terminal_age < WORKSPACE_TTL:
         approval_reasons.append("workspace TTL below 7d")
-    if metadata.non_allowlisted_large_files:
+    if kind == "workspace" and metadata.non_allowlisted_large_files:
         approval_reasons.append("workspace contains non-allowlisted large files")
     if approval_reasons:
         return CandidateAssessment(str(path), kind, "approval-required", approval_reasons, gates, estimated_size_bytes, metadata.task_id)
@@ -763,22 +853,59 @@ def discover_workspaces(workspaces_root: Path) -> list[Path]:
         return []
 
 
-def enrich_metadata(path: Path, metadata: WorkspaceMetadata, *, live_checks: bool) -> WorkspaceMetadata:
+def enrich_metadata(
+    path: Path,
+    metadata: WorkspaceMetadata,
+    *,
+    live_checks: bool,
+    repo_discovery: RepoDiscovery | None = None,
+) -> WorkspaceMetadata:
     dirty = metadata.git_dirty
     important_untracked = metadata.important_untracked
+    git_state_source = metadata.git_state_source
+    git_state_reason = metadata.git_state_reason
+    repo_root = metadata.repo_root
     if dirty is None or important_untracked is None:
-        detected_dirty, detected_untracked = git_state(path)
+        repo_discovery = repo_discovery or discover_repo_roots(path)
+        if repo_discovery.selected_repo_root:
+            repo_path = Path(repo_discovery.selected_repo_root)
+            detected_dirty, detected_untracked = git_state(repo_path)
+            git_state_source = str(repo_path)
+            git_state_reason = (
+                "computed from the single repository root in this workspace"
+                if detected_dirty is not None and detected_untracked is not None
+                else "single repository root found, but git status could not be read"
+            )
+            repo_root = str(repo_path)
+        else:
+            detected_dirty, detected_untracked = None, None
+            git_state_source = None
+            git_state_reason = repo_discovery.reason
+            repo_root = None
         dirty = dirty if dirty is not None else detected_dirty
         important_untracked = important_untracked if important_untracked is not None else detected_untracked
+    elif git_state_source is None:
+        git_state_source = "metadata"
+        git_state_reason = git_state_reason or "git state supplied by workspace metadata"
     if not live_checks:
         return WorkspaceMetadata(
-            **{**asdict(metadata), "git_dirty": dirty, "important_untracked": important_untracked}
+            **{
+                **asdict(metadata),
+                "git_dirty": dirty,
+                "important_untracked": important_untracked,
+                "git_state_source": git_state_source,
+                "git_state_reason": git_state_reason,
+                "repo_root": repo_root,
+            }
         )
     return WorkspaceMetadata(
         **{
             **asdict(metadata),
             "git_dirty": dirty,
             "important_untracked": important_untracked,
+            "git_state_source": git_state_source,
+            "git_state_reason": git_state_reason,
+            "repo_root": repo_root,
             "process_cwd_under_path": metadata.process_cwd_under_path or detect_process_cwd_under(path),
             "tmux_cwd_under_path": metadata.tmux_cwd_under_path or detect_tmux_cwd_under(path),
         }
@@ -812,23 +939,34 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     candidates: list[CandidateAssessment] = []
     for workspace in discovered_workspaces:
         raw_metadata = metadata_by_path.get(str(workspace), WorkspaceMetadata(owner_known=False))
-        metadata = enrich_metadata(workspace, raw_metadata, live_checks=not args.no_live_checks)
+        repo_discovery = discover_repo_roots(workspace)
+        metadata = enrich_metadata(
+            workspace,
+            raw_metadata,
+            live_checks=not args.no_live_checks,
+            repo_discovery=repo_discovery,
+        )
         breakdown = workspace_size_breakdown(workspace, large_threshold_bytes=args.large_threshold_bytes)
         metadata = WorkspaceMetadata(
             **{
                 **asdict(metadata),
-                "non_allowlisted_large_files": metadata.non_allowlisted_large_files or bool(breakdown.other_large_entries),
+                "non_allowlisted_large_files": (
+                    metadata.non_allowlisted_large_files
+                    or bool(breakdown.other_large_entries)
+                ),
             }
         )
-        artifact_paths = [
-            workspace / "node_modules",
-            workspace / ".next",
-            *(workspace / name for name in sorted(BUILD_CACHE_NAMES)),
+        artifact_paths = discover_artifact_paths(workspace, repo_discovery)
+        artifact_search_root_paths = [
+            str(root) for root in artifact_search_roots(workspace, repo_discovery)
         ]
+        artifact_discovery_reason = (
+            "searched workspace root plus selected repository root"
+            if len(artifact_search_root_paths) > 1
+            else "searched workspace root only"
+        )
         artifact_assessments = []
         for artifact in artifact_paths:
-            if not artifact.exists():
-                continue
             artifact_size, _ = safe_tree_size(artifact)
             assessment = classify_candidate(
                 artifact,
@@ -857,10 +995,26 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
                     "mapping_reasons": metadata.mapping_reasons,
                     "matched_task_count": metadata.matched_task_count,
                     "owner_known": metadata.owner_known,
+                    "git_state_source": metadata.git_state_source,
+                    "git_state_reason": metadata.git_state_reason,
+                    "repo_root": metadata.repo_root,
+                },
+                "repo_discovery": asdict(repo_discovery),
+                "artifact_discovery": {
+                    "search_roots": artifact_search_root_paths,
+                    "allowlisted_names": sorted(ALLOWLISTED_ARTIFACT_NAMES),
+                    "artifact_paths": [str(path) for path in artifact_paths],
+                    "reason": artifact_discovery_reason,
                 },
                 "size_breakdown": asdict(breakdown),
-                "artifact_candidates": [asdict(item) | {"auto_cleanable": item.auto_cleanable} for item in artifact_assessments],
-                "workspace_candidate": asdict(workspace_assessment) | {"auto_cleanable": workspace_assessment.auto_cleanable},
+                "artifact_candidates": [
+                    asdict(item) | {"auto_cleanable": item.auto_cleanable}
+                    for item in artifact_assessments
+                ],
+                "workspace_candidate": (
+                    asdict(workspace_assessment)
+                    | {"auto_cleanable": workspace_assessment.auto_cleanable}
+                ),
             }
         )
 
@@ -946,9 +1100,32 @@ def format_text_report(report: dict[str, Any]) -> str:
         breakdown = workspace["size_breakdown"]
         candidate = workspace["workspace_candidate"]
         evidence = workspace.get("metadata_evidence") or {}
-        lines.append(f"- {workspace['path']}: total {format_bytes(breakdown['total_bytes'])}; workspace state {candidate['state']}")
-        lines.append(f"  metadata: source={evidence.get('source')}, confidence={evidence.get('mapping_confidence')}, matches={evidence.get('matched_task_count')}")
-        lines.append(f"  node_modules={format_bytes(breakdown['node_modules_bytes'])}, .next={format_bytes(breakdown['next_bytes'])}, build/test caches={format_bytes(breakdown['build_test_cache_bytes'])}")
+        repo = workspace.get("repo_discovery") or {}
+        artifact_discovery = workspace.get("artifact_discovery") or {}
+        lines.append(
+            f"- {workspace['path']}: total {format_bytes(breakdown['total_bytes'])}; "
+            f"workspace state {candidate['state']}"
+        )
+        lines.append(
+            f"  metadata: source={evidence.get('source')}, "
+            f"confidence={evidence.get('mapping_confidence')}, "
+            f"matches={evidence.get('matched_task_count')}"
+        )
+        lines.append(
+            f"  repo discovery: status={repo.get('status')}, "
+            f"selected={repo.get('selected_repo_root')}, reason={repo.get('reason')}"
+        )
+        lines.append(
+            f"  git state: source={evidence.get('git_state_source')}, "
+            f"reason={evidence.get('git_state_reason')}"
+        )
+        lines.append(
+            f"  node_modules={format_bytes(breakdown['node_modules_bytes'])}, "
+            f".next={format_bytes(breakdown['next_bytes'])}, "
+            f"build/test caches={format_bytes(breakdown['build_test_cache_bytes'])}"
+        )
+        if artifact_discovery.get("artifact_paths"):
+            lines.append(f"  artifacts: {len(artifact_discovery['artifact_paths'])} allowlisted path(s) discovered")
         if candidate["reasons"]:
             lines.append(f"  reasons: {'; '.join(candidate['reasons'])}")
     return "\n".join(lines)
