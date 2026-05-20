@@ -266,3 +266,56 @@ def test_autopilot_queue_includes_dispatcher_eligibility_without_dispatching(tmp
     assert result.decision["dispatcher_eligibility"]["second_dispatcher_created"] is False
     assert result.decision["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0}
     assert calls == []
+
+
+def test_review_ready_contract_requires_pr_and_checks_without_merging():
+    from gateway.kanban_autopilot import evaluate_review_ready_contract
+
+    missing = evaluate_review_ready_contract({"work_id": "BO-081", "commit": "abc1234"})
+    assert missing["review_ready"] is False
+    assert "missing_pr_url" in missing["reason_codes"]
+    assert "missing_checks_passed" in missing["reason_codes"]
+    assert missing["merge_allowed"] is False
+    assert missing["release_allowed"] is False
+
+    satisfied = evaluate_review_ready_contract({
+        "work_id": "BO-081",
+        "repo_full_name": "chriskim12/hermes-agent",
+        "commit": "8f0cbc56db6498e16c628e42430dbd6156d99fb3",
+        "task_branch": "yuuka/bo-081-autopilot-review-ready-contract",
+        "pr_url": "https://github.com/chriskim12/hermes-agent/pull/123",
+        "pr_base": "main",
+        "pr_head": "yuuka/bo-081-autopilot-review-ready-contract",
+        "checks_passed": True,
+        "worktree_clean": True,
+        "kanban_worker_done": True,
+        "boundaries_confirmed": True,
+    })
+    assert satisfied["review_ready"] is True
+    assert satisfied["reason_codes"] == []
+    assert satisfied["merge_allowed"] is False
+    assert satisfied["release_allowed"] is False
+
+
+def test_review_ready_contract_rejects_wrong_repo_and_release_base():
+    from gateway.kanban_autopilot import evaluate_review_ready_contract
+
+    result = evaluate_review_ready_contract({
+        "work_id": "BO-081",
+        "repo_full_name": "evil/repo",
+        "commit": "8f0cbc56db6498e16c628e42430dbd6156d99fb3",
+        "task_branch": "feature",
+        "pr_url": "https://github.com/chriskim12/hermes-agent/pull/123",
+        "pr_base": "prod",
+        "pr_head": "other",
+        "checks_passed": True,
+        "worktree_clean": True,
+        "kanban_worker_done": True,
+        "boundaries_confirmed": True,
+    }, expected_repo_full_name="chriskim12/hermes-agent")
+
+    assert result["review_ready"] is False
+    assert "repo_full_name_mismatch" in result["reason_codes"]
+    assert "release_base_requires_separate_approval" in result["reason_codes"]
+    assert "pr_head_task_branch_mismatch" in result["reason_codes"]
+    assert result["merge_allowed"] is False

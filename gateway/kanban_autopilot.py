@@ -8,6 +8,7 @@ call the dispatcher, claim tasks, spawn workers, or mutate Kanban task state.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +34,9 @@ _READY_GATE_REQUIREMENTS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("missing_dependencies_blockers", ("dependencies/blockers", "dependencies:", "blockers:", "none"), "dependencies/blockers"),
     ("missing_review_package_expectation", ("review package", "review_ready", "changed files", "commit"), "review package expectation"),
 )
+_PR_URL_RE = re.compile(r"^https://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/pull/\d+/?$")
+_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
+_RELEASE_ONLY_BASES = {"prod", "production"}
 
 
 @dataclass(frozen=True)
@@ -182,6 +186,67 @@ def evaluate_autopilot_ready_gate(candidate: dict[str, Any]) -> dict[str, Any]:
         "reason_codes": reason_codes,
         "human_reason": "ready for autopilot dry-run selection" if accepted else "Missing executable contract fields: " + ", ".join(missing_labels),
         "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0},
+    }
+
+
+def evaluate_review_ready_contract(
+    evidence: dict[str, Any],
+    *,
+    expected_repo_full_name: str = "chriskim12/hermes-agent",
+) -> dict[str, Any]:
+    """Validate the review-ready PR package without allowing merge/release."""
+
+    reason_codes: list[str] = []
+    required = {
+        "repo_full_name": evidence.get("repo_full_name"),
+        "commit": evidence.get("commit") or evidence.get("head_sha"),
+        "task_branch": evidence.get("task_branch") or evidence.get("branch"),
+        "pr_url": evidence.get("pr_url"),
+        "pr_base": evidence.get("pr_base"),
+        "pr_head": evidence.get("pr_head"),
+    }
+    for field, value in required.items():
+        if not str(value or "").strip():
+            reason_codes.append(f"missing_{field}")
+    bool_required = {
+        "checks_passed": evidence.get("checks_passed"),
+        "worktree_clean": evidence.get("worktree_clean"),
+        "kanban_worker_done": evidence.get("kanban_worker_done"),
+        "boundaries_confirmed": evidence.get("boundaries_confirmed"),
+    }
+    for field, value in bool_required.items():
+        if value is not True:
+            reason_codes.append(f"missing_{field}")
+    commit = str(required["commit"] or "").strip()
+    if commit and not _SHA_RE.fullmatch(commit):
+        reason_codes.append("commit_not_sha_like")
+    pr_url = str(required["pr_url"] or "").strip()
+    pr_match = _PR_URL_RE.fullmatch(pr_url) if pr_url else None
+    if pr_url and not pr_match:
+        reason_codes.append("pr_url_not_github_pull_url")
+    if pr_match:
+        pr_repo = f"{pr_match.group('owner')}/{pr_match.group('repo')}".lower()
+        if pr_repo != expected_repo_full_name.lower():
+            reason_codes.append("pr_url_repo_mismatch")
+    repo = str(required["repo_full_name"] or "").strip().lower()
+    if repo and repo != expected_repo_full_name.lower():
+        reason_codes.append("repo_full_name_mismatch")
+    task_branch = str(required["task_branch"] or "").strip()
+    pr_head = str(required["pr_head"] or "").strip()
+    if task_branch and pr_head and task_branch != pr_head:
+        reason_codes.append("pr_head_task_branch_mismatch")
+    pr_base = str(required["pr_base"] or "").strip().lower()
+    if pr_base in _RELEASE_ONLY_BASES:
+        reason_codes.append("release_base_requires_separate_approval")
+    return {
+        "review_ready": not reason_codes,
+        "status": "review_ready" if not reason_codes else "blocked",
+        "reason_codes": reason_codes,
+        "merge_allowed": False,
+        "release_allowed": False,
+        "prod_customer_visible_allowed": False,
+        "gateway_restart_reload_allowed": False,
+        "human_reason": "review-ready PR contract satisfied; merge/release still forbidden" if not reason_codes else "Review-ready PR contract missing or unsafe: " + ", ".join(reason_codes),
     }
 
 
