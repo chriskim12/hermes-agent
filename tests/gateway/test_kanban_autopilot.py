@@ -584,3 +584,35 @@ def test_closeout_progress_gate_allows_explicit_no_code_evidence_without_pr():
     assert result["may_continue"] is True
     assert result["review_ready_equivalent"] == "no_code_evidence"
     assert result["merge_allowed"] is False
+
+
+def test_bounded_multi_tick_runs_until_cap_and_records_skipped_candidate(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import handle_autopilot_command, run_bounded_multi_tick
+
+    handle_autopilot_command("on", actor="tester")
+    result = run_bounded_multi_tick([_ready_candidate("BO-095"), _ready_candidate("BO-096"), _ready_candidate("BO-097")], max_tasks=2)
+
+    assert [item["public_id"] for item in result["executed"]] == ["BO-095", "BO-096"]
+    assert result["skipped"][0]["public_id"] == "BO-097"
+    assert result["skipped"][0]["reason_codes"] == ["max_tasks_per_run_reached"]
+    assert result["next_state"] == "paused"
+    assert result["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0}
+
+
+def test_bounded_multi_tick_stops_on_failure_or_no_progress(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import handle_autopilot_command, run_bounded_multi_tick
+
+    handle_autopilot_command("on", actor="tester")
+    blocked = run_bounded_multi_tick([_ready_candidate("BO-095")], max_tasks=2, closeout_results=[{"may_continue": False, "reason_codes": ["missing_review_ready_contract"]}])
+    assert blocked["executed"][0]["public_id"] == "BO-095"
+    assert blocked["would_pause"][0]["reason_code"] == "closeout_blocked"
+    assert blocked["next_state"] == "needs_human"
+
+    no_progress = run_bounded_multi_tick([{"id": "t_raw", "public_id": "BO-999", "status": "ready", "body": "raw"}], max_tasks=2)
+    assert no_progress["executed"] == []
+    assert no_progress["would_pause"][0]["reason_code"] == "no_progress"
+    assert no_progress["next_state"] == "needs_human"

@@ -381,6 +381,52 @@ def evaluate_autopilot_closeout_progress(
     }
 
 
+def run_bounded_multi_tick(
+    candidates: list[dict[str, Any]],
+    *,
+    max_tasks: int = 2,
+    closeout_results: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    """Simulate bounded multi-tick continuation without live side effects."""
+
+    cap = max(1, max_tasks)
+    simulation = simulate_closed_loop_ticks(candidates, max_ticks=cap)
+    executed: list[dict[str, Any]] = []
+    pauses = list(simulation.get("would_pause") or [])
+    skipped = []
+    for item in simulation.get("would_skip") or []:
+        reason_codes = item.get("reason_codes") or []
+        if reason_codes == ["max_ticks_cap_reached"]:
+            item = {**item, "reason_codes": ["max_tasks_per_run_reached"], "human_reason": f"bounded run cap reached: max_tasks={cap}"}
+        skipped.append(item)
+    closeouts = closeout_results or []
+    for idx, selected in enumerate(simulation.get("would_select") or []):
+        if idx >= cap:
+            skipped.append({**selected, "status": "skipped", "reason_codes": ["max_tasks_per_run_reached"]})
+            continue
+        executed.append({**selected, "tick": idx + 1, "handoff": "check_only"})
+        if idx < len(closeouts) and closeouts[idx].get("may_continue") is False:
+            pauses.append({"reason_code": "closeout_blocked", "human_reason": ",".join(closeouts[idx].get("reason_codes") or [])})
+            return {
+                "mode": "bounded_multi_tick_simulation",
+                "executed": executed,
+                "skipped": skipped,
+                "would_pause": pauses,
+                "next_state": "needs_human",
+                "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
+            }
+    if not executed and not pauses:
+        pauses.append({"reason_code": "no_progress", "human_reason": "No eligible work executed in bounded run."})
+    return {
+        "mode": "bounded_multi_tick_simulation",
+        "executed": executed,
+        "skipped": skipped,
+        "would_pause": pauses,
+        "next_state": "paused" if executed else "needs_human",
+        "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
+    }
+
+
 @dataclass(frozen=True)
 class AutopilotCommand:
     """Parsed /autopilot command shape."""
