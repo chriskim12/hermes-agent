@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -34,6 +36,85 @@ def metadata(**overrides):
     )
     base.update(overrides)
     return mod.WorkspaceMetadata(**base)
+
+
+def create_kanban_db(path, rows, *, include_runs=True):
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            public_id TEXT,
+            status TEXT NOT NULL,
+            completed_at INTEGER,
+            workspace_path TEXT,
+            claim_lock TEXT,
+            worker_pid INTEGER,
+            current_run_id INTEGER,
+            closeout_evidence TEXT,
+            result TEXT
+        )
+        """
+    )
+    if include_runs:
+        conn.execute(
+            """
+            CREATE TABLE task_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                worker_pid INTEGER,
+                claim_lock TEXT,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER,
+                summary TEXT,
+                metadata TEXT
+            )
+            """
+        )
+    for row in rows:
+        conn.execute(
+            """
+            INSERT INTO tasks (
+                id, public_id, status, completed_at, workspace_path,
+                claim_lock, worker_pid, current_run_id, closeout_evidence, result
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["id"],
+                row.get("public_id"),
+                row.get("status", "done"),
+                row.get("completed_at"),
+                row.get("workspace_path"),
+                row.get("claim_lock"),
+                row.get("worker_pid"),
+                row.get("current_run_id"),
+                json.dumps(row["closeout_evidence"]) if "closeout_evidence" in row else row.get("closeout_evidence"),
+                row.get("result"),
+            ),
+        )
+        if include_runs:
+            for run in row.get("runs", []):
+                conn.execute(
+                    """
+                    INSERT INTO task_runs (
+                        task_id, status, worker_pid, claim_lock, started_at,
+                        ended_at, summary, metadata
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["id"],
+                        run.get("status", "done"),
+                        run.get("worker_pid"),
+                        run.get("claim_lock"),
+                        run.get("started_at", row.get("completed_at") or 0),
+                        run.get("ended_at", row.get("completed_at")),
+                        run.get("summary"),
+                        json.dumps(run["metadata"]) if "metadata" in run else run.get("metadata"),
+                    ),
+                )
+    conn.commit()
+    conn.close()
 
 
 def test_safe_artifact_candidate_requires_terminal_ttl_and_clean_gates(tmp_path):
@@ -227,3 +308,217 @@ def test_report_includes_surfaces_breakdown_and_no_deletion_safety(tmp_path):
     assert set(definitions) == set(report["audit_manifest_fields_for_future_apply_mode"])
     assert "Measured bytes reclaimed" in definitions["actual_reclaimed_size_bytes"]
     assert "safety gate" in definitions["gates_evaluated"]
+
+
+def test_kanban_db_done_workspace_with_evidence_can_make_allowlisted_artifact_safe(tmp_path, monkeypatch):
+    mod = load_janitor()
+    hermes_home = tmp_path / ".hermes"
+    workspaces = hermes_home / "kanban" / "workspaces"
+    workspace = workspaces / "BO-075"
+    artifact = workspace / "node_modules"
+    artifact.mkdir(parents=True)
+    (artifact / "pkg.js").write_text("x")
+    db_path = tmp_path / "kanban.db"
+    create_kanban_db(
+        db_path,
+        [{
+            "id": "task-1",
+            "public_id": "BO-075",
+            "status": "done",
+            "completed_at": 1_778_342_400,
+            "workspace_path": str(workspace),
+            "closeout_evidence": {"final_summary": "done", "tests": ["unit"]},
+        }],
+    )
+    monkeypatch.setattr(mod, "git_state", lambda path: (False, False))
+
+    args = mod.build_parser().parse_args([
+        "--format", "json",
+        "--hermes-home", str(hermes_home),
+        "--workspaces-root", str(workspaces),
+        "--worktrees-root", str(tmp_path / "worktrees"),
+        "--sessions-root", str(tmp_path / "sessions"),
+        "--tmp-root", str(tmp_path / "tmp"),
+        "--docker-root", str(tmp_path / "docker"),
+        "--containerd-root", str(tmp_path / "containerd"),
+        "--kanban-db", str(db_path),
+        "--now", "2026-05-20T00:00:00Z",
+        "--no-live-checks",
+    ])
+
+    report = mod.build_report(args)
+
+    assert report["kanban_metadata"]["loaded"] is True
+    assert report["kanban_metadata"]["mapped_workspaces"] == 1
+    workspace_report = report["kanban_workspaces"][0]
+    assert workspace_report["metadata"]["task_id"] == "task-1"
+    assert workspace_report["metadata"]["public_id"] == "BO-075"
+    assert workspace_report["metadata_evidence"]["mapping_confidence"] == "exact"
+    assert workspace_report["artifact_candidates"][0]["state"] == "safe-artifact-candidate"
+
+
+def test_kanban_db_running_task_blocks_active_workspace(tmp_path, monkeypatch):
+    mod = load_janitor()
+    workspaces = tmp_path / "workspaces"
+    workspace = workspaces / "BO-076"
+    workspace.mkdir(parents=True)
+    db_path = tmp_path / "kanban.db"
+    create_kanban_db(
+        db_path,
+        [{
+            "id": "task-2",
+            "public_id": "BO-076",
+            "status": "running",
+            "workspace_path": str(workspace),
+            "worker_pid": 123,
+            "current_run_id": 1,
+            "runs": [{"status": "running", "worker_pid": 123, "summary": ""}],
+        }],
+    )
+    monkeypatch.setattr(mod, "git_state", lambda path: (False, False))
+
+    db_metadata, summary = mod.load_kanban_db_metadata(db_path, [workspace])
+    result = mod.classify_candidate(
+        workspace,
+        kind="workspace",
+        metadata=mod.enrich_metadata(workspace, db_metadata[str(workspace)], live_checks=False),
+        now=datetime(2026, 5, 20, tzinfo=timezone.utc),
+    )
+
+    assert summary["mapped_workspaces"] == 1
+    assert result.state == "blocked-active"
+    assert result.gates["active_worker_or_run"] is True
+    assert result.gates["active_run_status"] == "running"
+
+
+def test_kanban_db_ambiguous_duplicate_mapping_stays_approval_required(tmp_path, monkeypatch):
+    mod = load_janitor()
+    workspaces = tmp_path / "workspaces"
+    workspace = workspaces / "BO-077"
+    workspace.mkdir(parents=True)
+    db_path = tmp_path / "kanban.db"
+    create_kanban_db(
+        db_path,
+        [
+            {"id": "task-a", "status": "done", "completed_at": 1_778_342_400, "workspace_path": str(workspace), "closeout_evidence": {"summary": "a"}},
+            {"id": "task-b", "status": "done", "completed_at": 1_778_342_400, "workspace_path": str(workspace), "closeout_evidence": {"summary": "b"}},
+        ],
+    )
+    monkeypatch.setattr(mod, "git_state", lambda path: (False, False))
+
+    db_metadata, summary = mod.load_kanban_db_metadata(db_path, [workspace])
+    result = mod.classify_candidate(
+        workspace,
+        kind="workspace",
+        metadata=mod.enrich_metadata(workspace, db_metadata[str(workspace)], live_checks=False),
+        now=datetime(2026, 5, 20, tzinfo=timezone.utc),
+    )
+
+    assert summary["ambiguous_workspaces"] == 1
+    assert result.state == "approval-required"
+    assert result.gates["mapping_confidence"] == "ambiguous"
+    assert "ambiguous Kanban task mapping" in "; ".join(result.reasons)
+
+
+def test_kanban_db_missing_evidence_remains_approval_required_for_workspace_cleanup(tmp_path, monkeypatch):
+    mod = load_janitor()
+    workspaces = tmp_path / "workspaces"
+    workspace = workspaces / "BO-078"
+    workspace.mkdir(parents=True)
+    db_path = tmp_path / "kanban.db"
+    create_kanban_db(
+        db_path,
+        [{"id": "task-4", "status": "done", "completed_at": 1_778_342_400, "workspace_path": str(workspace)}],
+    )
+    monkeypatch.setattr(mod, "git_state", lambda path: (False, False))
+
+    db_metadata, _summary = mod.load_kanban_db_metadata(db_path, [workspace])
+    result = mod.classify_candidate(
+        workspace,
+        kind="workspace",
+        metadata=mod.enrich_metadata(workspace, db_metadata[str(workspace)], live_checks=False),
+        now=datetime(2026, 5, 20, tzinfo=timezone.utc),
+    )
+
+    assert result.state == "approval-required"
+    assert "evidence/summary preservation" in "; ".join(result.reasons)
+
+
+def test_kanban_db_schema_variation_missing_optional_fields_fails_closed(tmp_path, monkeypatch):
+    mod = load_janitor()
+    workspaces = tmp_path / "workspaces"
+    workspace = workspaces / "BO-079"
+    workspace.mkdir(parents=True)
+    db_path = tmp_path / "minimal.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL)")
+    conn.execute("INSERT INTO tasks (id, status) VALUES (?, ?)", ("BO-079", "done"))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(mod, "git_state", lambda path: (False, False))
+
+    db_metadata, summary = mod.load_kanban_db_metadata(db_path, [workspace])
+    result = mod.classify_candidate(
+        workspace,
+        kind="workspace",
+        metadata=mod.enrich_metadata(workspace, db_metadata[str(workspace)], live_checks=False),
+        now=datetime(2026, 5, 20, tzinfo=timezone.utc),
+    )
+
+    assert summary["loaded"] is True
+    assert summary["mapped_workspaces"] == 1
+    assert result.state == "approval-required"
+    reasons = "; ".join(result.reasons)
+    assert "unknown terminal-state age" in reasons
+    assert "evidence/summary preservation" in reasons
+
+
+def test_kanban_db_fallback_name_mapping_is_explanatory_not_auto_cleanable(tmp_path, monkeypatch):
+    mod = load_janitor()
+    workspaces = tmp_path / "workspaces"
+    workspace = workspaces / "BO-080"
+    artifact = workspace / "node_modules"
+    artifact.mkdir(parents=True)
+    db_path = tmp_path / "kanban.db"
+    create_kanban_db(
+        db_path,
+        [{
+            "id": "task-5",
+            "public_id": "BO-080",
+            "status": "done",
+            "completed_at": 1_778_342_400,
+            "closeout_evidence": {"summary": "done"},
+        }],
+    )
+    monkeypatch.setattr(mod, "git_state", lambda path: (False, False))
+
+    db_metadata, summary = mod.load_kanban_db_metadata(db_path, [workspace])
+    result = mod.classify_candidate(
+        artifact,
+        kind="artifact",
+        metadata=mod.enrich_metadata(workspace, db_metadata[str(workspace)], live_checks=False),
+        now=datetime(2026, 5, 20, tzinfo=timezone.utc),
+        estimated_size_bytes=1,
+    )
+
+    assert summary["mapped_workspaces"] == 1
+    assert result.state == "approval-required"
+    assert result.gates["mapping_confidence"] == "fallback-name"
+    assert "unknown task owner or task id" in "; ".join(result.reasons)
+
+
+def test_archived_task_state_does_not_satisfy_terminal_cleanup_gate(tmp_path, monkeypatch):
+    mod = load_janitor()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(mod, "git_state", lambda path: (False, False))
+
+    result = mod.classify_candidate(
+        workspace,
+        kind="workspace",
+        metadata=metadata(task_state="archived"),
+        now=datetime(2026, 5, 20, tzinfo=timezone.utc),
+    )
+
+    assert result.state == "blocked-active"
+    assert result.gates["task_terminal_state_done_cancelled_superseded"] is False
