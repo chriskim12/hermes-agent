@@ -124,6 +124,11 @@ class TestResolveCommand:
         assert resolve_command("nonexistent") is None
         assert resolve_command("") is None
 
+    def test_retired_ouro_intake_command_does_not_resolve(self):
+        assert resolve_command("ouro-intake") is None
+        assert resolve_command("ouro_intake") is None
+        assert resolve_command("/ouro-intake") is None
+
 
 # ---------------------------------------------------------------------------
 # Derived dicts (backwards compat)
@@ -189,6 +194,10 @@ class TestGatewayKnownCommands:
         assert "bg" in GATEWAY_KNOWN_COMMANDS
         assert "background" in GATEWAY_KNOWN_COMMANDS
 
+    def test_retired_ouro_intake_not_gateway_known(self):
+        assert "ouro-intake" not in GATEWAY_KNOWN_COMMANDS
+        assert "ouro_intake" not in GATEWAY_KNOWN_COMMANDS
+
     def test_is_frozenset(self):
         assert isinstance(GATEWAY_KNOWN_COMMANDS, frozenset)
 
@@ -214,6 +223,11 @@ class TestGatewayHelpLines:
         bg_line = [l for l in lines if "/background" in l]
         assert len(bg_line) == 1
         assert "/bg" in bg_line[0]
+
+    def test_retired_ouro_intake_not_in_gateway_help(self):
+        joined = "\n".join(gateway_help_lines())
+        assert "ouro-intake" not in joined
+        assert "ouro_intake" not in joined
 
 
 class TestTelegramBotCommands:

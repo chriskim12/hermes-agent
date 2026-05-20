@@ -6481,9 +6481,6 @@ class GatewayRunner:
             if _cmd_def_inner and _cmd_def_inner.name == "autopilot":
                 return await self._handle_autopilot_command(event)
 
-            if _cmd_def_inner and _cmd_def_inner.name == "ouro-intake":
-                return await self._handle_ouro_intake_command(event)
-
             # /goal is safe mid-run for status/pause/clear (inspection and
             # control-plane only — doesn't interrupt the running turn).
             # Setting a new goal text mid-run is rejected with the same
@@ -6811,9 +6808,6 @@ class GatewayRunner:
         if canonical == "autopilot":
             return await self._handle_autopilot_command(event)
 
-        if canonical == "ouro-intake":
-            return await self._handle_ouro_intake_command(event)
-
         if canonical == "retry":
             return await self._handle_retry_command(event)
         
@@ -7036,11 +7030,6 @@ class GatewayRunner:
         # Pending exec approvals are handled by /approve and /deny commands above.
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
-
-        if not command and event.message_type == MessageType.TEXT:
-            _ouro_plain_reply = await self._maybe_handle_ouro_intake_plain_reply(event)
-            if _ouro_plain_reply is not None:
-                return _ouro_plain_reply
 
         if self._is_telegram_topic_root_lobby(source):
             # Debounce the lobby reminder so a user who forgets about
@@ -8779,109 +8768,6 @@ class GatewayRunner:
         result = handle_autopilot_command(event.get_command_args(), actor=actor)
         return result.message
 
-
-
-    async def _maybe_handle_ouro_intake_plain_reply(self, event: MessageEvent) -> str | None:
-        """Route normal same-thread replies into an active /ouro-intake interview.
-
-        This preserves the intended interview UX: only the first turn needs the
-        slash command; subsequent plain text from the same origin advances the
-        active interview until Restate/Seed gates finish.  Slash commands and
-        messages without a bound active intake session fall through unchanged.
-        """
-        import asyncio
-        from gateway.ouro_intake import (
-            handle_ouro_intake_plain_reply,
-            origin_from_source,
-        )
-
-        if event.is_command():
-            return None
-        source = getattr(event, "source", None)
-        actor = None
-        if source is not None:
-            actor = (
-                getattr(source, "user_name", None)
-                or getattr(source, "user_id", None)
-                or getattr(source, "chat_id", None)
-            )
-        result = await asyncio.to_thread(
-            handle_ouro_intake_plain_reply,
-            event.text or "",
-            origin=origin_from_source(source),
-            actor=actor,
-            question_generator=self._generate_ouro_intake_question_sync,
-        )
-        return result.message if result is not None else None
-
-    def _generate_ouro_intake_question_sync(self, contract: dict, *, session: dict, values: dict, review: dict) -> str | None:
-        """Generate one /ouro-intake question from the vendored upstream prompt contract.
-
-        Narrow runtime bridge: one model turn, no tools, no repo/Kanban mutation
-        authority, one-line Socratic-question response.  Any failure falls back
-        to the deterministic question already selected by gateway.ouro_intake.
-        """
-        try:
-            from run_agent import AIAgent
-
-            prompt = str((contract or {}).get("system_prompt") or "").strip()
-            if not prompt:
-                return None
-            agent_kwargs = _resolve_runtime_agent_kwargs()
-            model = _resolve_gateway_model(_load_gateway_config())
-            agent = AIAgent(
-                **agent_kwargs,
-                model=model,
-                max_iterations=1,
-                enabled_toolsets=[],
-                quiet_mode=True,
-                skip_context_files=True,
-                skip_memory=True,
-                max_tokens=160,
-                ephemeral_system_prompt=(
-                    "You generate exactly one Socratic interview question from an "
-                    "Ouroboros InterviewEngine prompt contract. Do not use tools. "
-                    "Do not explain. Return only: generated-question:<one question>"
-                ),
-                log_prefix="ouro-intake-question",
-            )
-            result = agent.run_conversation(
-                "Use the upstream question contract below. Return exactly one line in this format: "
-                "generated-question:<one Socratic question>\n\n"
-                + prompt,
-                conversation_history=[],
-            )
-            text = str((result or {}).get("final_response") or "").strip()
-            if text.startswith("generated-question:"):
-                text = text.split(":", 1)[1].strip()
-            return next((line.strip() for line in text.splitlines() if line.strip()), None)
-        except Exception as exc:
-            logger.warning("/ouro-intake runtime question generation failed: %s", exc)
-            return None
-
-    async def _handle_ouro_intake_command(self, event: MessageEvent) -> str:
-        """Handle /ouro-intake through the admission-only Kanban controller."""
-        import asyncio
-        from gateway.ouro_intake import handle_ouro_intake_command
-
-        source = getattr(event, "source", None)
-        actor = None
-        if source is not None:
-            actor = (
-                getattr(source, "user_name", None)
-                or getattr(source, "user_id", None)
-                or getattr(source, "chat_id", None)
-            )
-        from gateway.ouro_intake import origin_from_source
-
-        result = await asyncio.to_thread(
-            handle_ouro_intake_command,
-            event.get_command_args(),
-            actor=actor,
-            origin=origin_from_source(source),
-            question_generator=self._generate_ouro_intake_question_sync,
-        )
-        return result.message
 
 
     async def _handle_kanban_command(self, event: MessageEvent) -> str:
