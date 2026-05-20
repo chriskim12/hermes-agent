@@ -319,3 +319,50 @@ def test_review_ready_contract_rejects_wrong_repo_and_release_base():
     assert "release_base_requires_separate_approval" in result["reason_codes"]
     assert "pr_head_task_branch_mismatch" in result["reason_codes"]
     assert result["merge_allowed"] is False
+
+
+def test_hard_stop_pauses_lane_and_blocks_eligibility_until_recovered(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import evaluate_dispatcher_eligibility, handle_autopilot_command
+
+    handle_autopilot_command("on", actor="tester")
+    stopped = handle_autopilot_command("hard-stop prod_action_detected", actor="tester")
+    assert stopped.ok is True
+    assert stopped.decision["desired_mode"] == "hard_stopped"
+    assert stopped.decision["effective_mode"] == "hard_stop"
+    assert stopped.decision["dispatch_blocked"] is True
+    assert stopped.decision["operator_recovery_required"] is True
+
+    verdict = evaluate_dispatcher_eligibility([_ready_candidate("BO-082")])
+    assert verdict["eligible"] == []
+    assert verdict["ineligible"][0]["reason_codes"] == ["autopilot_hard_stop_active"]
+    assert verdict["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0}
+
+    recovered = handle_autopilot_command("recover acknowledge-no-prod-action", actor="tester")
+    assert recovered.ok is True
+    assert recovered.decision["desired_mode"] == "paused"
+    assert recovered.decision["effective_mode"] == "paused"
+    assert recovered.decision["dispatch_blocked"] is True
+
+
+def test_lane_pause_blocks_matching_tenant_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import evaluate_dispatcher_eligibility, handle_autopilot_command
+
+    handle_autopilot_command("on", actor="tester")
+    paused = handle_autopilot_command("pause-lane autopilot overloaded", actor="tester")
+    assert paused.ok is True
+    assert paused.decision["paused_lanes"] == ["autopilot"]
+
+    blocked = _ready_candidate("BO-082")
+    blocked["tenant"] = "autopilot"
+    allowed = _ready_candidate("BO-083")
+    allowed["tenant"] = "other"
+    verdict = evaluate_dispatcher_eligibility([blocked, allowed])
+
+    assert [item["public_id"] for item in verdict["eligible"]] == ["BO-083"]
+    assert verdict["ineligible"][0]["public_id"] == "BO-082"
+    assert verdict["ineligible"][0]["reason_codes"] == ["autopilot_lane_paused"]
+    assert verdict["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0}

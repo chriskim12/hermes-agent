@@ -18,9 +18,9 @@ from hermes_constants import get_hermes_home
 
 AUTOPILOT_STATE_FILE = "gateway_autopilot_state.json"
 AUTOPILOT_STATE_VERSION = 2
-AUTOPILOT_USAGE = "/autopilot [status|dry-run|queue|on|pause [reason]|off|stop|focus <BO-123>]"
+AUTOPILOT_USAGE = "/autopilot [status|dry-run|queue|on|pause [reason]|pause-lane <tenant> [reason]|resume-lane <tenant>|hard-stop <reason>|recover <ack>|off|stop|focus <BO-123>]"
 _READ_ONLY_ACTIONS = {"status", "dry-run", "dry_run", "queue"}
-_CONTROL_ACTIONS = {"on", "off", "stop", "pause", "focus", "once"}
+_CONTROL_ACTIONS = {"on", "off", "stop", "pause", "pause-lane", "resume-lane", "hard-stop", "recover", "focus", "once"}
 _MUTATIONS_ATTEMPTED: list[str] = []
 _READY_GATE_REQUIREMENTS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("missing_goal", ("goal:", "goal -", "objective:"), "goal"),
@@ -126,13 +126,15 @@ def parse_autopilot_args(raw_args: str) -> AutopilotCommand:
     value = parts[1].strip() if len(parts) > 1 else ""
     if action == "dry_run":
         action = "dry-run"
-    if action in {"status", "dry-run", "queue", "on", "off", "stop", "pause", "focus", "once"}:
+    if action in {"status", "dry-run", "queue", "on", "off", "stop", "pause", "pause-lane", "resume-lane", "hard-stop", "recover", "focus", "once"}:
         return AutopilotCommand(action=action, raw_args=raw, value=value)
     raise ValueError(f"unsupported /autopilot command: {raw_args!r}; usage: {AUTOPILOT_USAGE}")
 
 
 def _effective_mode(desired_mode: str, state: dict[str, Any]) -> str:
     desired = str(desired_mode or "disabled").lower()
+    if desired == "hard_stopped":
+        return "hard_stop"
     if desired in {"stopped", "off", "disabled"}:
         return "stopped" if desired == "stopped" else "degraded"
     if desired == "paused":
@@ -259,11 +261,29 @@ def evaluate_dispatcher_eligibility(candidates: list[dict[str, Any]]) -> dict[st
 
     state = _read_state()
     effective = _effective_mode(str(state.get("desired_mode") or "disabled"), state)
+    paused_lanes = {str(lane).lower() for lane in (state.get("paused_lanes") or [])}
     eligible: list[dict[str, Any]] = []
     ineligible: list[dict[str, Any]] = []
     for candidate in candidates:
         gate = evaluate_autopilot_ready_gate(candidate)
-        if effective != "blocked":
+        tenant = str(candidate.get("tenant") or "").lower()
+        if effective == "hard_stop":
+            gate = {
+                **gate,
+                "autopilot_ready": False,
+                "status": "rejected",
+                "reason_codes": ["autopilot_hard_stop_active"],
+                "human_reason": "Autopilot hard-stop is active; explicit operator recovery is required.",
+            }
+        elif tenant and tenant in paused_lanes:
+            gate = {
+                **gate,
+                "autopilot_ready": False,
+                "status": "rejected",
+                "reason_codes": ["autopilot_lane_paused"],
+                "human_reason": f"Autopilot lane is paused: {tenant}",
+            }
+        elif effective != "blocked":
             gate = {
                 **gate,
                 "autopilot_ready": False,
@@ -277,6 +297,7 @@ def evaluate_dispatcher_eligibility(candidates: list[dict[str, Any]]) -> dict[st
             ineligible.append(gate)
     return {
         "controller_effective_mode": effective,
+        "paused_lanes": sorted(paused_lanes),
         "handoff_target": "existing_kanban_dispatcher",
         "second_dispatcher_created": False,
         "eligible": eligible,
@@ -338,6 +359,10 @@ def _status_decision(command: AutopilotCommand, *, actor: Optional[str] = None) 
         "reason": ";".join(reasons),
         "focus": state.get("focus"),
         "pause_reason": state.get("pause_reason"),
+        "paused_lanes": state.get("paused_lanes") or [],
+        "hard_stop_reason": state.get("hard_stop_reason"),
+        "dispatch_blocked": effective in {"blocked", "paused", "hard_stop", "stopped", "degraded"},
+        "operator_recovery_required": effective == "hard_stop",
         "state_file": state,
         "state_file_enabled_is_execution_proof": False,
         "read_only": command.read_only,
@@ -379,6 +404,8 @@ def _controller_state_for(command: AutopilotCommand, *, actor: Optional[str]) ->
         "desired_mode": str(previous.get("desired_mode") or ("enabled" if previous.get("enabled") else "disabled")),
         "focus": previous.get("focus"),
         "pause_reason": previous.get("pause_reason"),
+        "paused_lanes": previous.get("paused_lanes") or [],
+        "hard_stop_reason": previous.get("hard_stop_reason"),
         "updated_at": _iso_now(),
         "updated_by": actor or "unknown",
     }
@@ -388,6 +415,24 @@ def _controller_state_for(command: AutopilotCommand, *, actor: Optional[str]) ->
         state.update({"desired_mode": "stopped", "enabled": False, "pause_reason": None})
     elif command.action == "pause":
         state.update({"desired_mode": "paused", "enabled": False, "pause_reason": command.value or "manual_pause"})
+    elif command.action == "pause-lane":
+        parts = command.value.split(maxsplit=1)
+        lane = parts[0].strip().lower() if parts else ""
+        reason = parts[1].strip() if len(parts) > 1 else "manual_lane_pause"
+        paused = {str(existing).lower() for existing in (state.get("paused_lanes") or [])}
+        if lane:
+            paused.add(lane)
+        state.update({"paused_lanes": sorted(paused), "pause_reason": reason})
+    elif command.action == "resume-lane":
+        lane = command.value.split(maxsplit=1)[0].strip().lower()
+        paused = {str(existing).lower() for existing in (state.get("paused_lanes") or [])}
+        if lane:
+            paused.discard(lane)
+        state.update({"paused_lanes": sorted(paused)})
+    elif command.action == "hard-stop":
+        state.update({"desired_mode": "hard_stopped", "enabled": False, "hard_stop_reason": command.value or "manual_hard_stop", "pause_reason": command.value or "manual_hard_stop"})
+    elif command.action == "recover":
+        state.update({"desired_mode": "paused", "enabled": False, "hard_stop_reason": None, "pause_reason": command.value or "manual_recovery_acknowledged"})
     elif command.action == "focus":
         state.update({"focus": command.value.upper() if command.value else None})
     elif command.action == "once":
@@ -408,6 +453,10 @@ def _control_decision(command: AutopilotCommand, *, actor: Optional[str] = None)
         "reason": "phase1_controller_state_persisted_without_execution_authority",
         "focus": state.get("focus"),
         "pause_reason": state.get("pause_reason"),
+        "paused_lanes": state.get("paused_lanes") or [],
+        "hard_stop_reason": state.get("hard_stop_reason"),
+        "dispatch_blocked": effective in {"blocked", "paused", "hard_stop", "stopped", "degraded"},
+        "operator_recovery_required": effective == "hard_stop",
         "state_file": state,
         "state_file_enabled_is_execution_proof": False,
         "read_only": False,
