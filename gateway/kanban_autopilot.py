@@ -37,6 +37,148 @@ _READY_GATE_REQUIREMENTS: tuple[tuple[str, tuple[str, ...], str], ...] = (
 _PR_URL_RE = re.compile(r"^https://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/pull/\d+/?$")
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
 _RELEASE_ONLY_BASES = {"prod", "production"}
+_CLOSED_LOOP_ALLOWED_STATES = [
+    "disabled",
+    "dry_run",
+    "single_flight",
+    "bounded_multi_tick",
+    "parent_scoped",
+    "lane_scoped",
+    "paused",
+    "hard_stopped",
+    "needs_human",
+]
+_DEFAULT_CLOSED_LOOP_CAPS = {
+    "max_active_flights": 1,
+    "max_dispatches_per_tick": 1,
+    "max_tasks_per_run_single_flight": 1,
+    "max_tasks_per_run_early_bounded_multi_tick": 2,
+    "max_new_prs_per_run": 1,
+    "max_open_autopilot_prs": 2,
+    "max_consecutive_failures": 1,
+    "max_no_progress_ticks": 1,
+    "max_same_card_retries": 1,
+    "max_runtime_minutes": 60,
+    "max_daily_autopilot_tasks": 3,
+    "require_clean_closeout_per_task": True,
+    "require_review_ready_contract_before_next_task": True,
+}
+
+
+def get_closed_loop_operating_contract() -> dict[str, Any]:
+    """Return the BO-091 closed-loop Autopilot ADR/operating contract.
+
+    The contract is intentionally data-shaped so later slices can validate
+    policy/config files against the same invariants instead of relying on prose.
+    It grants no runtime authority: dispatcher handoff and worker completion
+    remain separate later slices and explicit approval gates.
+    """
+
+    return {
+        "adr": "bounded_controller_not_executor",
+        "authority_ceiling": "review_ready_pr",
+        "state_machine": {
+            "allowed_states": list(_CLOSED_LOOP_ALLOWED_STATES),
+            "promotion_ladder": [
+                ["dry_run", "single_flight"],
+                ["single_flight", "bounded_multi_tick"],
+                ["bounded_multi_tick", "parent_scoped"],
+                ["bounded_multi_tick", "lane_scoped"],
+            ],
+            "terminal_or_human_states": ["paused", "hard_stopped", "needs_human"],
+        },
+        "default_caps": dict(_DEFAULT_CLOSED_LOOP_CAPS),
+        "dispatcher_boundary": {
+            "execution_owner": "existing_kanban_dispatcher",
+            "autopilot_role": "controller_policy_evidence_layer",
+            "autopilot_may_directly_claim_or_spawn": False,
+            "second_dispatcher_allowed": False,
+            "handoff_success_is_worker_completion": False,
+            "worker_done_truth_source": "kanban_dispatcher_worker_done_evidence",
+        },
+        "scope_model": {
+            "selectors": ["parent_public_id", "lane_tenant", "repo_project", "labels", "assignee_or_profile"],
+            "scope_can_silently_widen": False,
+            "scope_escape_result": "needs_human_or_activation_rejected",
+        },
+        "forbidden_without_current_approval": [
+            "gateway_restart_reload",
+            "config_env_secret_provider_billing_pricing_mutation",
+            "worker_dispatch_claim_spawn_live_side_effect_before_activation_slice",
+            "fork_push_or_pr_before_child_range_worker_done",
+            "upstream_pr",
+            "merge_release_deploy_prod_customer_visible_action",
+            "canonical_main_sync_or_materialization",
+        ],
+        "stop_conditions": [
+            "forbidden_action_requested",
+            "scope_ambiguity",
+            "stale_kanban_state",
+            "dependency_or_blocker_detected",
+            "verification_failure_threshold_exceeded",
+            "worker_crash_or_timeout_repeated",
+            "dispatcher_unavailable",
+            "kanban_read_unavailable",
+            "policy_file_invalid_or_stale",
+            "worker_completion_evidence_missing",
+            "budget_or_cap_exceeded",
+            "pr_backlog_cap_exceeded",
+            "disk_ci_runtime_safety_threshold_exceeded",
+            "current_turn_approval_required_or_expired",
+        ],
+        "future_ralplan_required_for": [
+            "merge_release_deploy_prod_customer_visible_authority",
+            "gateway_restart_reload_automation",
+            "config_env_secret_provider_billing_pricing_mutation",
+            "replace_or_bypass_existing_dispatcher",
+            "new_dispatcher_worker_lifecycle_ownership",
+            "global_queue_draining_autonomy",
+            "cross_repo_lane_parent_scope_expansion",
+            "customer_facing_automation",
+            "destructive_cleanup_authority",
+            "security_auth_payment_billing_policy_mutation",
+        ],
+        "docs": "docs/closed-loop-kanban-autopilot.md",
+    }
+
+
+def validate_closed_loop_policy_contract(contract: dict[str, Any]) -> dict[str, Any]:
+    """Validate that a proposed closed-loop policy preserves BO-091 invariants."""
+
+    reason_codes: list[str] = []
+    if contract.get("adr") != "bounded_controller_not_executor":
+        reason_codes.append("adr_must_be_bounded_controller_not_executor")
+    if contract.get("authority_ceiling") != "review_ready_pr":
+        reason_codes.append("authority_ceiling_must_be_review_ready_pr")
+    states = (contract.get("state_machine") or {}).get("allowed_states") or []
+    for state in _CLOSED_LOOP_ALLOWED_STATES:
+        if state not in states:
+            reason_codes.append(f"missing_state_{state}")
+    caps = contract.get("default_caps") or {}
+    if caps.get("max_dispatches_per_tick") != 1:
+        reason_codes.append("max_dispatches_per_tick_must_be_one")
+    if caps.get("max_active_flights") != 1:
+        reason_codes.append("max_active_flights_must_be_one")
+    boundary = contract.get("dispatcher_boundary") or {}
+    if boundary.get("execution_owner") != "existing_kanban_dispatcher":
+        reason_codes.append("execution_owner_must_be_existing_dispatcher")
+    if boundary.get("autopilot_may_directly_claim_or_spawn") is not False:
+        reason_codes.append("direct_claim_or_spawn_not_allowed")
+    if boundary.get("second_dispatcher_allowed") is not False:
+        reason_codes.append("second_dispatcher_not_allowed")
+    if boundary.get("handoff_success_is_worker_completion") is not False:
+        reason_codes.append("handoff_success_must_not_equal_worker_completion")
+    scope = contract.get("scope_model") or {}
+    if scope.get("scope_can_silently_widen") is not False:
+        reason_codes.append("scope_must_not_silently_widen")
+    forbidden = set(contract.get("forbidden_without_current_approval") or [])
+    for required in {"gateway_restart_reload", "config_env_secret_provider_billing_pricing_mutation"}:
+        if required not in forbidden:
+            reason_codes.append(f"missing_forbidden_{required}")
+    future = set(contract.get("future_ralplan_required_for") or [])
+    if "merge_release_deploy_prod_customer_visible_authority" not in future:
+        reason_codes.append("future_ralplan_gate_missing_merge_release_prod")
+    return {"ok": not reason_codes, "reason_codes": reason_codes}
 
 
 @dataclass(frozen=True)

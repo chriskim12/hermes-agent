@@ -366,3 +366,59 @@ def test_lane_pause_blocks_matching_tenant_only(tmp_path, monkeypatch):
     assert verdict["ineligible"][0]["public_id"] == "BO-082"
     assert verdict["ineligible"][0]["reason_codes"] == ["autopilot_lane_paused"]
     assert verdict["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0}
+
+
+def test_closed_loop_operating_contract_documents_state_caps_boundaries_and_future_ralplan_gate():
+    from gateway.kanban_autopilot import get_closed_loop_operating_contract
+
+    contract = get_closed_loop_operating_contract()
+
+    assert contract["adr"] == "bounded_controller_not_executor"
+    assert contract["authority_ceiling"] == "review_ready_pr"
+    assert contract["dispatcher_boundary"]["autopilot_may_directly_claim_or_spawn"] is False
+    assert contract["dispatcher_boundary"]["execution_owner"] == "existing_kanban_dispatcher"
+    assert contract["state_machine"]["allowed_states"] == [
+        "disabled",
+        "dry_run",
+        "single_flight",
+        "bounded_multi_tick",
+        "parent_scoped",
+        "lane_scoped",
+        "paused",
+        "hard_stopped",
+        "needs_human",
+    ]
+    assert contract["default_caps"]["max_dispatches_per_tick"] == 1
+    assert contract["default_caps"]["max_open_autopilot_prs"] == 2
+    assert "gateway_restart_reload" in contract["forbidden_without_current_approval"]
+    assert "config_env_secret_provider_billing_pricing_mutation" in contract["forbidden_without_current_approval"]
+    assert "policy_file_invalid_or_stale" in contract["stop_conditions"]
+    assert "merge_release_deploy_prod_customer_visible_authority" in contract["future_ralplan_required_for"]
+
+
+def test_closed_loop_policy_contract_validator_rejects_second_dispatcher_and_scope_expansion():
+    from gateway.kanban_autopilot import (
+        get_closed_loop_operating_contract,
+        validate_closed_loop_policy_contract,
+    )
+
+    valid = validate_closed_loop_policy_contract(get_closed_loop_operating_contract())
+    assert valid["ok"] is True
+    assert valid["reason_codes"] == []
+
+    unsafe = get_closed_loop_operating_contract()
+    unsafe["dispatcher_boundary"] = {
+        **unsafe["dispatcher_boundary"],
+        "autopilot_may_directly_claim_or_spawn": True,
+        "second_dispatcher_allowed": True,
+    }
+    unsafe["authority_ceiling"] = "merge_release_deploy"
+    unsafe["scope_model"]["scope_can_silently_widen"] = True
+
+    result = validate_closed_loop_policy_contract(unsafe)
+
+    assert result["ok"] is False
+    assert "direct_claim_or_spawn_not_allowed" in result["reason_codes"]
+    assert "second_dispatcher_not_allowed" in result["reason_codes"]
+    assert "authority_ceiling_must_be_review_ready_pr" in result["reason_codes"]
+    assert "scope_must_not_silently_widen" in result["reason_codes"]
