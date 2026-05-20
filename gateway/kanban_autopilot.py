@@ -267,6 +267,70 @@ def simulate_closed_loop_ticks(candidates: list[dict[str, Any]], *, max_ticks: O
         "mutations_attempted": list(_MUTATIONS_ATTEMPTED),
     }
 
+def activate_single_flight(
+    candidates: list[dict[str, Any]],
+    *,
+    check_only_handoff: Optional[Any] = None,
+) -> dict[str, Any]:
+    """Run the BO-093 single-flight activation gate without live dispatch.
+
+    The function selects at most one eligible candidate, performs a caller-
+    supplied check-only handoff probe, and returns explicit non-completion
+    evidence. It never directly dispatches, claims, spawns, or mutates Kanban.
+    """
+
+    simulation = simulate_closed_loop_ticks(candidates, max_ticks=1)
+    selected = (simulation.get("would_select") or [])[:1]
+    skipped = []
+    for item in simulation.get("would_skip") or []:
+        reason_codes = item.get("reason_codes") or []
+        if reason_codes == ["max_ticks_cap_reached"]:
+            item = {**item, "reason_codes": ["single_flight_limit_reached"], "human_reason": "single-flight activation may select at most one candidate"}
+        skipped.append(item)
+    for extra in (simulation.get("would_select") or [])[1:]:
+        skipped.append({
+            "public_id": extra.get("public_id"),
+            "task_id": extra.get("task_id"),
+            "status": "skipped",
+            "reason_codes": ["single_flight_limit_reached"],
+            "human_reason": "single-flight activation may select at most one candidate",
+        })
+    if not selected:
+        return {
+            "status": "no_candidate",
+            "selected": None,
+            "skipped": skipped,
+            "handoff": None,
+            "next_state": simulation.get("next_state", "needs_human"),
+            "handoff_success_is_worker_completion": False,
+            "worker_done_observed": False,
+            "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
+            "mutations_attempted": list(_MUTATIONS_ATTEMPTED),
+        }
+    candidate = selected[0]
+    payload = {
+        "public_id": candidate.get("public_id"),
+        "task_id": candidate.get("task_id"),
+        "target": "existing_kanban_dispatcher",
+        "check_only": True,
+        "would_dispatch": False,
+        "handoff_success_is_worker_completion": False,
+    }
+    check = check_only_handoff(payload) if check_only_handoff else {"allowed": True, "reason": "no_check_callback_supplied"}
+    allowed = bool((check or {}).get("allowed"))
+    return {
+        "status": "handoff_check_passed" if allowed else "handoff_check_blocked",
+        "selected": candidate,
+        "skipped": skipped,
+        "handoff": payload,
+        "check": check,
+        "next_state": "pause_for_worker_observation" if allowed else "needs_human",
+        "handoff_success_is_worker_completion": False,
+        "worker_done_observed": False,
+        "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
+        "mutations_attempted": list(_MUTATIONS_ATTEMPTED),
+    }
+
 
 @dataclass(frozen=True)
 class AutopilotCommand:

@@ -480,3 +480,59 @@ def test_closed_loop_simulator_pauses_on_hard_stop_lane_pause_and_no_progress(tm
     blocked_report = simulate_closed_loop_ticks([{"id": "t_raw", "public_id": "BO-999", "status": "ready", "body": "raw"}], max_ticks=2)
     assert blocked_report["would_pause"][0]["reason_code"] == "no_progress"
     assert blocked_report["next_state"] == "needs_human"
+
+
+def test_single_flight_activation_runs_one_check_only_handoff_and_no_dispatch(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway import kanban_autopilot
+
+    forbidden_calls: list[str] = []
+
+    def forbidden(*_args, **_kwargs):
+        forbidden_calls.append("forbidden")
+        raise AssertionError("single-flight activation must not directly dispatch, claim, spawn, or mutate Kanban")
+
+    monkeypatch.setattr(kanban_autopilot, "dispatch_once", forbidden, raising=False)
+    monkeypatch.setattr(kanban_autopilot, "claim_task", forbidden, raising=False)
+    monkeypatch.setattr(kanban_autopilot, "spawn_worker", forbidden, raising=False)
+    monkeypatch.setattr(kanban_autopilot, "mutate_kanban", forbidden, raising=False)
+    kanban_autopilot.handle_autopilot_command("on", actor="tester")
+    checks: list[dict] = []
+
+    def check_only(payload: dict) -> dict:
+        checks.append(payload)
+        return {"allowed": True, "reason": "mock_check_passed"}
+
+    result = kanban_autopilot.activate_single_flight([_ready_candidate("BO-093"), _ready_candidate("BO-094")], check_only_handoff=check_only)
+
+    assert result["status"] == "handoff_check_passed"
+    assert result["selected"]["public_id"] == "BO-093"
+    assert result["handoff"]["target"] == "existing_kanban_dispatcher"
+    assert result["handoff"]["check_only"] is True
+    assert result["handoff"]["would_dispatch"] is False
+    assert result["handoff_success_is_worker_completion"] is False
+    assert len(checks) == 1
+    assert checks[0]["public_id"] == "BO-093"
+    assert result["skipped"][0]["reason_codes"] == ["single_flight_limit_reached"]
+    assert result["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0}
+    assert forbidden_calls == []
+
+
+def test_single_flight_activation_blocks_on_failed_check_without_completion(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import activate_single_flight, handle_autopilot_command
+
+    handle_autopilot_command("on", actor="tester")
+
+    result = activate_single_flight(
+        [_ready_candidate("BO-093")],
+        check_only_handoff=lambda payload: {"allowed": False, "reason": "mock_dispatcher_unavailable"},
+    )
+
+    assert result["status"] == "handoff_check_blocked"
+    assert result["next_state"] == "needs_human"
+    assert result["handoff_success_is_worker_completion"] is False
+    assert result["worker_done_observed"] is False
+    assert result["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0}
