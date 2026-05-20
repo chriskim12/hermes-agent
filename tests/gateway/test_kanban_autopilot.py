@@ -616,3 +616,31 @@ def test_bounded_multi_tick_stops_on_failure_or_no_progress(tmp_path, monkeypatc
     assert no_progress["executed"] == []
     assert no_progress["would_pause"][0]["reason_code"] == "no_progress"
     assert no_progress["next_state"] == "needs_human"
+
+
+def test_scope_filter_allows_only_parent_lane_repo_and_labels():
+    from gateway.kanban_autopilot import filter_candidates_for_scope
+
+    good = _ready_candidate("BO-096")
+    good.update({"parent_public_id": "BO-090", "tenant": "autopilot", "repo_full_name": "chriskim12/hermes-agent", "labels": ["closed-loop"]})
+    wrong_lane = {**good, "public_id": "BO-200", "tenant": "other"}
+    wrong_parent = {**good, "public_id": "BO-201", "parent_public_id": "BO-999"}
+
+    result = filter_candidates_for_scope([good, wrong_lane, wrong_parent], {"parent_public_id": "BO-090", "tenant": "autopilot", "repo_full_name": "chriskim12/hermes-agent", "labels": ["closed-loop"]})
+
+    assert [item["public_id"] for item in result["in_scope"]] == ["BO-096"]
+    assert result["out_of_scope"][0]["reason_codes"] == ["lane_scope_mismatch"]
+    assert result["out_of_scope"][1]["reason_codes"] == ["parent_scope_mismatch"]
+    assert result["scope_can_silently_widen"] is False
+
+
+def test_scope_filter_marks_ambiguous_dependency_or_missing_scope_as_needs_human():
+    from gateway.kanban_autopilot import filter_candidates_for_scope
+
+    ambiguous = _ready_candidate("BO-096")
+    ambiguous.update({"parent_public_id": "BO-090", "tenant": "autopilot", "relation_type": "dependency"})
+    result = filter_candidates_for_scope([ambiguous], {"parent_public_id": "BO-090", "tenant": "autopilot"})
+
+    assert result["in_scope"] == []
+    assert result["out_of_scope"][0]["reason_codes"] == ["hierarchy_dependency_ambiguous"]
+    assert result["next_state"] == "needs_human"

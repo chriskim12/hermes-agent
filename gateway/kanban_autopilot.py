@@ -427,6 +427,36 @@ def run_bounded_multi_tick(
     }
 
 
+def filter_candidates_for_scope(candidates: list[dict[str, Any]], scope: dict[str, Any]) -> dict[str, Any]:
+    """Filter candidates to an explicit parent/lane/repo/label scope."""
+
+    in_scope: list[dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
+    required_labels = set(scope.get("labels") or [])
+    for candidate in candidates:
+        reasons: list[str] = []
+        if scope.get("parent_public_id") and candidate.get("parent_public_id") != scope.get("parent_public_id"):
+            reasons.append("parent_scope_mismatch")
+        if scope.get("tenant") and candidate.get("tenant") != scope.get("tenant"):
+            reasons.append("lane_scope_mismatch")
+        if scope.get("repo_full_name") and candidate.get("repo_full_name") != scope.get("repo_full_name"):
+            reasons.append("repo_scope_mismatch")
+        if required_labels and not required_labels.issubset(set(candidate.get("labels") or [])):
+            reasons.append("label_scope_mismatch")
+        if candidate.get("relation_type") == "dependency":
+            reasons.append("hierarchy_dependency_ambiguous")
+        if reasons:
+            out.append({"public_id": candidate.get("public_id"), "task_id": candidate.get("id"), "reason_codes": reasons})
+        else:
+            in_scope.append(candidate)
+    return {
+        "in_scope": in_scope,
+        "out_of_scope": out,
+        "scope_can_silently_widen": False,
+        "next_state": "continue" if in_scope else "needs_human",
+    }
+
+
 @dataclass(frozen=True)
 class AutopilotCommand:
     """Parsed /autopilot command shape."""
