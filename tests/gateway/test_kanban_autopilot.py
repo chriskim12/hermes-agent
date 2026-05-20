@@ -422,3 +422,61 @@ def test_closed_loop_policy_contract_validator_rejects_second_dispatcher_and_sco
     assert "second_dispatcher_not_allowed" in result["reason_codes"]
     assert "authority_ceiling_must_be_review_ready_pr" in result["reason_codes"]
     assert "scope_must_not_silently_widen" in result["reason_codes"]
+
+
+def test_closed_loop_simulator_selects_one_candidate_and_never_dispatches(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway import kanban_autopilot
+
+    calls: list[str] = []
+
+    def forbidden(*_args, **_kwargs):
+        calls.append("forbidden")
+        raise AssertionError("read-only simulator must not dispatch, claim, spawn, or mutate Kanban")
+
+    monkeypatch.setattr(kanban_autopilot, "dispatch_once", forbidden, raising=False)
+    monkeypatch.setattr(kanban_autopilot, "claim_task", forbidden, raising=False)
+    monkeypatch.setattr(kanban_autopilot, "spawn_worker", forbidden, raising=False)
+    monkeypatch.setattr(kanban_autopilot, "mutate_kanban", forbidden, raising=False)
+    kanban_autopilot.handle_autopilot_command("on", actor="tester")
+
+    report = kanban_autopilot.simulate_closed_loop_ticks(
+        [_ready_candidate("BO-092"), {"id": "t_raw", "public_id": "BO-999", "status": "ready", "body": "raw"}],
+        max_ticks=2,
+    )
+
+    assert report["mode"] == "read_only_simulation"
+    assert report["would_select"][0]["public_id"] == "BO-092"
+    assert report["would_handoff"][0]["target"] == "existing_kanban_dispatcher"
+    assert report["would_handoff"][0]["check_only"] is True
+    assert report["would_skip"][0]["public_id"] == "BO-999"
+    assert "missing_goal" in report["would_skip"][0]["reason_codes"]
+    assert report["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0}
+    assert report["mutations_attempted"] == []
+    assert calls == []
+
+
+def test_closed_loop_simulator_pauses_on_hard_stop_lane_pause_and_no_progress(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import handle_autopilot_command, simulate_closed_loop_ticks
+
+    handle_autopilot_command("on", actor="tester")
+    handle_autopilot_command("pause-lane autopilot overloaded", actor="tester")
+    lane_candidate = _ready_candidate("BO-092")
+    lane_candidate["tenant"] = "autopilot"
+    lane_report = simulate_closed_loop_ticks([lane_candidate], max_ticks=2)
+    assert lane_report["would_pause"][0]["reason_code"] == "no_progress"
+    assert lane_report["would_skip"][0]["reason_codes"] == ["autopilot_lane_paused"]
+
+    handle_autopilot_command("hard-stop forbidden_action", actor="tester")
+    hard_report = simulate_closed_loop_ticks([_ready_candidate("BO-093")], max_ticks=2)
+    assert hard_report["would_pause"][0]["reason_code"] == "hard_stop"
+    assert hard_report["would_select"] == []
+    assert hard_report["would_handoff"] == []
+
+    handle_autopilot_command("recover acknowledged", actor="tester")
+    blocked_report = simulate_closed_loop_ticks([{"id": "t_raw", "public_id": "BO-999", "status": "ready", "body": "raw"}], max_ticks=2)
+    assert blocked_report["would_pause"][0]["reason_code"] == "no_progress"
+    assert blocked_report["next_state"] == "needs_human"

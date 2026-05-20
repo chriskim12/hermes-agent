@@ -181,6 +181,93 @@ def validate_closed_loop_policy_contract(contract: dict[str, Any]) -> dict[str, 
     return {"ok": not reason_codes, "reason_codes": reason_codes}
 
 
+def simulate_closed_loop_ticks(candidates: list[dict[str, Any]], *, max_ticks: Optional[int] = None) -> dict[str, Any]:
+    """Simulate closed-loop candidate selection without side effects.
+
+    This is BO-092's read-only simulator: it reuses the same Ready-gate and
+    dispatcher-eligibility contract as the live path, but returns only
+    ``would_*`` facts. It does not dispatch, claim, spawn, or mutate Kanban.
+    """
+
+    state = _read_state()
+    effective = _effective_mode(str(state.get("desired_mode") or "disabled"), state)
+    cap = max(1, int(max_ticks or _DEFAULT_CLOSED_LOOP_CAPS["max_tasks_per_run_early_bounded_multi_tick"]))
+    selected: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    handoffs: list[dict[str, Any]] = []
+    pauses: list[dict[str, Any]] = []
+
+    if effective == "hard_stop":
+        pauses.append({"reason_code": "hard_stop", "human_reason": "Autopilot hard-stop is active; no simulated handoff is allowed."})
+        for candidate in candidates:
+            skipped.append({
+                "public_id": candidate.get("public_id"),
+                "task_id": candidate.get("id"),
+                "status": "rejected",
+                "reason_codes": ["autopilot_hard_stop_active"],
+            })
+        return {
+            "mode": "read_only_simulation",
+            "controller_effective_mode": effective,
+            "would_select": selected,
+            "would_skip": skipped,
+            "would_pause": pauses,
+            "would_handoff": handoffs,
+            "next_state": "hard_stopped",
+            "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
+            "mutations_attempted": list(_MUTATIONS_ATTEMPTED),
+        }
+
+    verdict = evaluate_dispatcher_eligibility(candidates)
+    for item in verdict.get("ineligible") or []:
+        skipped.append({
+            "public_id": item.get("public_id"),
+            "task_id": item.get("task_id"),
+            "status": item.get("status"),
+            "reason_codes": item.get("reason_codes") or [],
+            "human_reason": item.get("human_reason"),
+        })
+    for item in (verdict.get("eligible") or [])[:cap]:
+        selected_item = {
+            "public_id": item.get("public_id"),
+            "task_id": item.get("task_id"),
+            "reason_codes": [],
+            "decision": "would_select",
+        }
+        selected.append(selected_item)
+        handoffs.append({
+            "public_id": item.get("public_id"),
+            "task_id": item.get("task_id"),
+            "target": "existing_kanban_dispatcher",
+            "check_only": True,
+            "would_dispatch": False,
+            "handoff_success_is_worker_completion": False,
+        })
+    if len(verdict.get("eligible") or []) > cap:
+        for item in (verdict.get("eligible") or [])[cap:]:
+            skipped.append({
+                "public_id": item.get("public_id"),
+                "task_id": item.get("task_id"),
+                "status": "skipped",
+                "reason_codes": ["max_ticks_cap_reached"],
+                "human_reason": f"simulation cap reached: max_ticks={cap}",
+            })
+    if not selected:
+        pauses.append({"reason_code": "no_progress", "human_reason": "No eligible candidate would be selected in this simulation tick."})
+    return {
+        "mode": "read_only_simulation",
+        "controller_effective_mode": verdict.get("controller_effective_mode", effective),
+        "max_ticks": cap,
+        "would_select": selected,
+        "would_skip": skipped,
+        "would_pause": pauses,
+        "would_handoff": handoffs,
+        "next_state": "continue" if selected else "needs_human",
+        "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
+        "mutations_attempted": list(_MUTATIONS_ATTEMPTED),
+    }
+
+
 @dataclass(frozen=True)
 class AutopilotCommand:
     """Parsed /autopilot command shape."""
