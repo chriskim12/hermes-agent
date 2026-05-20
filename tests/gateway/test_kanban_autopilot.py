@@ -536,3 +536,51 @@ def test_single_flight_activation_blocks_on_failed_check_without_completion(tmp_
     assert result["handoff_success_is_worker_completion"] is False
     assert result["worker_done_observed"] is False
     assert result["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0}
+
+
+def test_closeout_progress_gate_blocks_missing_evidence_and_pr_backlog():
+    from gateway.kanban_autopilot import evaluate_autopilot_closeout_progress
+
+    missing = evaluate_autopilot_closeout_progress({"work_id": "BO-094", "kanban_worker_done": True})
+    assert missing["may_continue"] is False
+    assert "missing_review_ready_contract" in missing["reason_codes"]
+
+    good = {
+        "work_id": "BO-094",
+        "repo_full_name": "chriskim12/hermes-agent",
+        "commit": "8f0cbc56db6498e16c628e42430dbd6156d99fb3",
+        "task_branch": "bo-094",
+        "pr_url": "https://github.com/chriskim12/hermes-agent/pull/123",
+        "pr_base": "main",
+        "pr_head": "bo-094",
+        "checks_passed": True,
+        "worktree_clean": True,
+        "kanban_worker_done": True,
+        "boundaries_confirmed": True,
+    }
+    backlog_blocked = evaluate_autopilot_closeout_progress(good, open_autopilot_prs=2, max_open_autopilot_prs=2)
+    assert backlog_blocked["may_continue"] is False
+    assert "pr_backlog_cap_reached" in backlog_blocked["reason_codes"]
+
+    allowed = evaluate_autopilot_closeout_progress(good, open_autopilot_prs=1, max_open_autopilot_prs=2)
+    assert allowed["may_continue"] is True
+    assert allowed["worker_done_observed"] is True
+    assert allowed["review_ready_contract"]["review_ready"] is True
+    assert allowed["merge_allowed"] is False
+
+
+def test_closeout_progress_gate_allows_explicit_no_code_evidence_without_pr():
+    from gateway.kanban_autopilot import evaluate_autopilot_closeout_progress
+
+    result = evaluate_autopilot_closeout_progress({
+        "work_id": "BO-094",
+        "no_code_task": True,
+        "artifact_path": "docs/closed-loop-kanban-autopilot.md",
+        "verification": "documentation reviewed and tests not applicable",
+        "kanban_worker_done": True,
+        "boundaries_confirmed": True,
+    })
+
+    assert result["may_continue"] is True
+    assert result["review_ready_equivalent"] == "no_code_evidence"
+    assert result["merge_allowed"] is False

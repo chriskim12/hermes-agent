@@ -332,6 +332,55 @@ def activate_single_flight(
     }
 
 
+def evaluate_autopilot_closeout_progress(
+    evidence: dict[str, Any],
+    *,
+    open_autopilot_prs: int = 0,
+    max_open_autopilot_prs: int = 2,
+) -> dict[str, Any]:
+    """Decide whether Autopilot may continue after a worker result.
+
+    BO-094 keeps worker_done observation, review-ready/no-code evidence, and PR
+    backlog caps distinct. It never grants merge/release authority.
+    """
+
+    reason_codes: list[str] = []
+    worker_done = evidence.get("kanban_worker_done") is True
+    if not worker_done:
+        reason_codes.append("worker_done_not_observed")
+    no_code = evidence.get("no_code_task") is True
+    review_contract: dict[str, Any] | None = None
+    review_equivalent = None
+    if no_code:
+        if not str(evidence.get("artifact_path") or "").strip():
+            reason_codes.append("missing_no_code_artifact")
+        if not str(evidence.get("verification") or "").strip():
+            reason_codes.append("missing_no_code_verification")
+        if evidence.get("boundaries_confirmed") is not True:
+            reason_codes.append("missing_boundaries_confirmed")
+        if not reason_codes:
+            review_equivalent = "no_code_evidence"
+    else:
+        review_contract = evaluate_review_ready_contract(evidence)
+        if not review_contract.get("review_ready"):
+            reason_codes.append("missing_review_ready_contract")
+    if open_autopilot_prs >= max_open_autopilot_prs:
+        reason_codes.append("pr_backlog_cap_reached")
+    return {
+        "may_continue": not reason_codes,
+        "reason_codes": reason_codes,
+        "worker_done_observed": worker_done,
+        "review_ready_contract": review_contract,
+        "review_ready_equivalent": review_equivalent,
+        "open_autopilot_prs": open_autopilot_prs,
+        "max_open_autopilot_prs": max_open_autopilot_prs,
+        "merge_allowed": False,
+        "release_allowed": False,
+        "prod_customer_visible_allowed": False,
+        "next_state": "continue" if not reason_codes else "needs_human",
+    }
+
+
 @dataclass(frozen=True)
 class AutopilotCommand:
     """Parsed /autopilot command shape."""
