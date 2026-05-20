@@ -47,6 +47,33 @@ def _setup_hermes_auth(hermes_home: Path, *, access_token: str = "access", refre
     return auth_file
 
 
+def _setup_hermes_pool_auth(hermes_home: Path, *, access_token: str = "pool-access", refresh_token: str = "pool-refresh"):
+    """Write Codex OAuth tokens into the credential pool only."""
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    auth_store = {
+        "version": 1,
+        "providers": {},
+        "credential_pool": {
+            "openai-codex": [
+                {
+                    "id": "pool1",
+                    "label": "openai-codex-oauth-1",
+                    "auth_type": "oauth",
+                    "priority": 0,
+                    "source": "manual:device_code",
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "base_url": DEFAULT_CODEX_BASE_URL,
+                    "last_refresh": "2026-05-19T08:43:42Z",
+                }
+            ],
+        },
+    }
+    auth_file = hermes_home / "auth.json"
+    auth_file.write_text(json.dumps(auth_store, indent=2))
+    return auth_file
+
+
 def _jwt_with_exp(exp_epoch: int) -> str:
     payload = {"exp": exp_epoch}
     encoded = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).rstrip(b"=").decode("utf-8")
@@ -61,6 +88,18 @@ def test_read_codex_tokens_success(tmp_path, monkeypatch):
     data = _read_codex_tokens()
     assert data["tokens"]["access_token"] == "access"
     assert data["tokens"]["refresh_token"] == "refresh"
+
+
+def test_read_codex_tokens_uses_credential_pool_when_provider_state_missing(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_pool_auth(hermes_home)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    data = _read_codex_tokens()
+
+    assert data["tokens"]["access_token"] == "pool-access"
+    assert data["tokens"]["refresh_token"] == "pool-refresh"
+    assert data["last_refresh"] == "2026-05-19T08:43:42Z"
 
 
 def test_read_codex_tokens_missing(tmp_path, monkeypatch):

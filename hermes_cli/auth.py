@@ -2960,6 +2960,36 @@ def _print_loopback_ssh_hint(redirect_uri: str, *, docs_url: str | None = None) 
 # where one app's refresh invalidates the other's session.
 # =============================================================================
 
+def _load_codex_pool_state(auth_store: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return a provider-state-shaped Codex OAuth entry from credential_pool."""
+    pool = auth_store.get("credential_pool")
+    if not isinstance(pool, dict):
+        return None
+    entries = pool.get("openai-codex")
+    if not isinstance(entries, list):
+        return None
+
+    candidates: list[Dict[str, Any]] = [entry for entry in entries if isinstance(entry, dict)]
+    candidates.sort(key=lambda entry: int(entry.get("priority") or 0))
+    for entry in candidates:
+        auth_type = str(entry.get("auth_type") or "").strip().lower()
+        if auth_type and auth_type != "oauth":
+            continue
+        tokens = {
+            "access_token": str(entry.get("access_token") or ""),
+            "refresh_token": str(entry.get("refresh_token") or ""),
+        }
+        if not tokens["access_token"] and not tokens["refresh_token"]:
+            continue
+        return {
+            "tokens": tokens,
+            "last_refresh": entry.get("last_refresh"),
+            "auth_mode": "chatgpt",
+            "source": "credential_pool",
+        }
+    return None
+
+
 def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     """Read Codex OAuth tokens from Hermes auth store (~/.hermes/auth.json).
     
@@ -2972,6 +3002,8 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     else:
         auth_store = _load_auth_store()
     state = _load_provider_state(auth_store, "openai-codex")
+    if not state:
+        state = _load_codex_pool_state(auth_store)
     if not state:
         raise AuthError(
             "No Codex credentials stored. Run `hermes auth` to authenticate.",
