@@ -14,11 +14,24 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - '**/*.py'
+      # Keep PR Docker smoke focused on packaging/container/runtime entrypoints.
+      # Broad Python correctness is covered by Tests; push/release still keep
+      # the full publish path above so main receives image coverage.
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'docker/**'
       - 'pyproject.toml'
       - 'uv.lock'
-      - 'Dockerfile'
-      - 'docker/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'web/package.json'
+      - 'web/package-lock.json'
+      - 'ui-tui/package.json'
+      - 'ui-tui/package-lock.json'
+      - 'ui-tui/packages/hermes-ink/**'
+      - '*.py'
+      - 'agent/**'
+      - 'hermes_cli/**'
       - '.github/workflows/docker-publish.yml'
       - '.github/actions/hermes-smoke-test/**'
   release:
