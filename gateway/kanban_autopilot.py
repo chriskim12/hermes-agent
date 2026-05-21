@@ -1014,10 +1014,10 @@ def _effective_mode(desired_mode: str, state: dict[str, Any]) -> str:
         return "stopped" if desired == "stopped" else "degraded"
     if desired == "paused":
         return "paused"
-    # Phase 1 records controller intent only.  Even desired=on remains blocked
-    # until later BO-079/BO-080 gates prove safe execution eligibility.
+    # Focused `/autopilot on <parent>` has live bounded dispatcher authority;
+    # unscoped `on` stays blocked so the global ready queue cannot be drained.
     if desired in {"on", "enabled"}:
-        return "blocked"
+        return "parent_scoped" if state.get("focus") else "blocked"
     if state.get("read_error"):
         return "degraded"
     return "degraded"
@@ -1158,13 +1158,13 @@ def evaluate_dispatcher_eligibility(candidates: list[dict[str, Any]]) -> dict[st
                 "reason_codes": ["autopilot_lane_paused"],
                 "human_reason": f"Autopilot lane is paused: {tenant}",
             }
-        elif effective != "blocked":
+        elif effective not in {"blocked", "parent_scoped", "bounded_multi_tick"}:
             gate = {
                 **gate,
                 "autopilot_ready": False,
                 "status": "rejected",
                 "reason_codes": ["autopilot_effective_mode_not_blocked_pending_dispatch_gate"],
-                "human_reason": "Autopilot controller is not in desired=on/effective=blocked pending-dispatch-gate mode.",
+                "human_reason": "Autopilot controller is not in a dispatch-enabled mode.",
             }
         if gate["autopilot_ready"]:
             eligible.append(gate)
@@ -1280,6 +1280,56 @@ def _bounded_on_decision(command: AutopilotCommand, *, actor: Optional[str], can
     }
 
 
+def autopilot_continuous_tick(*, actor: Optional[str] = None, candidates: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
+    """Run one persisted `/autopilot on <parent>` controller tick.
+
+    The gateway watcher calls this repeatedly.  It is intentionally one bounded
+    tick: load the persisted parent focus, select at most one ready-gate-passed
+    child, and hand only that selected task to the existing Kanban dispatcher.
+    """
+
+    state = _read_state()
+    desired = str(state.get("desired_mode") or "disabled").lower()
+    if desired != "on" or not state.get("enabled"):
+        return {
+            "action": "continuous-tick",
+            "actor": actor,
+            "desired_mode": desired,
+            "effective_mode": _effective_mode(desired, state),
+            "status": "IDLE",
+            "reason": "autopilot_not_on",
+            "scope": {"parent_public_id": state.get("focus"), "tenant": None},
+            "caps": {"max_active_flights": 1, "max_dispatches_per_tick": 1},
+            "dispatched_count": 0,
+            "dispatch_result": None,
+            "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
+            "mutations_attempted": list(_MUTATIONS_ATTEMPTED),
+        }
+    focus = str(state.get("focus") or "").strip().upper()
+    if not focus:
+        return {
+            "action": "continuous-tick",
+            "actor": actor,
+            "desired_mode": desired,
+            "effective_mode": _effective_mode(desired, state),
+            "status": "BLOCKED",
+            "reason": "missing_parent_scope",
+            "scope": {"parent_public_id": None, "tenant": None},
+            "caps": {"max_active_flights": 1, "max_dispatches_per_tick": 1},
+            "dispatched_count": 0,
+            "dispatch_result": None,
+            "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
+            "mutations_attempted": list(_MUTATIONS_ATTEMPTED),
+        }
+    command = AutopilotCommand(action="on", raw_args=f"on {focus}", value=focus)
+    resolved_candidates = _resolve_candidates(command, candidates)
+    return _bounded_on_decision(
+        command,
+        actor=actor or "autopilot-continuous-loop",
+        candidates=resolved_candidates,
+    )
+
+
 def _once_decision(command: AutopilotCommand, *, actor: Optional[str], candidates: Optional[list[dict[str, Any]]]) -> dict[str, Any]:
     single_flight = activate_single_flight(candidates or [])
     dispatch_result: dict[str, Any] | None = None
@@ -1343,10 +1393,14 @@ def _status_decision(command: AutopilotCommand, *, actor: Optional[str] = None) 
     state = _read_state()
     desired_mode = str(state.get("desired_mode") or "disabled")
     effective = _effective_mode(desired_mode, state)
-    reasons = ["phase1_controller_state_only_no_execution_authority"]
+    reasons = []
+    if effective == "parent_scoped":
+        reasons.append("parent_scoped_continuous_loop_enabled")
+    else:
+        reasons.append("phase1_controller_state_only_no_execution_authority")
     if state.get("read_error"):
         reasons.append(str(state["read_error"]))
-    if state.get("enabled") or desired_mode in {"on", "enabled"}:
+    if (state.get("enabled") or desired_mode in {"on", "enabled"}) and effective != "parent_scoped":
         reasons.append("state_file_enabled_true_is_not_runtime_proof")
     return {
         "action": command.action,
@@ -1383,14 +1437,20 @@ def _format_status_message(decision: dict[str, Any]) -> str:
         lines.append(f"focus={decision['focus']}")
     if decision.get("pause_reason"):
         lines.append(f"pause_reason={decision['pause_reason']}")
-    lines.extend(
-        [
-            "reason=" + str(decision["reason"]),
-            "State file enabled=true is not execution proof.",
-            "No dispatch, claim, worker spawn, or Kanban mutation was attempted.",
-            f"state_file={state.get('path')}",
-        ]
-    )
+    lines.append("reason=" + str(decision["reason"]))
+    if decision.get("effective_mode") == "parent_scoped":
+        lines.extend([
+            "Continuous bounded loop is enabled for the focused parent.",
+            "Each tick may hand at most one selected task to the existing Kanban dispatcher.",
+        ])
+    else:
+        lines.extend(
+            [
+                "State file enabled=true is not execution proof.",
+                "No dispatch, claim, worker spawn, or Kanban mutation was attempted.",
+            ]
+        )
+    lines.append(f"state_file={state.get('path')}")
     return "\n".join(lines)
 
 
@@ -1408,7 +1468,10 @@ def _controller_state_for(command: AutopilotCommand, *, actor: Optional[str]) ->
         "updated_by": actor or "unknown",
     }
     if command.action == "on":
-        state.update({"desired_mode": "on", "enabled": True, "pause_reason": None})
+        updates: dict[str, Any] = {"desired_mode": "on", "enabled": True, "pause_reason": None}
+        if command.value.strip():
+            updates["focus"] = command.value.strip().upper()
+        state.update(updates)
     elif command.action in {"off", "stop"}:
         state.update({"desired_mode": "stopped", "enabled": False, "pause_reason": None})
     elif command.action == "pause":

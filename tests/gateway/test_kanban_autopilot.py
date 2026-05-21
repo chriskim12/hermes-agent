@@ -1046,3 +1046,67 @@ def test_autopilot_on_without_explicit_or_focused_parent_scope_stays_control_onl
     assert result.ok is True
     assert result.decision["desired_mode"] == "on"
     assert result.decision["dispatch_once_called"] is False
+
+
+def test_autopilot_on_parent_persists_focus_for_continuous_loop(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import handle_autopilot_command
+
+    result = handle_autopilot_command("on BO-114", actor="tester", candidates=[])
+    status = handle_autopilot_command("status", actor="tester")
+    state = json.loads((tmp_path / "gateway_autopilot_state.json").read_text(encoding="utf-8"))
+
+    assert result.ok is True
+    assert state["desired_mode"] == "on"
+    assert state["enabled"] is True
+    assert state["focus"] == "BO-114"
+    assert status.decision["focus"] == "BO-114"
+
+
+def test_autopilot_continuous_tick_uses_persisted_parent_focus_and_dispatches_one(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway import kanban_autopilot
+
+    loaded: list[dict] = []
+    dispatched: list[str] = []
+
+    def fake_loader(*, parent_public_id=None, tenant=None, limit=50):
+        loaded.append({"parent_public_id": parent_public_id, "tenant": tenant, "limit": limit})
+        return [_ready_candidate("BO-201"), _ready_candidate("BO-202")]
+
+    def fake_dispatch(candidate: dict, **_kwargs) -> dict:
+        dispatched.append(candidate["public_id"])
+        return {"dispatched": True, "spawned": [{"task_id": candidate["task_id"], "assignee": "default", "workspace": "/tmp/ws"}]}
+
+    monkeypatch.setattr(kanban_autopilot, "load_live_kanban_candidates", fake_loader, raising=False)
+    monkeypatch.setattr(kanban_autopilot, "dispatch_selected_once", fake_dispatch, raising=False)
+
+    kanban_autopilot.handle_autopilot_command("on BO-114", actor="tester", candidates=[])
+    result = kanban_autopilot.autopilot_continuous_tick(actor="gateway-loop")
+
+    assert result["status"] == "BOUNDED_DISPATCHED"
+    assert result["scope"] == {"parent_public_id": "BO-114", "tenant": None}
+    assert result["caps"] == {"max_active_flights": 1, "max_dispatches_per_tick": 1}
+    assert result["dispatched_count"] == 1
+    assert loaded == [{"parent_public_id": "BO-114", "tenant": None, "limit": 50}]
+    assert dispatched == ["BO-201"]
+
+
+def test_autopilot_continuous_tick_without_parent_scope_stays_blocked(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway import kanban_autopilot
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("continuous autopilot must not dispatch without parent focus")
+
+    monkeypatch.setattr(kanban_autopilot, "dispatch_selected_once", forbidden, raising=False)
+    kanban_autopilot.handle_autopilot_command("on", actor="tester")
+
+    result = kanban_autopilot.autopilot_continuous_tick(actor="gateway-loop")
+
+    assert result["status"] == "BLOCKED"
+    assert result["reason"] == "missing_parent_scope"
+    assert result["dispatched_count"] == 0
