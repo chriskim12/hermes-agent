@@ -11,6 +11,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -455,3 +456,144 @@ def apply_workspace_cleanup_actions(
         })
         results.append(result)
     return results
+
+
+def _format_bytes(size: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TiB"
+
+
+def _disk_usage_dict(path: Path) -> dict[str, Any]:
+    usage = shutil.disk_usage(path)
+    used = usage.total - usage.free
+    percent = (used / usage.total * 100) if usage.total else 0.0
+    return {
+        "path": str(path),
+        "total_bytes": usage.total,
+        "used_bytes": used,
+        "free_bytes": usage.free,
+        "used_percent": round(percent, 1),
+    }
+
+
+def _pressure_level(used_percent: float) -> str:
+    if used_percent >= 95:
+        return "critical"
+    if used_percent >= 85:
+        return "warning"
+    return "ok"
+
+
+def collect_disk_pressure_report(
+    *,
+    root_path: Path = Path("/"),
+    data_path: Path = Path("/mnt/hermes-data"),
+    db_path: Path = Path.home() / ".hermes" / "kanban.db",
+    workspaces_root: Path = Path.home() / ".hermes" / "kanban" / "workspaces",
+    top_paths: Sequence[Path] | None = None,
+    min_workspace_bytes: int = 10 * 1024 * 1024,
+    min_artifact_bytes: int = 10 * 1024 * 1024,
+    now: int | None = None,
+) -> dict[str, Any]:
+    """Collect a read-only daily disk pressure report.
+
+    The report intentionally only observes disk pressure and cleanup candidates;
+    it never calls cleanup apply functions. It is safe for a no-agent cron job.
+    """
+    now = int(now if now is not None else time.time())
+    top_paths = list(top_paths or [
+        Path.home() / ".hermes" / "hermes-agent" / ".worktrees",
+        Path.home() / ".hermes" / "kanban" / "workspaces",
+        Path.home() / ".hermes" / "sessions",
+        Path("/var/lib/docker"),
+        Path("/var/lib/containerd"),
+        Path("/tmp"),
+        Path.home() / ".npm",
+        Path.home() / ".cache" / "uv",
+    ])
+
+    root_usage = _disk_usage_dict(root_path)
+    data_usage = _disk_usage_dict(data_path) if data_path.exists() else None
+    workspace_reports = classify_workspaces(
+        db_path,
+        workspaces_root,
+        now=now,
+        min_workspace_bytes=min_workspace_bytes,
+        min_artifact_bytes=min_artifact_bytes,
+    ) if db_path.exists() else []
+    artifact_actions = plan_artifact_cleanup_actions(workspace_reports)
+    workspace_actions = plan_workspace_cleanup_actions(workspace_reports)
+
+    pressure_paths: list[dict[str, Any]] = []
+    for path in top_paths:
+        if not path.exists():
+            pressure_paths.append({"path": str(path), "exists": False, "size_bytes": 0})
+            continue
+        pressure_paths.append({"path": str(path), "exists": True, "size_bytes": path_size(path)})
+    pressure_paths.sort(key=lambda item: int(item.get("size_bytes") or 0), reverse=True)
+
+    state_counts: dict[str, int] = {}
+    for report in workspace_reports:
+        state_counts[report.state] = state_counts.get(report.state, 0) + 1
+
+    return {
+        "checked_at_epoch": now,
+        "root": root_usage,
+        "data": data_usage,
+        "pressure_level": _pressure_level(float(root_usage["used_percent"])),
+        "top_paths": pressure_paths,
+        "workspace_state_counts": state_counts,
+        "workspace_reports": [report.to_dict() for report in workspace_reports],
+        "artifact_cleanup_candidates": [action.to_dict() for action in artifact_actions],
+        "workspace_cleanup_candidates": [action.to_dict() for action in workspace_actions],
+        "safe_to_apply_without_approval": False,
+        "boundary": "read-only report; no deletion/apply/restart/env mutation",
+    }
+
+
+def format_disk_pressure_report(report: Mapping[str, Any]) -> str:
+    """Render a privacy-safe operational report for Discord/cron delivery."""
+    root = report["root"]
+    data = report.get("data")
+    artifact_candidates = list(report.get("artifact_cleanup_candidates") or [])
+    workspace_candidates = list(report.get("workspace_cleanup_candidates") or [])
+    top_paths = list(report.get("top_paths") or [])[:8]
+    state_counts = dict(report.get("workspace_state_counts") or {})
+
+    lines = [
+        "📌 Daily disk pressure report",
+        f"- root: {root['used_percent']}% used, {_format_bytes(int(root['free_bytes']))} free ({report['pressure_level']})",
+    ]
+    if data:
+        lines.append(f"- /mnt/hermes-data: {data['used_percent']}% used, {_format_bytes(int(data['free_bytes']))} free")
+    lines.extend([
+        f"- cleanup candidates: artifacts={len(artifact_candidates)}, full_workspaces={len(workspace_candidates)}",
+        "- boundary: read-only; no cleanup was applied",
+        "",
+        "Top pressure paths:",
+    ])
+    for item in top_paths:
+        suffix = _format_bytes(int(item.get("size_bytes") or 0)) if item.get("exists") else "missing"
+        lines.append(f"- {item['path']}: {suffix}")
+
+    lines.extend(["", "Kanban workspace states:"])
+    if state_counts:
+        for state, count in sorted(state_counts.items()):
+            lines.append(f"- {state}: {count}")
+    else:
+        lines.append("- none")
+
+    if artifact_candidates or workspace_candidates:
+        lines.extend(["", "Candidate preview:"])
+        for action in artifact_candidates[:5]:
+            lines.append(f"- artifact {action['kind']} {action['artifact_path']} ({_format_bytes(int(action['size_bytes']))})")
+        for action in workspace_candidates[:5]:
+            lines.append(f"- workspace {action['workspace_path']} ({_format_bytes(int(action['size_bytes']))})")
+    return "\n".join(lines)

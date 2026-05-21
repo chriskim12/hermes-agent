@@ -10,7 +10,9 @@ from hermes_cli.kanban_workspace_janitor import (
     apply_workspace_cleanup_actions,
     classify_workspace,
     classify_workspaces,
+    collect_disk_pressure_report,
     discover_artifacts,
+    format_disk_pressure_report,
     path_size,
     plan_artifact_cleanup_actions,
     plan_workspace_cleanup_actions,
@@ -357,3 +359,78 @@ def test_apply_workspace_cleanup_actions_apply_rejects_dirty_and_deletes_clean(t
     assert dirty.exists()
     assert results[1]["deleted"] is True
     assert not clean.exists()
+
+
+def test_collect_disk_pressure_report_is_read_only_and_counts_candidates(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    workspaces = tmp_path / "workspaces"
+    workspace = workspaces / "t_done"
+    artifact = workspace / "node_modules"
+    artifact.mkdir(parents=True)
+    (artifact / "pkg.js").write_text("x" * 32)
+
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            public_id TEXT,
+            title TEXT,
+            status TEXT,
+            review_phase TEXT,
+            completed_at INTEGER,
+            result TEXT,
+            closeout_evidence TEXT,
+            current_run_id INTEGER,
+            worker_pid INTEGER,
+            assignee TEXT,
+            workspace_kind TEXT,
+            workspace_path TEXT
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("t_done", "BO-999", "Fixture", "done", "worker_done", 1, "kept", None, None, None, None, "scratch", None),
+    )
+    conn.commit()
+    monkeypatch.setattr("hermes_cli.kanban_workspace_janitor.process_cwds", lambda: [])
+    monkeypatch.setattr("hermes_cli.kanban_workspace_janitor.tmux_cwds", lambda: [])
+
+    report = collect_disk_pressure_report(
+        root_path=tmp_path,
+        data_path=tmp_path,
+        db_path=db_path,
+        workspaces_root=workspaces,
+        top_paths=[workspace],
+        min_workspace_bytes=1,
+        min_artifact_bytes=1,
+        now=200_000,
+    )
+
+    assert artifact.exists()
+    assert report["safe_to_apply_without_approval"] is False
+    assert report["workspace_state_counts"] == {"safe-artifact-candidate": 1}
+    assert len(report["artifact_cleanup_candidates"]) == 1
+    assert report["workspace_cleanup_candidates"] == []
+
+
+def test_format_disk_pressure_report_includes_boundary_and_candidates():
+    rendered = format_disk_pressure_report(
+        {
+            "root": {"used_percent": 96.0, "free_bytes": 1024},
+            "data": {"used_percent": 10.0, "free_bytes": 2048},
+            "pressure_level": "critical",
+            "artifact_cleanup_candidates": [
+                {"kind": "node_modules", "artifact_path": "/tmp/t/node_modules", "size_bytes": 1024}
+            ],
+            "workspace_cleanup_candidates": [],
+            "top_paths": [{"path": "/tmp/t", "exists": True, "size_bytes": 2048}],
+            "workspace_state_counts": {"safe-artifact-candidate": 1},
+        }
+    )
+
+    assert "Daily disk pressure report" in rendered
+    assert "root: 96.0% used" in rendered
+    assert "cleanup candidates: artifacts=1, full_workspaces=0" in rendered
+    assert "boundary: read-only" in rendered
