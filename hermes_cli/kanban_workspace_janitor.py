@@ -536,7 +536,20 @@ def collect_disk_pressure_report(
         if not path.exists():
             pressure_paths.append({"path": str(path), "exists": False, "size_bytes": 0})
             continue
-        pressure_paths.append({"path": str(path), "exists": True, "size_bytes": path_size(path)})
+        measured_path = path
+        resolved_path = None
+        if path.is_symlink():
+            try:
+                candidate = path.resolve(strict=True)
+            except OSError:
+                candidate = path
+            if candidate.is_dir():
+                measured_path = candidate
+                resolved_path = str(candidate)
+        item = {"path": str(path), "exists": True, "size_bytes": path_size(measured_path)}
+        if resolved_path:
+            item["resolved_path"] = resolved_path
+        pressure_paths.append(item)
     pressure_paths.sort(key=lambda item: int(item.get("size_bytes") or 0), reverse=True)
 
     state_counts: dict[str, int] = {}
