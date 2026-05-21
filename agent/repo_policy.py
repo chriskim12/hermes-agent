@@ -137,7 +137,19 @@ def _add_contract_issues(policy: dict[str, Any], issues: list[RepoPolicyIssue]) 
     runtime = _mapping(policy.get("runtime"))
     gates = _mapping(policy.get("gates"))
     closeout = _mapping(policy.get("closeout"))
+    guard = _mapping(policy.get("guard"))
     closeout_sections = set(closeout.get("required_sections") or [])
+
+    if guard:
+        canonical_checkout = guard.get("canonical_checkout")
+        protected_branches = guard.get("protected_branches")
+        mutation_mode = guard.get("mutation_on_canonical_checkout")
+        if not isinstance(canonical_checkout, str) or not canonical_checkout.startswith("/"):
+            issues.append(RepoPolicyIssue("invalid_guard_canonical_checkout", "Policy drift detected: guard.canonical_checkout must be an absolute path"))
+        if not isinstance(protected_branches, list) or not protected_branches or not all(isinstance(branch, str) and branch for branch in protected_branches):
+            issues.append(RepoPolicyIssue("invalid_guard_protected_branches", "Policy drift detected: guard.protected_branches must be a non-empty list of branch names"))
+        if mutation_mode != "block":
+            issues.append(RepoPolicyIssue("invalid_guard_mutation_mode", "Policy drift detected: guard.mutation_on_canonical_checkout must be block"))
 
     missing_closeout = sorted(REQUIRED_CLOSEOUT - closeout_sections)
     if missing_closeout:
@@ -245,6 +257,13 @@ def check_repo_policy(repo_path: str | Path) -> RepoPolicyCheckResult:
                 "work_done_means": workflow.get("work_done_means"),
                 "release_path": f"{workflow.get('release_source')}->{workflow.get('release_target')}" if workflow.get("release_source") and workflow.get("release_target") else None,
                 "live_apply": workflow.get("live_apply"),
+            }
+        guard = _mapping(policy.get("guard"))
+        if guard:
+            authority["guard"] = {
+                "canonical_checkout": guard.get("canonical_checkout"),
+                "protected_branches": guard.get("protected_branches"),
+                "mutation_on_canonical_checkout": guard.get("mutation_on_canonical_checkout"),
             }
         issues.extend(_agents_conflicts(repo))
 

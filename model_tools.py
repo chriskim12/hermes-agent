@@ -802,6 +802,23 @@ def handle_function_call(
             if function_name in {"write_file", "patch"}:
                 return json.dumps({"error": "Edit approval denied: approval guard failed"}, ensure_ascii=False)
 
+        # Repo-policy v1 hardblock: canonical checkout + protected branch + mutation = block.
+        # This runs before dispatch so protected canonical checkouts are not dirtied by
+        # file tools or obviously mutating terminal commands.
+        try:
+            from agent.repo_mutation_guard import guard_result_json, repo_policy_mutation_block_message
+
+            repo_guard_message = repo_policy_mutation_block_message(function_name, function_args)
+            if repo_guard_message is not None:
+                return guard_result_json(repo_guard_message)
+        except Exception as _repo_guard_err:
+            logger.debug("repo-policy mutation guard error: %s", _repo_guard_err)
+            if function_name in {"write_file", "patch"}:
+                return json.dumps(
+                    {"error": "Repo-policy mutation guard failed closed before file mutation"},
+                    ensure_ascii=False,
+                )
+
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).
         if function_name not in _READ_SEARCH_TOOLS:
