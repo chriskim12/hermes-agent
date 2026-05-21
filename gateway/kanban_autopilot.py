@@ -1491,6 +1491,72 @@ def reconcile_post_merge_cleanup(registry: dict[str, Any], *, merged_prs: list[d
 
 
 
+def prove_worker_verifier_retry_loop_check_only(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Check an end-to-end worker→verifier→retry/review_ready event trace.
+
+    BO-153's proof is deliberately check-only: it accepts fixture events and
+    verifies that a completed worker event leads either to verifier FAIL with a
+    retry/remediation disposition, or verifier PASS with cleanup-checked
+    review_ready.  It records forbidden authority as false and performs no
+    Kanban, GitHub, cleanup, restart, or provider mutation.
+    """
+
+    by_kind: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        by_kind.setdefault(str(event.get("kind") or ""), []).append(event)
+    reason_codes: list[str] = []
+    if not by_kind.get("worker_completed"):
+        reason_codes.append("missing_worker_completed_event")
+    if not by_kind.get("verifier_intake"):
+        reason_codes.append("missing_verifier_intake_event")
+    verifier_events = by_kind.get("verifier_result") or []
+    if not verifier_events:
+        reason_codes.append("missing_verifier_result_event")
+    outcomes: list[dict[str, Any]] = []
+    for event in verifier_events:
+        verdict = str(event.get("verdict") or "").upper()
+        if verdict == "FAIL":
+            retry = bool(by_kind.get("retry_queued") or by_kind.get("remediation_child_queued"))
+            if not retry:
+                reason_codes.append("verifier_fail_without_retry_or_remediation")
+            outcomes.append({"verdict": verdict, "next_state": "retry_or_remediation" if retry else "needs_human"})
+        elif verdict == "PASS":
+            cleanup = bool(by_kind.get("cleanup_checked"))
+            review_ready = bool(by_kind.get("review_ready_promoted"))
+            if not cleanup:
+                reason_codes.append("verifier_pass_without_cleanup_check")
+            if not review_ready:
+                reason_codes.append("verifier_pass_without_review_ready_promotion")
+            outcomes.append({"verdict": verdict, "next_state": "review_ready" if cleanup and review_ready else "blocked"})
+        else:
+            reason_codes.append("unknown_verifier_verdict")
+            outcomes.append({"verdict": verdict or "UNKNOWN", "next_state": "needs_human"})
+    forbidden_attempts = [event for event in events if str(event.get("kind") or "") == "forbidden_mutation_attempt"]
+    if forbidden_attempts and not by_kind.get("authority_blocked"):
+        reason_codes.append("forbidden_attempt_not_blocked")
+    parent_matrix_updated = bool(by_kind.get("parent_matrix_updated"))
+    if not parent_matrix_updated:
+        reason_codes.append("missing_parent_matrix_update")
+    return {
+        "passed": not reason_codes,
+        "reason_codes": reason_codes,
+        "outcomes": outcomes,
+        "observed": {kind: len(items) for kind, items in sorted(by_kind.items())},
+        "parent_matrix_updated": parent_matrix_updated,
+        "authority": {
+            "check_only": True,
+            "merge_allowed": False,
+            "release_allowed": False,
+            "gateway_restart_reload_allowed": False,
+            "config_env_secret_mutation_allowed": False,
+            "prod_customer_visible_allowed": False,
+        },
+        "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
+        "next_state": "proof_passed" if not reason_codes else "needs_human",
+    }
+
+
+
 def evaluate_autopilot_promotion_policy(proof: dict[str, Any]) -> dict[str, Any]:
     """Evaluate whether first live pickup proof may promote to bounded check-only mode.
 
