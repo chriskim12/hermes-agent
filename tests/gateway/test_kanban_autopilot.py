@@ -1891,3 +1891,73 @@ def test_verifier_pass_operator_report_allows_only_review_ready_gate():
     assert report["authority"]["review_ready_allowed"] is True
     assert report["authority"]["gateway_restart_reload_allowed"] is False
     assert report["authority"]["config_env_secret_mutation_allowed"] is False
+
+
+def test_e2e_check_only_worker_verifier_retry_and_success_paths_pass():
+    from gateway.kanban_autopilot import prove_worker_verifier_retry_loop_check_only
+
+    failure_path = prove_worker_verifier_retry_loop_check_only([
+        {"kind": "worker_completed", "public_id": "BO-153"},
+        {"kind": "verifier_intake", "public_id": "BO-153"},
+        {"kind": "verifier_result", "verdict": "FAIL", "missing_criteria": ["dc-02"]},
+        {"kind": "retry_queued", "public_id": "BO-153", "attempt": 2},
+        {"kind": "parent_matrix_updated", "parent_public_id": "BO-145"},
+    ])
+    success_path = prove_worker_verifier_retry_loop_check_only([
+        {"kind": "worker_completed", "public_id": "BO-153"},
+        {"kind": "verifier_intake", "public_id": "BO-153"},
+        {"kind": "verifier_result", "verdict": "PASS"},
+        {"kind": "cleanup_checked", "public_id": "BO-153"},
+        {"kind": "review_ready_promoted", "public_id": "BO-153"},
+        {"kind": "parent_matrix_updated", "parent_public_id": "BO-145"},
+    ])
+
+    assert failure_path["passed"] is True
+    assert failure_path["outcomes"][0]["next_state"] == "retry_or_remediation"
+    assert success_path["passed"] is True
+    assert success_path["outcomes"][0]["next_state"] == "review_ready"
+    assert success_path["authority"]["check_only"] is True
+    assert success_path["authority"]["gateway_restart_reload_allowed"] is False
+    assert success_path["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0}
+
+
+def test_e2e_check_only_blocks_pass_without_cleanup_or_parent_matrix():
+    from gateway.kanban_autopilot import prove_worker_verifier_retry_loop_check_only
+
+    result = prove_worker_verifier_retry_loop_check_only([
+        {"kind": "worker_completed", "public_id": "BO-153"},
+        {"kind": "verifier_intake", "public_id": "BO-153"},
+        {"kind": "verifier_result", "verdict": "PASS"},
+    ])
+
+    assert result["passed"] is False
+    assert "verifier_pass_without_cleanup_check" in result["reason_codes"]
+    assert "verifier_pass_without_review_ready_promotion" in result["reason_codes"]
+    assert "missing_parent_matrix_update" in result["reason_codes"]
+    assert result["next_state"] == "needs_human"
+
+
+def test_e2e_check_only_blocks_unblocked_forbidden_mutation_attempt():
+    from gateway.kanban_autopilot import prove_worker_verifier_retry_loop_check_only
+
+    blocked = prove_worker_verifier_retry_loop_check_only([
+        {"kind": "worker_completed"},
+        {"kind": "verifier_intake"},
+        {"kind": "verifier_result", "verdict": "FAIL"},
+        {"kind": "remediation_child_queued", "public_id": "BO-999"},
+        {"kind": "forbidden_mutation_attempt", "mutation": "gateway_restart"},
+        {"kind": "authority_blocked", "mutation": "gateway_restart"},
+        {"kind": "parent_matrix_updated"},
+    ])
+    unblocked = prove_worker_verifier_retry_loop_check_only([
+        {"kind": "worker_completed"},
+        {"kind": "verifier_intake"},
+        {"kind": "verifier_result", "verdict": "FAIL"},
+        {"kind": "retry_queued"},
+        {"kind": "forbidden_mutation_attempt", "mutation": "gateway_restart"},
+        {"kind": "parent_matrix_updated"},
+    ])
+
+    assert blocked["passed"] is True
+    assert unblocked["passed"] is False
+    assert "forbidden_attempt_not_blocked" in unblocked["reason_codes"]
