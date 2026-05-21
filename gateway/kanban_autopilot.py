@@ -1319,6 +1319,112 @@ def build_autopilot_review_package(
     }
 
 
+def build_worktree_cleanup_registry(entries: list[dict[str, Any]], *, bundle_id: Optional[str] = None) -> dict[str, Any]:
+    """Normalize task-owned worktree cleanup state without deleting anything.
+
+    BO-151 keeps cleanup accounting explicit: registered git worktrees need
+    review-safe disposition before ``review_ready`` and a separate post-merge
+    reconcile ledger after Chris accepts/merges the PR stack.  This helper is
+    pure/check-only; it records which entries would block instead of attempting
+    ``git worktree remove`` or branch pruning itself.
+    """
+
+    normalized: list[dict[str, Any]] = []
+    blockers: list[dict[str, Any]] = []
+    for raw in entries:
+        entry = dict(raw)
+        public_id = entry.get("public_id") or entry.get("card_id") or entry.get("task_id")
+        cleanup_state = str(entry.get("cleanup_state") or "pending").strip().lower()
+        reason_codes: list[str] = []
+        if not str(entry.get("path") or "").strip():
+            reason_codes.append("missing_worktree_path")
+        if entry.get("registered_git_worktree") is not True:
+            reason_codes.append("registered_git_worktree_not_verified")
+        if cleanup_state == "removed":
+            if entry.get("git_worktree_remove_verified") is not True:
+                reason_codes.append("missing_git_worktree_remove_proof")
+        elif cleanup_state == "retained":
+            if not str(entry.get("retained_reason") or "").strip():
+                reason_codes.append("missing_retained_reason")
+            if not str(entry.get("ttl") or entry.get("revisit_at") or "").strip():
+                reason_codes.append("missing_retained_ttl")
+            if entry.get("review_safe") is not True:
+                reason_codes.append("retained_residue_not_review_safe")
+        else:
+            reason_codes.append("cleanup_pending")
+        if entry.get("active_process_cwd") or entry.get("active_tmux_cwd") or entry.get("active_worker_pid"):
+            reason_codes.append("active_reference_blocks_cleanup")
+        status = "ok" if not reason_codes else "blocked"
+        item = {**entry, "public_id": public_id, "cleanup_state": cleanup_state, "status": status, "reason_codes": reason_codes}
+        normalized.append(item)
+        if reason_codes:
+            blockers.append({"public_id": public_id, "path": entry.get("path"), "reason_codes": reason_codes})
+    return {
+        "bundle_id": bundle_id,
+        "entries": normalized,
+        "blocked_entries": blockers,
+        "cleanup_required": bool(blockers),
+        "review_ready_allowed": not blockers,
+        "destructive_cleanup_performed": False,
+        "required_apply_primitive": "git_worktree_remove_then_prune_verify",
+    }
+
+
+def evaluate_pre_review_cleanup_gate(registry: dict[str, Any]) -> dict[str, Any]:
+    """Gate review_ready on removed or safely-retained task worktrees."""
+
+    blockers = list(registry.get("blocked_entries") or [])
+    reason_codes = ["cleanup_required"] if blockers else []
+    for blocker in blockers:
+        for code in blocker.get("reason_codes") or []:
+            if code not in reason_codes:
+                reason_codes.append(code)
+    return {
+        "review_ready_allowed": not blockers,
+        "cleanup_required": bool(blockers),
+        "reason_codes": reason_codes,
+        "blocked_entries": blockers,
+        "post_merge_reconcile_still_required": True,
+        "destructive_cleanup_performed": False,
+    }
+
+
+def reconcile_post_merge_cleanup(registry: dict[str, Any], *, merged_prs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build a post-merge cleanup reconcile ledger from existing proof.
+
+    The reconcile remains check-only here: it verifies that every retained or
+    removed worktree entry has corresponding merged/accepted PR evidence and no
+    stale cleanup blockers.  Runtime materialization and gateway restart remain
+    outside this authority ceiling.
+    """
+
+    merged_by_public_id = {str(pr.get("public_id") or pr.get("work_id") or ""): pr for pr in merged_prs}
+    entries = registry.get("entries") or []
+    stale: list[dict[str, Any]] = []
+    reconciled: list[dict[str, Any]] = []
+    for entry in entries:
+        public_id = str(entry.get("public_id") or "")
+        pr = merged_by_public_id.get(public_id)
+        reasons: list[str] = []
+        if not pr or pr.get("state") != "MERGED":
+            reasons.append("missing_merged_pr_truth")
+        if entry.get("status") != "ok":
+            reasons.append("pre_review_cleanup_not_resolved")
+        item = {"public_id": public_id, "path": entry.get("path"), "merged_pr": pr, "reason_codes": reasons, "status": "reconciled" if not reasons else "blocked"}
+        reconciled.append(item)
+        if reasons:
+            stale.append(item)
+    return {
+        "reconciled": reconciled,
+        "stale_entries": stale,
+        "closed_allowed": not stale,
+        "gateway_restart_reload_allowed": False,
+        "canonical_materialization_allowed": False,
+        "destructive_cleanup_performed": False,
+    }
+
+
+
 def evaluate_autopilot_promotion_policy(proof: dict[str, Any]) -> dict[str, Any]:
     """Evaluate whether first live pickup proof may promote to bounded check-only mode.
 
