@@ -3,10 +3,13 @@ from __future__ import annotations
 import sqlite3
 
 from hermes_cli.kanban_workspace_janitor import (
+    CleanupAction,
+    apply_artifact_cleanup_actions,
     classify_workspace,
     classify_workspaces,
     discover_artifacts,
     path_size,
+    plan_artifact_cleanup_actions,
 )
 
 
@@ -162,3 +165,100 @@ def test_classify_workspaces_loads_task_metadata_from_db(tmp_path, monkeypatch):
     assert reports[0].task["public_id"] == "BO-999"
     assert reports[0].state == "safe-artifact-candidate"
     assert reports[0].size_bytes == path_size(workspace)
+
+
+def test_plan_artifact_cleanup_actions_only_uses_safe_candidates(tmp_path):
+    safe_workspace = tmp_path / "safe"
+    safe_artifact = safe_workspace / "node_modules"
+    safe_artifact.mkdir(parents=True)
+    (safe_artifact / "pkg.js").write_text("x")
+    blocked_workspace = tmp_path / "blocked"
+    blocked_artifact = blocked_workspace / "node_modules"
+    blocked_artifact.mkdir(parents=True)
+
+    safe_report = classify_workspace(
+        safe_workspace,
+        {"id": "safe", "status": "done", "completed_at": 1, "result": "kept"},
+        now=200_000,
+        proc_cwds=[],
+        pane_cwds=[],
+    )
+    blocked_report = classify_workspace(
+        blocked_workspace,
+        {"id": "blocked", "status": "blocked", "completed_at": None},
+        now=200_000,
+        proc_cwds=[],
+        pane_cwds=[],
+    )
+
+    actions = plan_artifact_cleanup_actions([blocked_report, safe_report])
+
+    assert len(actions) == 1
+    assert actions[0].task_id == "safe"
+    assert actions[0].artifact_path == str(safe_artifact)
+
+
+def test_apply_artifact_cleanup_actions_dry_run_never_deletes(tmp_path):
+    workspace = tmp_path / "safe"
+    artifact = workspace / "node_modules"
+    artifact.mkdir(parents=True)
+    (artifact / "pkg.js").write_text("x")
+    action = CleanupAction(
+        task_id="safe",
+        workspace_path=str(workspace),
+        artifact_path=str(artifact),
+        kind="node_modules",
+        size_bytes=1,
+        candidate_state="safe-artifact-candidate",
+        reason="fixture",
+    )
+
+    result = apply_artifact_cleanup_actions([action])
+
+    assert result == [
+        {
+            "task_id": "safe",
+            "workspace_path": str(workspace),
+            "artifact_path": str(artifact),
+            "kind": "node_modules",
+            "size_bytes": 1,
+            "candidate_state": "safe-artifact-candidate",
+            "reason": "fixture",
+            "dry_run": True,
+            "deleted": False,
+            "guard_errors": [],
+        }
+    ]
+    assert artifact.exists()
+
+
+def test_apply_artifact_cleanup_actions_apply_requires_exact_guards(tmp_path):
+    workspace = tmp_path / "safe"
+    artifact = workspace / "node_modules"
+    artifact.mkdir(parents=True)
+    (artifact / "pkg.js").write_text("x")
+    bad = CleanupAction(
+        task_id="safe",
+        workspace_path=str(workspace),
+        artifact_path=str(tmp_path / "outside" / "node_modules"),
+        kind="node_modules",
+        size_bytes=1,
+        candidate_state="safe-artifact-candidate",
+        reason="fixture",
+    )
+    good = CleanupAction(
+        task_id="safe",
+        workspace_path=str(workspace),
+        artifact_path=str(artifact),
+        kind="node_modules",
+        size_bytes=1,
+        candidate_state="safe-artifact-candidate",
+        reason="fixture",
+    )
+
+    results = apply_artifact_cleanup_actions([bad, good], dry_run=False)
+
+    assert results[0]["deleted"] is False
+    assert "artifact_not_under_workspace" in results[0]["guard_errors"]
+    assert results[1]["deleted"] is True
+    assert not artifact.exists()

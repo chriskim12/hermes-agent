@@ -8,6 +8,7 @@ approval-gated.
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import subprocess
 from dataclasses import dataclass, field
@@ -253,3 +254,112 @@ def classify_workspaces(
         reports.append(report)
     reports.sort(key=lambda report: report.size_bytes, reverse=True)
     return reports
+
+
+@dataclass(slots=True)
+class CleanupAction:
+    """A planned exact-path artifact cleanup action.
+
+    The action is inert until passed to ``apply_artifact_cleanup_actions`` with
+    ``dry_run=False``. This keeps BO-127's apply path explicit and testable.
+    """
+
+    task_id: str
+    workspace_path: str
+    artifact_path: str
+    kind: str
+    size_bytes: int
+    candidate_state: str
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "workspace_path": self.workspace_path,
+            "artifact_path": self.artifact_path,
+            "kind": self.kind,
+            "size_bytes": self.size_bytes,
+            "candidate_state": self.candidate_state,
+            "reason": self.reason,
+        }
+
+
+def plan_artifact_cleanup_actions(
+    reports: Iterable[WorkspaceReport],
+) -> list[CleanupAction]:
+    """Plan exact allowlisted artifact cleanup actions from classifier output."""
+    actions: list[CleanupAction] = []
+    for report in reports:
+        if report.state != "safe-artifact-candidate":
+            continue
+        workspace = Path(report.workspace_path)
+        for artifact in report.artifacts:
+            kind = str(artifact.get("kind") or "")
+            artifact_path = Path(str(artifact.get("path") or ""))
+            if kind not in ARTIFACT_NAMES:
+                continue
+            if artifact_path.name != kind:
+                continue
+            if not _is_relative_to(artifact_path, workspace):
+                continue
+            actions.append(
+                CleanupAction(
+                    task_id=report.task_id,
+                    workspace_path=str(workspace),
+                    artifact_path=str(artifact_path),
+                    kind=kind,
+                    size_bytes=int(artifact.get("size_bytes") or 0),
+                    candidate_state=report.state,
+                    reason=report.reason,
+                )
+            )
+    actions.sort(key=lambda action: action.size_bytes, reverse=True)
+    return actions
+
+
+def apply_artifact_cleanup_actions(
+    actions: Iterable[CleanupAction],
+    *,
+    dry_run: bool = True,
+) -> list[dict[str, Any]]:
+    """Apply or preview exact artifact cleanup actions.
+
+    ``dry_run=True`` is the default and never deletes. ``dry_run=False`` only
+    removes an artifact if all final exact-path guards still pass:
+
+    - artifact path exists and is a directory;
+    - artifact is not a symlink;
+    - artifact path remains under the recorded workspace;
+    - basename still matches the allowlisted artifact kind.
+    """
+    results: list[dict[str, Any]] = []
+    for action in actions:
+        artifact = Path(action.artifact_path)
+        workspace = Path(action.workspace_path)
+        guard_errors: list[str] = []
+        if action.kind not in ARTIFACT_NAMES:
+            guard_errors.append("kind_not_allowlisted")
+        if artifact.name != action.kind:
+            guard_errors.append("artifact_basename_mismatch")
+        if not _is_relative_to(artifact, workspace):
+            guard_errors.append("artifact_not_under_workspace")
+        if artifact.is_symlink():
+            guard_errors.append("artifact_is_symlink")
+        if not artifact.exists():
+            guard_errors.append("artifact_missing")
+        if artifact.exists() and not artifact.is_dir():
+            guard_errors.append("artifact_not_directory")
+
+        result = action.to_dict()
+        result.update({"dry_run": dry_run, "deleted": False, "guard_errors": guard_errors})
+        if guard_errors or dry_run:
+            results.append(result)
+            continue
+        before = path_size(artifact)
+        shutil.rmtree(artifact)
+        result.update({
+            "deleted": not artifact.exists(),
+            "reclaimed_bytes": before,
+        })
+        results.append(result)
+    return results
