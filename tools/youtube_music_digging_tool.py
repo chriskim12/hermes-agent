@@ -541,7 +541,7 @@ def _parse_track_info(info: dict[str, Any]) -> TrackInfo:
     artist = raw_artist
     title = cleaned_title
 
-    m = re.match(r"^(.{1,120}?)\s+[-–—]\s+(.{1,180})$", cleaned_title)
+    m = re.match(r"^(.{2,120}?)\s*[-–—]\s+(.{1,180})$", cleaned_title)
     if m:
         left, right = m.group(1).strip(), m.group(2).strip()
         if left and right:

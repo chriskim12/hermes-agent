@@ -16,6 +16,19 @@ def test_parse_artist_title_preserves_identity_parentheses():
     assert parsed.inferred is True
 
 
+def test_parse_artist_title_accepts_missing_space_before_dash():
+    parsed = tool._parse_track_info({
+        "title": "QBass- Deepa",
+        "uploader": "G Music",
+        "upload_date": "20190101",
+    })
+
+    assert parsed.artist == "QBass"
+    assert parsed.title == "Deepa"
+    assert parsed.date == "2019"
+    assert parsed.inferred is True
+
+
 def test_parse_title_cleans_spaces_left_by_removed_noise_terms():
     parsed = tool._parse_track_info({
         "title": "Rick Astley - Never Gonna Give You Up (Official Video) (4K Remaster)",
