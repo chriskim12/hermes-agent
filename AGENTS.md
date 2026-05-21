@@ -9,6 +9,16 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 source .venv/bin/activate   # or: source venv/bin/activate
 ```
 
+## Repo policy
+
+Before repo work, read `.hermes/repo-policy.yaml`.
+Before external side effects, run `python scripts/check_repo_policy.py --json .` or equivalent repo-policy check.
+If policy is missing, malformed, or mismatched with observable repo state, fail closed to local-only.
+Every closeout must lead with human-first sections (`결론`, `실제 반영`, `아직 안 한 것`, `다음 판단`) and then include the policy ledger (`Policy check`, Green/Yellow/Red/Git/Live sections).
+For this runtime/tooling repo, gateway restart/reload and live runtime apply are Yellow/Red queue items, not automatic closeout actions.
+
+`AGENTS.md` is a pointer only; `.hermes/repo-policy.yaml` is the repo authority.
+
 `scripts/run_tests.sh` probes `.venv` first, then `venv`, then
 `$HOME/.hermes/hermes-agent/venv` (for worktrees that share a venv with the
 main checkout).

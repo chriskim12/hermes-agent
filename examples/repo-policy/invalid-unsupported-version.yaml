@@ -1,0 +1,45 @@
+# Invalid fixture: unsupported schema version must fail closed.
+version: 2
+
+repo:
+  name: invalid-version
+  class: product
+
+authority:
+  policy_source: .hermes/repo-policy.yaml
+
+roles:
+  work: task_branch
+  landing: develop
+  release: release_pr_to_main
+  live_apply: deploy_gate
+
+branches:
+  landing: develop
+  release_base: main
+
+gates:
+  green_allowed:
+    - code_changes
+    - tests
+  yellow_queue: []
+  red_requires_explicit_approval:
+    - merge
+    - deploy
+    - prod_mutation
+    - env_secret_change
+    - billing_pricing_change
+
+runtime:
+  restart_policy: not_applicable
+  live_apply_queue: not_applicable
+
+closeout:
+  required_sections:
+    - Policy check
+    - Green 완료
+    - Yellow 대기
+    - Red 필요
+    - 검증
+    - Git 상태
+    - Live 상태
