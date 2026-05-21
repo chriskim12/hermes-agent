@@ -11,6 +11,11 @@ on:
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
+  # Tier-2 backstop: even with faster path-filtered PR gates, run the broad
+  # test lane on a timer and on demand so skipped PR paths cannot hide drift.
+  schedule:
+    - cron: '17 8 * * 1'
+  workflow_dispatch:
 
 permissions:
   contents: read

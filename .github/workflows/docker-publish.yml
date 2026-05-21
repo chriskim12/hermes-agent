@@ -34,6 +34,12 @@ on:
       - 'hermes_cli/**'
       - '.github/workflows/docker-publish.yml'
       - '.github/actions/hermes-smoke-test/**'
+  # Tier-2 smoke-only backstop: build/smoke on a timer or manually without
+  # moving Docker tags. Publish/tag movement remains restricted to push/release
+  # conditions inside the jobs below.
+  schedule:
+    - cron: '17 9 * * 1'
+  workflow_dispatch:
   release:
     types: [published]
 
