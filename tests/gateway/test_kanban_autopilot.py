@@ -76,6 +76,7 @@ def _review_ready_evidence(body: str = DONE_CRITERIA_BODY) -> dict[str, object]:
         "pr_head": "yuuka/bo-081-autopilot-review-ready-contract",
         "checks_passed": True,
         "worktree_clean": True,
+        "verifier_verdict": {"verdict": "PASS", "criterion_results": _verifier_results(body)},
         **_worker_done_evidence(body),
     }
 
@@ -546,6 +547,7 @@ def test_review_ready_contract_rejects_stale_criteria_hash_and_requires_worktree
         "criteria_hash": "0" * 64,
         "workspace_kind": "worktree",
         "cleanup": {},
+        "verifier_verdict": {"verdict": "PASS", "criterion_results": _verifier_results()},
     }
 
     stale = evaluate_review_ready_contract(evidence)
@@ -571,6 +573,21 @@ def test_review_ready_contract_rejects_stale_criteria_hash_and_requires_worktree
     })
     assert retained["review_ready"] is True
     assert retained["reason_codes"] == []
+
+
+def test_review_ready_contract_requires_verifier_pass():
+    from gateway.kanban_autopilot import evaluate_review_ready_contract
+
+    missing = evaluate_review_ready_contract({k: v for k, v in _review_ready_evidence().items() if k != "verifier_verdict"})
+    failed = evaluate_review_ready_contract({**_review_ready_evidence(), "verifier_verdict": {"verdict": "FAIL", "reason_codes": ["criterion_failed"]}})
+    passed = evaluate_review_ready_contract(_review_ready_evidence())
+
+    assert missing["review_ready"] is False
+    assert "missing_verifier_pass" in missing["reason_codes"]
+    assert failed["review_ready"] is False
+    assert "missing_verifier_pass" in failed["reason_codes"]
+    assert passed["review_ready"] is True
+    assert "missing_verifier_pass" not in passed["reason_codes"]
 
 
 def test_ready_gate_accepts_native_contract_but_never_claims_or_spawns(monkeypatch):
@@ -733,6 +750,7 @@ def test_review_ready_contract_requires_pr_and_checks_without_merging():
         "checks_passed": True,
         "worktree_clean": True,
         "task_body": DONE_CRITERIA_BODY,
+        "verifier_verdict": {"verdict": "PASS", "criterion_results": _verifier_results()},
     })
     assert satisfied["review_ready"] is True
     assert satisfied["reason_codes"] == []
@@ -1077,6 +1095,7 @@ def test_closeout_progress_gate_blocks_missing_evidence_and_pr_backlog():
         "checks_passed": True,
         "worktree_clean": True,
         "task_body": DONE_CRITERIA_BODY,
+        "verifier_verdict": {"verdict": "PASS", "criterion_results": _verifier_results()},
     }
     backlog_blocked = evaluate_autopilot_closeout_progress(good, open_autopilot_prs=2, max_open_autopilot_prs=2)
     assert backlog_blocked["may_continue"] is False
@@ -1212,6 +1231,7 @@ def test_review_package_proof_summarizes_pr_readiness_without_live_authority():
         "checks_passed": True,
         "worktree_clean": True,
         "task_body": DONE_CRITERIA_BODY,
+        "verifier_verdict": {"verdict": "PASS", "criterion_results": _verifier_results()},
     }
     run_report = {
         "executed": [{"public_id": "BO-116"}, {"public_id": "BO-117"}],

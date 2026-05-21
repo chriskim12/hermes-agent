@@ -1803,6 +1803,24 @@ def evaluate_review_ready_contract(
         reason_codes.extend(worker_done_evidence.get("reason_codes") or [])
     if _evidence_uses_task_worktree(evidence):
         reason_codes.extend(_worktree_cleanup_blockers(evidence))
+    verifier_verdict = evidence.get("verifier_verdict")
+    if isinstance(verifier_verdict, dict):
+        verifier_pass = str(verifier_verdict.get("verdict") or "").strip().upper() == "PASS"
+        if not verifier_pass:
+            reason_codes.append("missing_verifier_pass")
+    elif isinstance(verifier_verdict, str):
+        verifier_pass = verifier_verdict.strip().upper() == "PASS"
+        if not verifier_pass:
+            reason_codes.append("missing_verifier_pass")
+    else:
+        verifier_payload = evidence.get("verifier_evidence")
+        if isinstance(verifier_payload, dict):
+            verifier_verdict = evaluate_verifier_verdict(evidence, verifier_payload)
+            if verifier_verdict.get("verdict") != "PASS":
+                reason_codes.append("missing_verifier_pass")
+        else:
+            verifier_verdict = None
+            reason_codes.append("missing_verifier_pass")
     commit = str(required["commit"] or "").strip()
     if commit and not _SHA_RE.fullmatch(commit):
         reason_codes.append("commit_not_sha_like")
