@@ -8,6 +8,7 @@ policy scope, while `/autopilot on <parent>` narrows the same bounded loop.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -35,6 +36,36 @@ _READY_GATE_REQUIREMENTS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("missing_dependencies_blockers", ("dependencies/blockers", "dependencies:", "blockers:", "none"), "dependencies/blockers"),
     ("missing_review_package_expectation", ("review package", "review_ready", "changed files", "commit"), "review package expectation"),
 )
+_DONE_CRITERIA_LEDGER_SCHEMA = "autopilot_done_criteria_ledger.v1"
+_DONE_CRITERIA_LEDGER_VERSION = 1
+_DONE_CRITERIA_SECTION_HEADERS = (
+    "done criteria",
+    "done criteria ledger",
+)
+_DONE_CRITERIA_HEADER_RE = re.compile(
+    r"^\s*(?P<header>done criteria|done criteria ledger)\s*:\s*(?P<inline>.*\S)?\s*$",
+    re.IGNORECASE,
+)
+_DONE_CRITERIA_ITEM_RE = re.compile(r"^\s*(?:[-*+•]|(?:\d+|[A-Za-z])[.)])\s+(?P<text>.+\S)\s*$")
+_DONE_CRITERIA_AMBIGUOUS_RE = re.compile(
+    r"\b(?:and/or|either\b|maybe\b|perhaps\b|some\s+way|tbd\b|to\s+be\s+determined|etc\.?|or\b)"
+    r"|\b\w+\s*/\s*\w+\b",
+    re.IGNORECASE,
+)
+_KNOWN_TASK_SECTION_HEADERS = {
+    "goal",
+    "end-state/output",
+    "scope/non-goals",
+    "acceptance criteria",
+    "verification requirements",
+    "authority boundary",
+    "repo/lane truth",
+    "risk flags",
+    "dependencies/blockers",
+    "review package expectation",
+    "done criteria",
+    "done criteria ledger",
+}
 _PR_URL_RE = re.compile(r"^https://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/pull/\d+/?$")
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
 _RELEASE_ONLY_BASES = {"prod", "production"}
@@ -64,6 +95,212 @@ _DEFAULT_CLOSED_LOOP_CAPS = {
     "require_clean_closeout_per_task": True,
     "require_review_ready_contract_before_next_task": True,
 }
+
+
+def _normalize_done_criteria_text(text: Any) -> str:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip().strip("•*-:;.,")
+    return normalized.lower()
+
+
+def _slugify_done_criteria_text(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug or "criterion"
+
+
+def _done_criteria_is_ambiguous(text: str) -> bool:
+    lowered = text.lower()
+    return bool(_DONE_CRITERIA_AMBIGUOUS_RE.search(lowered))
+
+
+def _extract_done_criteria_lines(body: str) -> tuple[list[str], str | None]:
+    items: list[str] = []
+    section: str | None = None
+    collecting = False
+    for raw_line in body.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+        header_match = _DONE_CRITERIA_HEADER_RE.match(stripped)
+        if header_match:
+            section = header_match.group("header").lower()
+            collecting = True
+            inline = _normalize_done_criteria_text(header_match.group("inline"))
+            if inline:
+                items.append(inline)
+            continue
+        if not collecting:
+            continue
+        current_header = stripped.split(":", 1)[0].strip().lower() if ":" in stripped else ""
+        if current_header in _KNOWN_TASK_SECTION_HEADERS and current_header not in _DONE_CRITERIA_SECTION_HEADERS:
+            break
+        item_match = _DONE_CRITERIA_ITEM_RE.match(stripped)
+        if item_match:
+            items.append(_normalize_done_criteria_text(item_match.group("text")))
+            continue
+        if items:
+            items[-1] = _normalize_done_criteria_text(f"{items[-1]} {stripped}")
+        else:
+            items.append(_normalize_done_criteria_text(stripped))
+    return items, section
+
+
+def build_done_criteria_ledger(body: Any) -> dict[str, Any]:
+    text = str(body or "")
+    items, section = _extract_done_criteria_lines(text)
+    reason_codes: list[str] = []
+    if not items:
+        reason_codes.append("missing_done_criteria_ledger")
+        return {
+            "ok": False,
+            "status": "rejected",
+            "reason_codes": reason_codes,
+            "human_reason": "Missing explicit done criteria ledger section.",
+            "done_criteria_ledger": None,
+        }
+    criteria: list[dict[str, Any]] = []
+    ambiguous_items: list[str] = []
+    slug_counts: dict[str, int] = {}
+    for index, raw_item in enumerate(items, start=1):
+        normalized = _normalize_done_criteria_text(raw_item)
+        if not normalized:
+            continue
+        if _done_criteria_is_ambiguous(normalized):
+            ambiguous_items.append(normalized)
+        slug = _slugify_done_criteria_text(normalized)
+        slug_counts[slug] = slug_counts.get(slug, 0) + 1
+        suffix = f"-{slug_counts[slug]}" if slug_counts[slug] > 1 else ""
+        criteria.append(
+            {
+                "id": f"dc-{index:02d}-{slug}{suffix}",
+                "text": normalized,
+            }
+        )
+    if not criteria:
+        reason_codes.append("missing_done_criteria_ledger")
+        return {
+            "ok": False,
+            "status": "rejected",
+            "reason_codes": reason_codes,
+            "human_reason": "Missing explicit done criteria ledger section.",
+            "done_criteria_ledger": None,
+        }
+    if ambiguous_items:
+        return {
+            "ok": False,
+            "status": "rejected",
+            "reason_codes": ["ambiguous_done_criteria_ledger"],
+            "human_reason": "Ambiguous done criteria require refinement: " + ", ".join(ambiguous_items),
+            "done_criteria_ledger": None,
+        }
+    normalized_ledger = {
+        "schema": _DONE_CRITERIA_LEDGER_SCHEMA,
+        "version": _DONE_CRITERIA_LEDGER_VERSION,
+        "criteria": criteria,
+    }
+    criteria_hash = hashlib.sha256(
+        json.dumps(normalized_ledger, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    ledger = {
+        **normalized_ledger,
+        "criteria_hash": criteria_hash,
+    }
+    return {
+        "ok": True,
+        "status": "accepted",
+        "reason_codes": [],
+        "human_reason": "done criteria ledger extracted",
+        "done_criteria_ledger": ledger,
+        "criteria_hash": criteria_hash,
+        "criteria_version": _DONE_CRITERIA_LEDGER_VERSION,
+        "criteria_ids": [criterion["id"] for criterion in criteria],
+        "source_section": section or "done criteria",
+    }
+
+
+def _criteria_hash_from_evidence(evidence: dict[str, Any]) -> str:
+    for key in ("done_criteria_hash", "criteria_hash"):
+        value = str(evidence.get(key) or "").strip()
+        if value:
+            return value
+    ledger = evidence.get("done_criteria_ledger")
+    if isinstance(ledger, dict):
+        value = str(ledger.get("criteria_hash") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _evidence_uses_task_worktree(evidence: dict[str, Any]) -> bool:
+    workspace_kind = str(evidence.get("workspace_kind") or "").strip().lower()
+    return bool(
+        evidence.get("task_owned_worktree") is True
+        or workspace_kind == "worktree"
+        or str(evidence.get("worktree_path") or "").strip()
+    )
+
+
+def _worktree_cleanup_blockers(evidence: dict[str, Any]) -> list[str]:
+    cleanup = evidence.get("cleanup") if isinstance(evidence.get("cleanup"), dict) else {}
+    git = evidence.get("git") if isinstance(evidence.get("git"), dict) else {}
+    proof = str(cleanup.get("proof") or evidence.get("cleanup_proof") or "").strip()
+    worktree_clean = cleanup.get("worktree_clean")
+    git_clean = git.get("worktree_clean")
+    status_short = str(git.get("status_short") or "").strip()
+    if proof and worktree_clean is not False and git_clean is not False and not status_short:
+        return []
+    residue = evidence.get("residue")
+    if not isinstance(residue, dict):
+        return ["missing_cleanup_proof"]
+    items = residue.get("items")
+    if not isinstance(items, list):
+        return ["missing_cleanup_proof"]
+    blockers: list[str] = []
+    retained_seen = False
+    for raw_item in items:
+        if not isinstance(raw_item, dict):
+            continue
+        disposition = str(raw_item.get("disposition") or "").strip().lower()
+        if disposition == "retained":
+            retained_seen = True
+            if not str(raw_item.get("reason") or "").strip():
+                blockers.append("retained_residue_missing_reason")
+            ttl = str(raw_item.get("ttl") or raw_item.get("revisit_at") or raw_item.get("expires_at") or "").strip()
+            if not ttl:
+                blockers.append("retained_residue_missing_ttl")
+    if retained_seen and not blockers:
+        return []
+    return blockers or ["missing_cleanup_proof"]
+
+
+def _done_criteria_validation_for_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+    source_text = str(
+        evidence.get("task_body")
+        or evidence.get("body")
+        or evidence.get("task_spec")
+        or evidence.get("spec")
+        or ""
+    )
+    if not source_text:
+        return {
+            "ok": False,
+            "reason_codes": ["missing_done_criteria_ledger"],
+            "human_reason": "Missing explicit done criteria ledger source text.",
+            "done_criteria_ledger": None,
+        }
+    extracted = build_done_criteria_ledger(source_text)
+    if not extracted.get("ok"):
+        return extracted
+    expected_hash = _criteria_hash_from_evidence(evidence)
+    if expected_hash and expected_hash != extracted["criteria_hash"]:
+        return {
+            "ok": False,
+            "reason_codes": ["stale_criteria_hash"],
+            "human_reason": "Stale done criteria hash no longer matches the current ledger.",
+            "done_criteria_ledger": extracted.get("done_criteria_ledger"),
+            "criteria_hash": extracted["criteria_hash"],
+        }
+    return extracted
 
 
 def get_closed_loop_operating_contract() -> dict[str, Any]:
@@ -1080,6 +1317,10 @@ def evaluate_autopilot_ready_gate(candidate: dict[str, Any]) -> dict[str, Any]:
         if not any(marker in haystack for marker in markers):
             reason_codes.append(code)
             missing_labels.append(label)
+    done_criteria = build_done_criteria_ledger(body)
+    if not done_criteria.get("ok"):
+        reason_codes.extend(done_criteria.get("reason_codes") or ["invalid_done_criteria_ledger"])
+        missing_labels.append("explicit done criteria ledger")
     routing = candidate.get("routing_verdict") or {}
     if isinstance(routing, str):
         try:
@@ -1098,6 +1339,10 @@ def evaluate_autopilot_ready_gate(candidate: dict[str, Any]) -> dict[str, Any]:
         "status": "accepted" if accepted else "rejected",
         "reason_codes": reason_codes,
         "human_reason": "ready for autopilot dry-run selection" if accepted else "Missing executable contract fields: " + ", ".join(missing_labels),
+        "done_criteria_ledger": done_criteria.get("done_criteria_ledger"),
+        "criteria_hash": done_criteria.get("criteria_hash"),
+        "criteria_version": done_criteria.get("criteria_version"),
+        "criteria_ids": done_criteria.get("criteria_ids") or [],
         "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0},
     }
 
@@ -1130,6 +1375,11 @@ def evaluate_review_ready_contract(
     for field, value in bool_required.items():
         if value is not True:
             reason_codes.append(f"missing_{field}")
+    done_criteria = _done_criteria_validation_for_evidence(evidence)
+    if not done_criteria.get("ok"):
+        reason_codes.extend(done_criteria.get("reason_codes") or ["invalid_done_criteria_ledger"])
+    if _evidence_uses_task_worktree(evidence):
+        reason_codes.extend(_worktree_cleanup_blockers(evidence))
     commit = str(required["commit"] or "").strip()
     if commit and not _SHA_RE.fullmatch(commit):
         reason_codes.append("commit_not_sha_like")
@@ -1155,6 +1405,9 @@ def evaluate_review_ready_contract(
         "review_ready": not reason_codes,
         "status": "review_ready" if not reason_codes else "blocked",
         "reason_codes": reason_codes,
+        "done_criteria_ledger": done_criteria.get("done_criteria_ledger"),
+        "criteria_hash": done_criteria.get("criteria_hash"),
+        "criteria_version": done_criteria.get("criteria_version"),
         "merge_allowed": False,
         "release_allowed": False,
         "prod_customer_visible_allowed": False,
