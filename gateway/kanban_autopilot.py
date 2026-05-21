@@ -375,6 +375,61 @@ def activate_single_flight(
     }
 
 
+def dispatch_selected_once(
+    candidate: dict[str, Any],
+    *,
+    board: Optional[str] = None,
+    failure_limit: int = 1,
+) -> dict[str, Any]:
+    """Hand one Autopilot-selected task to the existing Kanban dispatcher.
+
+    This intentionally reuses ``kanban_db.dispatch_once`` with a task-id filter
+    so Autopilot remains a selector/policy layer, not a second dispatcher.
+    """
+
+    task_id = str(candidate.get("task_id") or candidate.get("id") or "").strip()
+    if not task_id:
+        return {"dispatched": False, "reason": "missing_task_id", "spawned": []}
+    try:
+        from hermes_cli import kanban_db as kb
+    except Exception as exc:
+        return {"dispatched": False, "reason": "kanban_db_unavailable", "error": str(exc), "spawned": []}
+    conn = None
+    try:
+        conn = kb.connect(board=board)
+        result = kb.dispatch_once(
+            conn,
+            max_spawn=1,
+            failure_limit=failure_limit,
+            board=board,
+            task_ids=[task_id],
+        )
+    except Exception as exc:
+        return {"dispatched": False, "reason": "dispatcher_error", "error": str(exc), "spawned": []}
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    spawned = [
+        {"task_id": tid, "assignee": who, "workspace": ws}
+        for tid, who, ws in (result.spawned or [])
+    ]
+    return {
+        "dispatched": bool(spawned),
+        "target_task_id": task_id,
+        "reclaimed": result.reclaimed,
+        "crashed": result.crashed,
+        "timed_out": result.timed_out,
+        "auto_blocked": result.auto_blocked,
+        "promoted": result.promoted,
+        "spawned": spawned,
+        "skipped_unassigned": result.skipped_unassigned,
+        "skipped_nonspawnable": result.skipped_nonspawnable,
+    }
+
+
 def evaluate_autopilot_closeout_progress(
     evidence: dict[str, Any],
     *,
@@ -1187,17 +1242,70 @@ def _format_closed_loop_dry_run_message(decision: dict[str, Any]) -> str:
     ])
 
 
+def _bounded_on_decision(command: AutopilotCommand, *, actor: Optional[str], candidates: Optional[list[dict[str, Any]]]) -> dict[str, Any]:
+    """Execute one bounded parent-scoped Autopilot tick for `/autopilot on <scope>`."""
+
+    state = _write_state(_controller_state_for(command, actor=actor))
+    scope = _candidate_scope_for(command)
+    candidate_list = candidates or []
+    single_flight = activate_single_flight(candidate_list)
+    dispatch_result: dict[str, Any] | None = None
+    if single_flight.get("status") == "handoff_check_passed" and single_flight.get("selected"):
+        dispatch_result = dispatch_selected_once(single_flight["selected"])
+        handoff = dict(single_flight.get("handoff") or {})
+        handoff.update({"check_only": False, "would_dispatch": True})
+        single_flight = {**single_flight, "handoff": handoff}
+    dispatched = bool((dispatch_result or {}).get("dispatched"))
+    return {
+        "action": command.action,
+        "actor": actor,
+        "desired_mode": state.get("desired_mode"),
+        "effective_mode": _effective_mode(str(state.get("desired_mode") or "disabled"), state),
+        "read_only": False,
+        "status": "BOUNDED_DISPATCHED" if dispatched else "BOUNDED_BLOCKED",
+        "reason": "parent_scoped_bounded_dispatch_via_existing_dispatcher",
+        "scope": scope,
+        "caps": {"max_active_flights": 1, "max_dispatches_per_tick": 1},
+        "single_flight": single_flight,
+        "dispatch_result": dispatch_result,
+        "dispatched_count": 1 if dispatched else 0,
+        "dry_run_side_effects": {
+            "claimed": 0,
+            "spawned": len((dispatch_result or {}).get("spawned") or []),
+            "mutated": 0,
+            "dispatched": 1 if dispatched else 0,
+        },
+        "mutations_attempted": list(_MUTATIONS_ATTEMPTED),
+        "state_file_enabled_is_execution_proof": False,
+    }
+
+
 def _once_decision(command: AutopilotCommand, *, actor: Optional[str], candidates: Optional[list[dict[str, Any]]]) -> dict[str, Any]:
     single_flight = activate_single_flight(candidates or [])
-    status = "CHECK_ONLY_HANDOFF_READY" if single_flight.get("status") == "handoff_check_passed" else "CHECK_ONLY_HANDOFF_BLOCKED"
+    dispatch_result: dict[str, Any] | None = None
+    if single_flight.get("status") == "handoff_check_passed" and single_flight.get("selected"):
+        dispatch_result = dispatch_selected_once(single_flight["selected"])
+        handoff = dict(single_flight.get("handoff") or {})
+        handoff.update({"check_only": False, "would_dispatch": True})
+        single_flight = {**single_flight, "handoff": handoff}
+    if dispatch_result is not None:
+        status = "DISPATCHED" if dispatch_result.get("dispatched") else "DISPATCH_BLOCKED"
+    else:
+        status = "CHECK_ONLY_HANDOFF_BLOCKED"
     return {
         "action": command.action,
         "actor": actor,
         "read_only": False,
         "status": status,
-        "reason": "single_flight_check_only_no_dispatch",
+        "reason": "single_flight_selected_dispatch_via_existing_dispatcher" if dispatch_result is not None else "single_flight_no_dispatch_candidate",
         "single_flight": single_flight,
-        "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
+        "dispatch_result": dispatch_result,
+        "dry_run_side_effects": {
+            "claimed": 0,
+            "spawned": len((dispatch_result or {}).get("spawned") or []),
+            "mutated": 0,
+            "dispatched": 1 if (dispatch_result or {}).get("dispatched") else 0,
+        },
         "mutations_attempted": list(_MUTATIONS_ATTEMPTED),
     }
 
@@ -1206,12 +1314,28 @@ def _format_once_message(decision: dict[str, Any]) -> str:
     sf = decision.get("single_flight") or {}
     selected = sf.get("selected") or {}
     return "\n".join([
-        "Autopilot single-flight check-only",
+        "Autopilot single-flight dispatch",
         f"status={decision.get('status')}",
         f"selected={selected.get('public_id') or selected.get('task_id')}",
+        f"spawned={len(((decision.get('dispatch_result') or {}).get('spawned') or []))}",
         f"worker_done_observed={sf.get('worker_done_observed')}",
         "handoff_success_is_worker_completion=False",
-        "No dispatch, claim, worker spawn, or Kanban mutation was attempted.",
+        "Autopilot selected one candidate and handed only that task to the existing Kanban dispatcher.",
+    ])
+
+
+def _format_bounded_on_message(decision: dict[str, Any]) -> str:
+    scope = decision.get("scope") or {}
+    sf = decision.get("single_flight") or {}
+    selected = sf.get("selected") or {}
+    return "\n".join([
+        "Autopilot bounded parent-scoped dispatch",
+        f"status={decision.get('status')}",
+        f"scope_parent={scope.get('parent_public_id')}",
+        f"selected={selected.get('public_id') or selected.get('task_id')}",
+        f"dispatched={decision.get('dispatched_count')}",
+        "caps=max_active_flights=1,max_dispatches_per_tick=1",
+        "handoff_success_is_worker_completion=False",
     ])
 
 
@@ -1376,6 +1500,10 @@ def handle_autopilot_command(
     if command.action == "once":
         decision = _once_decision(command, actor=actor, candidates=_resolve_candidates(command, candidates))
         return AutopilotResult(True, command, _format_once_message(decision), decision, False)
+
+    if command.action == "on" and command.value.strip():
+        decision = _bounded_on_decision(command, actor=actor, candidates=_resolve_candidates(command, candidates))
+        return AutopilotResult(True, command, _format_bounded_on_message(decision), decision, False)
 
     if command.action in _CONTROL_ACTIONS:
         decision = _control_decision(command, actor=actor)

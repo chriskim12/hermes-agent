@@ -4519,6 +4519,7 @@ def dispatch_once(
     max_spawn: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     board: Optional[str] = None,
+    task_ids: Optional[list[str]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -4546,6 +4547,9 @@ def dispatch_once(
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
+    ``task_ids`` optionally restricts the ready scan to a pre-selected subset;
+    Autopilot uses this to hand only selector-approved tasks to the existing
+    dispatcher without creating a second claim/spawn implementation.
     """
     # Reap zombie children from previously spawned workers.
     # The gateway-embedded dispatcher is the parent of every worker spawned
@@ -4609,11 +4613,25 @@ def dispatch_once(
             ).fetchone()[0]
         )
 
-    ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
+    task_filter = [str(tid) for tid in (task_ids or []) if str(tid or "").strip()]
+    if task_ids is not None:
+        placeholders = ",".join("?" for _ in task_filter)
+        if not task_filter:
+            ready_rows = []
+        else:
+            ready_rows = conn.execute(
+                "SELECT id, assignee FROM tasks "
+                "WHERE status = 'ready' AND claim_lock IS NULL "
+                f"AND id IN ({placeholders}) "
+                "ORDER BY priority DESC, created_at ASC",
+                task_filter,
+            ).fetchall()
+    else:
+        ready_rows = conn.execute(
+            "SELECT id, assignee FROM tasks "
+            "WHERE status = 'ready' AND claim_lock IS NULL "
+            "ORDER BY priority DESC, created_at ASC"
+        ).fetchall()
     spawned = 0
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:

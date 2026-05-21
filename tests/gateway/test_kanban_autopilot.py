@@ -892,7 +892,7 @@ def test_autopilot_dry_run_loads_live_kanban_candidates_when_not_injected(tmp_pa
     assert result.decision["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0}
 
 
-def test_autopilot_once_loads_live_kanban_candidates_for_check_only_handoff(tmp_path, monkeypatch):
+def test_autopilot_once_loads_live_kanban_candidates_for_selected_dispatch(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     from gateway import kanban_autopilot
@@ -904,29 +904,145 @@ def test_autopilot_once_loads_live_kanban_candidates_for_check_only_handoff(tmp_
         return [_ready_candidate("BO-115")]
 
     monkeypatch.setattr(kanban_autopilot, "load_live_kanban_candidates", fake_loader, raising=False)
+    monkeypatch.setattr(
+        kanban_autopilot,
+        "dispatch_selected_once",
+        lambda candidate, **_kwargs: {"dispatched": True, "spawned": [{"task_id": candidate["task_id"], "assignee": "default", "workspace": "/tmp/ws"}]},
+        raising=False,
+    )
     kanban_autopilot.handle_autopilot_command("on", actor="tester")
 
     result = kanban_autopilot.handle_autopilot_command("once BO-114", actor="tester")
 
     assert result.ok is True
     assert calls == [{"parent_public_id": "BO-114", "tenant": None, "limit": 50}]
-    assert result.decision["status"] == "CHECK_ONLY_HANDOFF_READY"
+    assert result.decision["status"] == "DISPATCHED"
     assert result.decision["single_flight"]["selected"]["public_id"] == "BO-115"
-    assert result.decision["single_flight"]["handoff"]["check_only"] is True
-    assert result.decision["single_flight"]["handoff"]["would_dispatch"] is False
+    assert result.decision["single_flight"]["handoff"]["check_only"] is False
+    assert result.decision["single_flight"]["handoff"]["would_dispatch"] is True
 
 
-def test_autopilot_once_command_uses_single_flight_check_only_not_completion(tmp_path, monkeypatch):
+def test_autopilot_once_command_uses_single_flight_dispatch_not_completion(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
-    from gateway.kanban_autopilot import handle_autopilot_command
+    from gateway import kanban_autopilot
 
-    handle_autopilot_command("on", actor="tester")
-    result = handle_autopilot_command("once", actor="tester", candidates=[_ready_candidate("BO-090"), _ready_candidate("BO-091")])
+    monkeypatch.setattr(
+        kanban_autopilot,
+        "dispatch_selected_once",
+        lambda candidate, **_kwargs: {"dispatched": True, "spawned": [{"task_id": candidate["task_id"], "assignee": "default", "workspace": "/tmp/ws"}]},
+        raising=False,
+    )
+    kanban_autopilot.handle_autopilot_command("on", actor="tester")
+    result = kanban_autopilot.handle_autopilot_command("once", actor="tester", candidates=[_ready_candidate("BO-090"), _ready_candidate("BO-091")])
 
     assert result.ok is True
-    assert result.decision["status"] == "CHECK_ONLY_HANDOFF_READY"
+    assert result.decision["status"] == "DISPATCHED"
     assert result.decision["single_flight"]["selected"]["public_id"] == "BO-090"
     assert result.decision["single_flight"]["handoff_success_is_worker_completion"] is False
-    assert result.decision["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0}
+    assert result.decision["dry_run_side_effects"] == {"claimed": 0, "spawned": 1, "mutated": 0, "dispatched": 1}
     assert "worker_done_observed=False" in result.message
+
+
+def test_autopilot_once_dispatches_selected_candidate_through_existing_dispatcher(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway import kanban_autopilot
+
+    dispatched: list[dict] = []
+
+    def fake_dispatch(candidate: dict, **_kwargs) -> dict:
+        dispatched.append(candidate)
+        return {
+            "dispatched": True,
+            "spawned": [{"task_id": candidate["task_id"], "assignee": "default", "workspace": "/tmp/ws"}],
+            "reclaimed": 0,
+            "crashed": [],
+            "timed_out": [],
+            "auto_blocked": [],
+            "promoted": 0,
+            "skipped_unassigned": [],
+            "skipped_nonspawnable": [],
+        }
+
+    monkeypatch.setattr(kanban_autopilot, "dispatch_selected_once", fake_dispatch, raising=False)
+    kanban_autopilot.handle_autopilot_command("on", actor="tester")
+
+    result = kanban_autopilot.handle_autopilot_command(
+        "once",
+        actor="tester",
+        candidates=[_ready_candidate("BO-122"), _ready_candidate("BO-123")],
+    )
+
+    assert result.ok is True
+    assert result.decision["status"] == "DISPATCHED"
+    assert result.decision["single_flight"]["selected"]["public_id"] == "BO-122"
+    assert result.decision["single_flight"]["handoff"]["check_only"] is False
+    assert result.decision["single_flight"]["handoff"]["would_dispatch"] is True
+    assert result.decision["dispatch_result"]["spawned"][0]["task_id"] == "t_good"
+    assert [item["public_id"] for item in dispatched] == ["BO-122"]
+
+
+def test_autopilot_once_blocks_without_dispatch_when_selected_dispatcher_spawns_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway import kanban_autopilot
+
+    monkeypatch.setattr(
+        kanban_autopilot,
+        "dispatch_selected_once",
+        lambda candidate, **_kwargs: {"dispatched": False, "spawned": [], "skipped_unassigned": [candidate["task_id"]]},
+        raising=False,
+    )
+    kanban_autopilot.handle_autopilot_command("on", actor="tester")
+
+    result = kanban_autopilot.handle_autopilot_command("once", actor="tester", candidates=[_ready_candidate("BO-122")])
+
+    assert result.ok is True
+    assert result.decision["status"] == "DISPATCH_BLOCKED"
+    assert result.decision["single_flight"]["selected"]["public_id"] == "BO-122"
+    assert result.decision["dispatch_result"]["spawned"] == []
+    assert result.decision["single_flight"]["worker_done_observed"] is False
+
+
+def test_autopilot_on_with_parent_scope_dispatches_one_bounded_candidate(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway import kanban_autopilot
+
+    dispatched: list[str] = []
+
+    def fake_dispatch(candidate: dict, **_kwargs) -> dict:
+        dispatched.append(candidate["public_id"])
+        return {"dispatched": True, "spawned": [{"task_id": candidate["task_id"], "assignee": "default", "workspace": "/tmp/ws"}]}
+
+    monkeypatch.setattr(kanban_autopilot, "dispatch_selected_once", fake_dispatch, raising=False)
+
+    result = kanban_autopilot.handle_autopilot_command(
+        "on BO-114",
+        actor="tester",
+        candidates=[_ready_candidate("BO-122"), _ready_candidate("BO-123")],
+    )
+
+    assert result.ok is True
+    assert result.decision["status"] == "BOUNDED_DISPATCHED"
+    assert result.decision["scope"] == {"parent_public_id": "BO-114", "tenant": None}
+    assert result.decision["dispatched_count"] == 1
+    assert result.decision["dry_run_side_effects"] == {"claimed": 0, "spawned": 1, "mutated": 0, "dispatched": 1}
+    assert dispatched == ["BO-122"]
+
+
+def test_autopilot_on_without_explicit_or_focused_parent_scope_stays_control_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway import kanban_autopilot
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("unscoped /autopilot on must not dispatch")
+
+    monkeypatch.setattr(kanban_autopilot, "dispatch_selected_once", forbidden, raising=False)
+    result = kanban_autopilot.handle_autopilot_command("on", actor="tester", candidates=[_ready_candidate("BO-122")])
+
+    assert result.ok is True
+    assert result.decision["desired_mode"] == "on"
+    assert result.decision["dispatch_once_called"] is False

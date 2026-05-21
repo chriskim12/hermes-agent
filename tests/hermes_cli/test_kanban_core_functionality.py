@@ -4233,3 +4233,37 @@ def test_reclaim_task_clears_failure_counter(kanban_home):
         assert task.status == "ready"
     finally:
         conn.close()
+
+
+def test_dispatch_once_can_spawn_only_selected_task_ids(kanban_home, all_assignees_spawnable):
+    """Autopilot needs the existing dispatcher to accept a selected subset."""
+    conn = kb.connect()
+    spawned: list[str] = []
+
+    def _spawn(task, _workspace):
+        spawned.append(task.id)
+        return None
+
+    try:
+        selected = kb.create_task(conn, title="selected", assignee="worker")
+        other = kb.create_task(conn, title="other", assignee="worker")
+
+        result = kb.dispatch_once(conn, spawn_fn=_spawn, max_spawn=5, task_ids=[selected])
+
+        assert [item[0] for item in result.spawned] == [selected]
+        assert spawned == [selected]
+        assert kb.get_task(conn, selected).status == "running"
+        assert kb.get_task(conn, other).status == "ready"
+    finally:
+        conn.close()
+
+
+def test_dispatch_once_with_empty_selected_task_ids_spawns_nothing(kanban_home, all_assignees_spawnable):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="ready", assignee="worker")
+        result = kb.dispatch_once(conn, spawn_fn=lambda *_: None, max_spawn=5, task_ids=[])
+        assert result.spawned == []
+        assert kb.get_task(conn, tid).status == "ready"
+    finally:
+        conn.close()
