@@ -23,6 +23,11 @@ on:
       - 'ui-tui/packages/hermes-ink/**'
       - '.github/workflows/nix.yml'
       - '.github/actions/nix-setup/**'
+  # Tier-2 backstop for path-filtered PR Nix: run the matrix weekly and on
+  # demand against main so package/reproducibility drift is still surfaced.
+  schedule:
+    - cron: '47 8 * * 1'
+  workflow_dispatch:
 
 permissions:
   contents: read
