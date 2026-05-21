@@ -3806,6 +3806,11 @@ class GatewayRunner:
         # so human-in-the-loop workflows hear back without polling.
         asyncio.create_task(self._kanban_notifier_watcher())
 
+        # Start background Autopilot controller — when `/autopilot on <parent>`
+        # is enabled, it repeatedly selects at most one scoped ready-gate task
+        # and hands only that task to the existing Kanban dispatcher.
+        asyncio.create_task(self._autopilot_controller_watcher())
+
         # Start background kanban dispatcher — spawns workers for ready
         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
         # When false, users run `hermes kanban daemon` externally or
@@ -4717,6 +4722,71 @@ class GatewayRunner:
                     "kanban notifier: artifact upload (%s) failed: %s",
                     path, exc,
                 )
+
+    async def _autopilot_controller_watcher(self) -> None:
+        """Background `/autopilot on <parent>` controller loop.
+
+        This is not a second dispatcher.  Each tick delegates exactly one
+        Autopilot-selected task id to the existing Kanban dispatcher helper,
+        and only when the persisted Autopilot state has an explicit parent
+        focus.  Unscoped `on` remains blocked.
+        """
+
+        try:
+            from hermes_cli.config import load_config as _load_config
+        except Exception:
+            logger.warning("autopilot controller: config loader unavailable; disabled")
+            return
+        env_override = os.environ.get("HERMES_AUTOPILOT_IN_GATEWAY", "").strip().lower()
+        if env_override in {"0", "false", "no", "off"}:
+            logger.info("autopilot controller: disabled via HERMES_AUTOPILOT_IN_GATEWAY env")
+            return
+        try:
+            cfg = _load_config()
+        except Exception as exc:
+            logger.warning("autopilot controller: cannot load config (%s); disabled", exc)
+            return
+        autopilot_cfg = cfg.get("autopilot", {}) if isinstance(cfg, dict) else {}
+        if not autopilot_cfg.get("continuous_in_gateway", True):
+            logger.info("autopilot controller: disabled via config autopilot.continuous_in_gateway=false")
+            return
+        try:
+            interval = float(autopilot_cfg.get("tick_interval_seconds", autopilot_cfg.get("interval_seconds", 60)) or 60)
+        except (TypeError, ValueError):
+            interval = 60.0
+        interval = max(interval, 5.0)
+
+        await asyncio.sleep(5)
+        logger.info("autopilot controller: embedded in gateway (interval=%.1fs)", interval)
+        while self._running:
+            try:
+                from gateway.kanban_autopilot import autopilot_continuous_tick
+                decision = await asyncio.to_thread(autopilot_continuous_tick, actor="gateway-autopilot-loop")
+                if decision.get("dispatched_count"):
+                    scope = decision.get("scope") or {}
+                    selected = ((decision.get("single_flight") or {}).get("selected") or {})
+                    logger.info(
+                        "autopilot controller: dispatched=%s scope=%s selected=%s",
+                        decision.get("dispatched_count"),
+                        scope.get("parent_public_id"),
+                        selected.get("public_id") or selected.get("task_id"),
+                    )
+                elif decision.get("status") == "BLOCKED" and decision.get("reason") != "missing_parent_scope":
+                    logger.info(
+                        "autopilot controller: blocked reason=%s status=%s",
+                        decision.get("reason"),
+                        decision.get("status"),
+                    )
+            except asyncio.CancelledError:
+                logger.debug("autopilot controller: cancelled")
+                raise
+            except Exception:
+                logger.exception("autopilot controller: unexpected watcher error")
+
+            slept = 0.0
+            while slept < interval and self._running:
+                await asyncio.sleep(min(1.0, interval - slept))
+                slept += 1.0
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
