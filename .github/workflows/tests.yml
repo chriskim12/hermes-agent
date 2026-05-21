@@ -22,8 +22,13 @@ concurrency:
 
 jobs:
   test:
+    name: test (shard ${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -56,7 +61,7 @@ jobs:
         run: |
           mkdir -p .test-reports
           source .venv/bin/activate
-          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto --durations=50 -o faulthandler_timeout=180 --junitxml=.test-reports/pytest-unit.xml
+          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto --splits 4 --group ${{ matrix.shard }} --durations=50 -o faulthandler_timeout=180 --junitxml=.test-reports/pytest-unit-shard-${{ matrix.shard }}.xml
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
@@ -67,9 +72,23 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: pytest-unit-diagnostics
-          path: .test-reports/pytest-unit.xml
+          name: pytest-unit-shard-${{ matrix.shard }}-diagnostics
+          path: .test-reports/pytest-unit-shard-${{ matrix.shard }}.xml
           if-no-files-found: warn
+
+  test-result:
+    name: test result
+    runs-on: ubuntu-latest
+    needs: test
+    if: always()
+    steps:
+      - name: Check pytest shard matrix result
+        run: |
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "::error::At least one pytest shard failed or was cancelled: ${{ needs.test.result }}"
+            exit 1
+          fi
+          echo "All pytest shards passed."
 
   e2e:
     runs-on: ubuntu-latest
