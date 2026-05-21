@@ -318,6 +318,113 @@ def test_worker_done_evidence_accepts_complete_worker_proof_contract():
     assert result["cleanup_or_residue_proof"] is True
 
 
+def _verifier_results(body: str = DONE_CRITERIA_BODY, status: str = "PASS") -> list[dict[str, Any]]:
+    from gateway.kanban_autopilot import build_done_criteria_ledger
+
+    ledger = build_done_criteria_ledger(body)
+    assert ledger["ok"] is True
+    return [
+        {
+            "criterion_id": criterion["id"],
+            "status": status,
+            "evidence": f"verifier independently checked {criterion['id']}",
+        }
+        for criterion in ledger["done_criteria_ledger"]["criteria"]
+    ]
+
+
+def test_verifier_verdict_pass_requires_distinct_identity_and_all_criteria_evidence():
+    from gateway.kanban_autopilot import evaluate_verifier_verdict
+
+    result = evaluate_verifier_verdict(
+        {**_worker_done_evidence(), "worker_identity": "arisu"},
+        {"verifier_identity": "yuuka", "criterion_results": _verifier_results()},
+    )
+
+    assert result["verdict"] == "PASS"
+    assert result["review_ready_input_eligible"] is True
+    assert set(item["criterion_id"] for item in result["criterion_results"]) == set(result["criteria_ids"])
+    assert result["side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0}
+
+
+def test_verifier_verdict_rejects_worker_self_approval():
+    from gateway.kanban_autopilot import evaluate_verifier_verdict
+
+    result = evaluate_verifier_verdict(
+        {**_worker_done_evidence(), "worker_identity": "arisu"},
+        {"verifier_identity": "arisu", "criterion_results": _verifier_results()},
+    )
+
+    assert result["verdict"] == "FAIL"
+    assert result["review_ready_input_eligible"] is False
+    assert "verifier_same_as_worker" in result["reason_codes"]
+    assert any("distinct" in item for item in result["remediation_instructions"])
+
+
+def test_verifier_verdict_fail_includes_actionable_remediation_and_keeps_worker_done():
+    from gateway.kanban_autopilot import evaluate_verifier_verdict
+
+    criterion_results = _verifier_results()
+    criterion_results[0] = {
+        **criterion_results[0],
+        "status": "FAIL",
+        "remediation": "Add focused pytest evidence for the first criterion.",
+    }
+    result = evaluate_verifier_verdict(
+        {**_worker_done_evidence(), "worker_identity": "arisu"},
+        {"verifier_identity": "yuuka", "criterion_results": criterion_results},
+    )
+
+    assert result["verdict"] == "FAIL"
+    assert result["worker_done_retained"] is True
+    assert result["worker_done_evidence"]["worker_done_evidence_valid"] is True
+    assert result["review_ready_input_eligible"] is False
+    assert any(code.startswith("verifier_failed_") for code in result["reason_codes"])
+    assert "Add focused pytest evidence for the first criterion." in result["remediation_instructions"]
+
+
+def test_verifier_verdict_blocked_reports_blocker_reason_codes():
+    from gateway.kanban_autopilot import evaluate_verifier_verdict
+
+    result = evaluate_verifier_verdict(
+        {**_worker_done_evidence(), "worker_identity": "arisu"},
+        {"verifier_identity": "yuuka", "blocker_reason_codes": ["missing_live_pr_context"]},
+    )
+
+    assert result["verdict"] == "BLOCKED"
+    assert result["review_ready_input_eligible"] is False
+    assert result["blocker_reason_codes"] == ["missing_live_pr_context"]
+
+
+def test_verifier_verdict_requires_refinement_for_missing_ambiguous_or_stale_ledger():
+    from gateway.kanban_autopilot import evaluate_verifier_verdict
+
+    missing = evaluate_verifier_verdict(
+        {**_worker_done_evidence(), "worker_identity": "arisu", "task_body": "Goal: too vague", "criteria_hash": ""},
+        {"verifier_identity": "yuuka", "criterion_results": []},
+    )
+    ambiguous_body = """
+Done criteria:
+- Maybe pass tests or etc.
+"""
+    ambiguous = evaluate_verifier_verdict(
+        {**_worker_done_evidence(), "worker_identity": "arisu", "task_body": ambiguous_body, "criteria_hash": ""},
+        {"verifier_identity": "yuuka", "criterion_results": []},
+    )
+    stale = evaluate_verifier_verdict(
+        {**_worker_done_evidence(), "worker_identity": "arisu", "criteria_hash": "0" * 64},
+        {"verifier_identity": "yuuka", "criterion_results": _verifier_results()},
+    )
+
+    assert missing["verdict"] == "REFINEMENT_REQUIRED"
+    assert "missing_done_criteria_ledger" in missing["reason_codes"]
+    assert ambiguous["verdict"] == "REFINEMENT_REQUIRED"
+    assert "ambiguous_done_criteria_ledger" in ambiguous["reason_codes"]
+    assert stale["verdict"] == "REFINEMENT_REQUIRED"
+    assert "stale_criteria_hash" in stale["reason_codes"]
+    assert stale["review_ready_input_eligible"] is False
+
+
 def test_ready_gate_rejects_missing_or_ambiguous_done_criteria_and_accepts_explicit_criteria():
     from gateway.kanban_autopilot import evaluate_autopilot_ready_gate
 
