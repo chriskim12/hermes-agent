@@ -50,6 +50,11 @@ runtime:
   - exact_apply_action
   - post_apply_proof
   - rollback_or_stop_condition
+guard:
+  canonical_checkout: /home/ubuntu/.hermes/hermes-agent
+  protected_branches:
+  - main
+  mutation_on_canonical_checkout: block
 closeout:
   required_sections:
   - 결론

@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+# Repo-policy second-defense hook. Install or symlink this as .git/hooks/pre-commit
+# or set `git config core.hooksPath .hermes/hooks`.
+exec python3 "$(git rev-parse --show-toplevel)/scripts/repo_policy_guard_hook.py" "$@"
