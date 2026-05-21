@@ -1250,6 +1250,72 @@ def generate_autopilot_run_report(run: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def generate_verifier_failure_operator_report(verifier_result: dict[str, Any], remediation_state: dict[str, Any]) -> dict[str, Any]:
+    """Summarize verifier failures and remediation state for operators.
+
+    BO-152 makes failed verifier outcomes readable without granting recovery
+    authority.  The report is intentionally deterministic and check-only: it
+    names missing criteria, retry/remediation disposition, next owner, and the
+    authority boundary so an operator can see why review_ready is blocked.
+    """
+
+    verdict = str(verifier_result.get("verdict") or "UNKNOWN").upper()
+    missing = list(verifier_result.get("missing_criteria") or verifier_result.get("reason_codes") or [])
+    retry_count = int(remediation_state.get("retry_count") or 0)
+    max_retries = int(remediation_state.get("max_retries") or 0)
+    remediation_child = remediation_state.get("remediation_child")
+    retry_allowed = bool(remediation_state.get("retry_allowed")) and retry_count < max_retries
+    needs_human = verdict in {"BLOCKED", "REFINEMENT_REQUIRED"} or (verdict == "FAIL" and not retry_allowed and not remediation_child)
+    if verdict == "PASS":
+        next_state = "review_ready_gate"
+    elif retry_allowed:
+        next_state = "retry_queued"
+    elif remediation_child:
+        next_state = "remediation_child_queued"
+    else:
+        next_state = "needs_human"
+    lines = [
+        "Autopilot verifier report",
+        f"verdict={verdict}",
+        f"next_state={next_state}",
+    ]
+    if missing:
+        lines.append("missing=" + ",".join(str(item) for item in missing))
+    lines.append(f"retry={retry_count}/{max_retries}")
+    if remediation_child:
+        lines.append(f"remediation_child={remediation_child}")
+    if remediation_state.get("blocked_reason"):
+        lines.append(f"blocked_reason={remediation_state.get('blocked_reason')}")
+    return {
+        "summary": {
+            "verdict": verdict,
+            "missing_criteria_count": len(missing),
+            "retry_count": retry_count,
+            "max_retries": max_retries,
+            "retry_allowed": retry_allowed,
+            "needs_human": needs_human,
+            "next_state": next_state,
+        },
+        "missing_criteria": missing,
+        "remediation": {
+            "retry_allowed": retry_allowed,
+            "retry_count": retry_count,
+            "max_retries": max_retries,
+            "remediation_child": remediation_child,
+            "blocked_reason": remediation_state.get("blocked_reason"),
+        },
+        "authority": {
+            "review_ready_allowed": verdict == "PASS",
+            "merge_allowed": False,
+            "release_allowed": False,
+            "gateway_restart_reload_allowed": False,
+            "config_env_secret_mutation_allowed": False,
+        },
+        "text": "\n".join(lines),
+    }
+
+
+
 def build_autopilot_review_package(
     evidence: dict[str, Any],
     *,

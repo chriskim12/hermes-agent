@@ -1844,3 +1844,50 @@ def test_post_merge_cleanup_reconcile_requires_merged_pr_truth_and_resolved_regi
     assert result["stale_entries"][0]["public_id"] == "BO-152"
     assert "missing_merged_pr_truth" in result["stale_entries"][0]["reason_codes"]
     assert "pre_review_cleanup_not_resolved" in result["stale_entries"][0]["reason_codes"]
+
+
+def test_verifier_failure_operator_report_shows_retry_and_missing_criteria():
+    from gateway.kanban_autopilot import generate_verifier_failure_operator_report
+
+    report = generate_verifier_failure_operator_report(
+        {"verdict": "FAIL", "missing_criteria": ["dc-02-tests", "dc-04-cleanup"]},
+        {"retry_allowed": True, "retry_count": 0, "max_retries": 1},
+    )
+
+    assert report["summary"]["verdict"] == "FAIL"
+    assert report["summary"]["next_state"] == "retry_queued"
+    assert report["summary"]["retry_allowed"] is True
+    assert report["missing_criteria"] == ["dc-02-tests", "dc-04-cleanup"]
+    assert "dc-04-cleanup" in report["text"]
+    assert report["authority"]["review_ready_allowed"] is False
+    assert report["authority"]["merge_allowed"] is False
+
+
+def test_verifier_failure_operator_report_shows_remediation_child_or_needs_human():
+    from gateway.kanban_autopilot import generate_verifier_failure_operator_report
+
+    child = generate_verifier_failure_operator_report(
+        {"verdict": "FAIL", "reason_codes": ["missing_pr"]},
+        {"retry_allowed": False, "retry_count": 1, "max_retries": 1, "remediation_child": "BO-999"},
+    )
+    blocked = generate_verifier_failure_operator_report(
+        {"verdict": "BLOCKED", "missing_criteria": ["scope_escape"]},
+        {"retry_allowed": False, "retry_count": 1, "max_retries": 1, "blocked_reason": "scope expansion needs Chris"},
+    )
+
+    assert child["summary"]["next_state"] == "remediation_child_queued"
+    assert child["remediation"]["remediation_child"] == "BO-999"
+    assert blocked["summary"]["needs_human"] is True
+    assert blocked["summary"]["next_state"] == "needs_human"
+    assert "scope expansion needs Chris" in blocked["text"]
+
+
+def test_verifier_pass_operator_report_allows_only_review_ready_gate():
+    from gateway.kanban_autopilot import generate_verifier_failure_operator_report
+
+    report = generate_verifier_failure_operator_report({"verdict": "PASS"}, {"retry_allowed": False, "retry_count": 0, "max_retries": 1})
+
+    assert report["summary"]["next_state"] == "review_ready_gate"
+    assert report["authority"]["review_ready_allowed"] is True
+    assert report["authority"]["gateway_restart_reload_allowed"] is False
+    assert report["authority"]["config_env_secret_mutation_allowed"] is False
