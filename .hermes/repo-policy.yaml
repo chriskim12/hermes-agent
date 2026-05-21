@@ -1,65 +1,68 @@
 version: 1
-
 repo:
   name: NousResearch/hermes-agent
   class: runtime_tooling
-
 authority:
   policy_source: .hermes/repo-policy.yaml
   agents_pointer: AGENTS.md
-
 roles:
   work: task_worktree
   landing: verified_fork_main
   release: upstream_sync_or_local_release_note
   live_apply: gateway_runtime_queue
-
+workflow:
+  canonical_landing: verified_landing
+  work_done_means: verified_landing_candidate
+  release_source: main
+  release_target: main
+  live_apply: gateway_runtime_queue
 branches:
   landing: main
   release_base: main
-
 gates:
   green_allowed:
-    - code_changes
-    - tests
-    - static_checks
-    - cleanup
-    - local_commit
+  - code_changes
+  - tests
+  - static_checks
+  - cleanup
+  - local_commit
   yellow_queue:
-    - live_apply_pending
-    - gateway_restart_needed
-    - human_review_needed
+  - live_apply_pending
+  - gateway_restart_needed
+  - human_review_needed
   red_requires_explicit_approval:
-    - push
-    - upstream_pr
-    - merge
-    - release
-    - deploy
-    - env_secret_change
-    - gateway_restart_reload
-    - live_runtime_apply
-    - destructive_cleanup
-
+  - push
+  - upstream_pr
+  - merge
+  - release
+  - deploy
+  - env_secret_change
+  - gateway_restart_reload
+  - live_runtime_apply
+  - destructive_cleanup
 runtime:
   restart_policy: queue_apply_one_restart
   live_apply_queue: required
   queue_entry_requires:
-    - changed_artifact
-    - commit_or_ref
-    - reason
-    - exact_apply_action
-    - post_apply_proof
-    - rollback_or_stop_condition
-
+  - changed_artifact
+  - commit_or_ref
+  - reason
+  - exact_apply_action
+  - post_apply_proof
+  - rollback_or_stop_condition
 closeout:
   required_sections:
-    - Policy check
-    - Green 완료
-    - Yellow 대기
-    - Red 필요
-    - 검증
-    - Git 상태
-    - Live 상태
-    - Gateway restart 필요
-    - Live runtime 반영됨
-    - 대기열 포함됨
+  - 결론
+  - 실제 반영
+  - 아직 안 한 것
+  - 다음 판단
+  - Policy check
+  - Green 완료
+  - Yellow 대기
+  - Red 필요
+  - 검증
+  - Git 상태
+  - Live 상태
+  - Gateway restart 필요
+  - Live runtime 반영됨
+  - 대기열 포함됨

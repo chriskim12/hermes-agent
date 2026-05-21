@@ -5,7 +5,17 @@
   "description": "Repo-local authority contract for branch/release/live-apply policy. The policy is authoritative only when this schema and the repo-policy checker pass; missing, malformed, stale, or mismatched policy reports Policy drift detected and fails closed to local-only authority.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["version", "repo", "authority", "roles", "branches", "gates", "runtime", "closeout"],
+  "required": [
+    "version",
+    "repo",
+    "authority",
+    "roles",
+    "workflow",
+    "branches",
+    "gates",
+    "runtime",
+    "closeout"
+  ],
   "properties": {
     "version": {
       "const": 1,
@@ -14,7 +24,10 @@
     "repo": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "class"],
+      "required": [
+        "name",
+        "class"
+      ],
       "properties": {
         "name": {
           "type": "string",
@@ -23,7 +36,11 @@
         },
         "class": {
           "type": "string",
-          "enum": ["product", "runtime_tooling", "other"],
+          "enum": [
+            "product",
+            "runtime_tooling",
+            "other"
+          ],
           "description": "Repository class. Product repos standardize landing on develop; runtime_tooling repos use live-apply queue semantics; other repos remain conservative/local-only unless separately defined."
         }
       }
@@ -31,7 +48,9 @@
     "authority": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["policy_source"],
+      "required": [
+        "policy_source"
+      ],
       "properties": {
         "policy_source": {
           "const": ".hermes/repo-policy.yaml",
@@ -46,26 +65,50 @@
     "roles": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["work", "landing", "release", "live_apply"],
+      "required": [
+        "work",
+        "landing",
+        "release",
+        "live_apply"
+      ],
       "properties": {
         "work": {
           "type": "string",
-          "enum": ["task_branch", "task_worktree", "local_only"],
+          "enum": [
+            "task_branch",
+            "task_worktree",
+            "local_only"
+          ],
           "description": "Isolation surface for ordinary work before landing."
         },
         "landing": {
           "type": "string",
-          "enum": ["develop", "verified_landing", "verified_fork_main", "local_only"],
+          "enum": [
+            "develop",
+            "verified_landing",
+            "verified_fork_main",
+            "local_only"
+          ],
           "description": "Green destination. Product repos must use develop in v1."
         },
         "release": {
           "type": "string",
-          "enum": ["release_pr_to_main", "upstream_sync_or_local_release_note", "manual_gate", "not_applicable"],
+          "enum": [
+            "release_pr_to_main",
+            "upstream_sync_or_local_release_note",
+            "manual_gate",
+            "not_applicable"
+          ],
           "description": "Release gate after landing. Release/merge/deploy remains Red unless explicitly approved."
         },
         "live_apply": {
           "type": "string",
-          "enum": ["deploy_gate", "gateway_runtime_queue", "manual_gate", "not_applicable"],
+          "enum": [
+            "deploy_gate",
+            "gateway_runtime_queue",
+            "manual_gate",
+            "not_applicable"
+          ],
           "description": "Live/runtime mutation gate. Gateway restart/reload is never implied by schema validity alone."
         }
       }
@@ -73,14 +116,23 @@
     "branches": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["landing", "release_base"],
+      "required": [
+        "landing",
+        "release_base"
+      ],
       "properties": {
         "landing": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "description": "Landing branch name. Product repos must be develop and the checker must observe it locally or remotely before external authority expands."
         },
         "release_base": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "description": "Release/main base branch if applicable."
         }
       }
@@ -88,7 +140,11 @@
     "gates": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["green_allowed", "yellow_queue", "red_requires_explicit_approval"],
+      "required": [
+        "green_allowed",
+        "yellow_queue",
+        "red_requires_explicit_approval"
+      ],
       "properties": {
         "green_allowed": {
           "type": "array",
@@ -96,7 +152,16 @@
           "uniqueItems": true,
           "items": {
             "type": "string",
-            "enum": ["code_changes", "tests", "static_checks", "cleanup", "local_commit", "push_to_landing", "checker_dry_run", "read_only_inspection"]
+            "enum": [
+              "code_changes",
+              "tests",
+              "static_checks",
+              "cleanup",
+              "local_commit",
+              "push_to_landing",
+              "checker_dry_run",
+              "read_only_inspection"
+            ]
           },
           "description": "Actions the agent may complete when the policy and checker pass. External effects still require the corresponding repo class rule."
         },
@@ -105,7 +170,13 @@
           "uniqueItems": true,
           "items": {
             "type": "string",
-            "enum": ["release_pr_prepare", "live_apply_pending", "gateway_restart_needed", "policy_migration_needed", "human_review_needed"]
+            "enum": [
+              "release_pr_prepare",
+              "live_apply_pending",
+              "gateway_restart_needed",
+              "policy_migration_needed",
+              "human_review_needed"
+            ]
           },
           "description": "Actions to queue or report as pending rather than execute immediately."
         },
@@ -115,7 +186,20 @@
           "uniqueItems": true,
           "items": {
             "type": "string",
-            "enum": ["push", "upstream_pr", "merge", "release", "deploy", "prod_mutation", "env_secret_change", "billing_pricing_change", "customer_visible_change", "gateway_restart_reload", "live_runtime_apply", "destructive_cleanup"]
+            "enum": [
+              "push",
+              "upstream_pr",
+              "merge",
+              "release",
+              "deploy",
+              "prod_mutation",
+              "env_secret_change",
+              "billing_pricing_change",
+              "customer_visible_change",
+              "gateway_restart_reload",
+              "live_runtime_apply",
+              "destructive_cleanup"
+            ]
           },
           "description": "Actions blocked until Chris explicitly approves them in the current authority context."
         }
@@ -124,16 +208,27 @@
     "runtime": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["restart_policy", "live_apply_queue"],
+      "required": [
+        "restart_policy",
+        "live_apply_queue"
+      ],
       "properties": {
         "restart_policy": {
           "type": "string",
-          "enum": ["not_applicable", "queue_apply_one_restart", "manual_explicit_only"],
+          "enum": [
+            "not_applicable",
+            "queue_apply_one_restart",
+            "manual_explicit_only"
+          ],
           "description": "Restart/reload policy. queue_apply_one_restart authorizes only a named bounded queue-apply turn, not ordinary closeout."
         },
         "live_apply_queue": {
           "type": "string",
-          "enum": ["not_applicable", "required", "manual_explicit_only"],
+          "enum": [
+            "not_applicable",
+            "required",
+            "manual_explicit_only"
+          ],
           "description": "Whether live/runtime apply work must enter a queue before execution."
         },
         "queue_entry_requires": {
@@ -141,7 +236,14 @@
           "uniqueItems": true,
           "items": {
             "type": "string",
-            "enum": ["changed_artifact", "commit_or_ref", "reason", "exact_apply_action", "post_apply_proof", "rollback_or_stop_condition"]
+            "enum": [
+              "changed_artifact",
+              "commit_or_ref",
+              "reason",
+              "exact_apply_action",
+              "post_apply_proof",
+              "rollback_or_stop_condition"
+            ]
           },
           "description": "Required fields for runtime live-apply queue entries."
         }
@@ -150,55 +252,200 @@
     "closeout": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["required_sections"],
+      "required": [
+        "required_sections"
+      ],
       "properties": {
         "required_sections": {
           "type": "array",
-          "minItems": 7,
+          "minItems": 11,
           "uniqueItems": true,
-          "contains": {"const": "Policy check"},
+          "contains": {
+            "const": "Policy check"
+          },
           "items": {
             "type": "string",
-            "enum": ["Policy check", "Green 완료", "Yellow 대기", "Red 필요", "검증", "Git 상태", "Live 상태", "Gateway restart 필요", "Live runtime 반영됨", "대기열 포함됨"]
+            "enum": [
+              "다음 판단",
+              "아직 안 한 것",
+              "실제 반영",
+              "결론",
+              "Policy check",
+              "Green 완료",
+              "Yellow 대기",
+              "Red 필요",
+              "검증",
+              "Git 상태",
+              "Live 상태",
+              "Gateway restart 필요",
+              "Live runtime 반영됨",
+              "대기열 포함됨"
+            ]
           },
           "description": "Closeout headings required for every repo task. Runtime/tooling repos should include the gateway/live/queue extras."
+        }
+      }
+    },
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "canonical_landing",
+        "work_done_means",
+        "release_source",
+        "release_target",
+        "live_apply"
+      ],
+      "properties": {
+        "canonical_landing": {
+          "type": "string",
+          "enum": [
+            "develop",
+            "verified_landing",
+            "verified_fork_main",
+            "local_only"
+          ],
+          "description": "Plain workflow landing meaning. Product repos standardize to develop; runtime/tooling repos use verified landing/fork-main candidates."
+        },
+        "work_done_means": {
+          "type": "string",
+          "enum": [
+            "pushed_to_develop",
+            "local_commit",
+            "verified_landing_candidate",
+            "read_only_evidence"
+          ],
+          "description": "Human-readable completion meaning for ordinary work. Product repo work is not done until it is pushed/landed to develop under policy authority."
+        },
+        "release_source": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Branch/ref that release PRs or release batches should start from; product repos use develop."
+        },
+        "release_target": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Branch/ref that release PRs target; product repos use main."
+        },
+        "live_apply": {
+          "type": "string",
+          "enum": [
+            "deploy_gate",
+            "gateway_runtime_queue",
+            "manual_gate",
+            "not_applicable"
+          ],
+          "description": "How this repo reaches live/runtime/customer-visible state."
         }
       }
     }
   },
   "allOf": [
     {
-      "if": {"properties": {"repo": {"properties": {"class": {"const": "product"}}}}},
+      "if": {
+        "properties": {
+          "repo": {
+            "properties": {
+              "class": {
+                "const": "product"
+              }
+            }
+          }
+        }
+      },
       "then": {
         "properties": {
           "roles": {
             "properties": {
-              "landing": {"const": "develop"},
-              "release": {"const": "release_pr_to_main"},
-              "live_apply": {"const": "deploy_gate"}
+              "landing": {
+                "const": "develop"
+              },
+              "release": {
+                "const": "release_pr_to_main"
+              },
+              "live_apply": {
+                "const": "deploy_gate"
+              }
             }
           },
           "branches": {
             "properties": {
-              "landing": {"const": "develop"}
+              "landing": {
+                "const": "develop"
+              }
+            }
+          },
+          "workflow": {
+            "properties": {
+              "canonical_landing": {
+                "const": "develop"
+              },
+              "work_done_means": {
+                "const": "pushed_to_develop"
+              },
+              "release_source": {
+                "const": "develop"
+              },
+              "release_target": {
+                "const": "main"
+              },
+              "live_apply": {
+                "const": "deploy_gate"
+              }
             }
           }
         }
       }
     },
     {
-      "if": {"properties": {"repo": {"properties": {"class": {"const": "runtime_tooling"}}}}},
+      "if": {
+        "properties": {
+          "repo": {
+            "properties": {
+              "class": {
+                "const": "runtime_tooling"
+              }
+            }
+          }
+        }
+      },
       "then": {
         "properties": {
           "roles": {
             "properties": {
-              "live_apply": {"const": "gateway_runtime_queue"}
+              "live_apply": {
+                "const": "gateway_runtime_queue"
+              }
             }
           },
           "runtime": {
             "properties": {
-              "restart_policy": {"enum": ["queue_apply_one_restart", "manual_explicit_only"]},
-              "live_apply_queue": {"const": "required"}
+              "restart_policy": {
+                "enum": [
+                  "queue_apply_one_restart",
+                  "manual_explicit_only"
+                ]
+              },
+              "live_apply_queue": {
+                "const": "required"
+              }
+            }
+          },
+          "workflow": {
+            "properties": {
+              "canonical_landing": {
+                "enum": [
+                  "verified_landing",
+                  "verified_fork_main"
+                ]
+              },
+              "live_apply": {
+                "const": "gateway_runtime_queue"
+              }
             }
           }
         }

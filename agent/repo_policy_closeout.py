@@ -3,7 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-STANDARD_CLOSEOUT_SECTIONS: tuple[str, ...] = (
+HUMAN_CLOSEOUT_SECTIONS: tuple[str, ...] = (
+    "결론",
+    "실제 반영",
+    "아직 안 한 것",
+    "다음 판단",
+)
+
+REQUIRED_LEDGER_SECTIONS: tuple[str, ...] = (
     "Policy check",
     "Green 완료",
     "Yellow 대기",
@@ -13,17 +20,31 @@ STANDARD_CLOSEOUT_SECTIONS: tuple[str, ...] = (
     "Live 상태",
 )
 
+STANDARD_CLOSEOUT_SECTIONS: tuple[str, ...] = HUMAN_CLOSEOUT_SECTIONS + REQUIRED_LEDGER_SECTIONS
+
 RUNTIME_TOOLING_EXTRA_SECTIONS: tuple[str, ...] = (
     "Gateway restart 필요",
     "Live runtime 반영됨",
     "대기열 포함됨",
 )
 
-STANDARD_CLOSEOUT_TEMPLATE = """Policy check
+STANDARD_CLOSEOUT_TEMPLATE = """결론
+- <한 줄로: 이 작업이 실제로 어디까지 반영됐는지>
+
+실제 반영
+- <작업 결과가 어느 branch/worktree/commit/policy/checker까지 반영됐는지>
+
+아직 안 한 것
+- <push/PR/merge/release/deploy/live apply/restart/env-secret/customer-visible mutation 중 하지 않은 것>
+
+다음 판단
+- <Chris가 판단해야 할 것 또는 다음 카드/게이트>
+
+Policy check
 - <repo-policy checker result, policy path, pass/fail_closed/drift reason>
 
 Green 완료
-- <completed local/green work>
+- <completed local/green work; keep this as ledger, not the headline>
 
 Yellow 대기
 - <queued release/live/restart/review items, or none>

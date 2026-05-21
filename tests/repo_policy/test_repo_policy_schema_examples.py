@@ -15,6 +15,7 @@ REQUIRED_TOP_LEVEL = {
     "repo",
     "authority",
     "roles",
+    "workflow",
     "branches",
     "gates",
     "runtime",
@@ -60,6 +61,7 @@ def contract_errors(policy: dict) -> list[str]:
         errors.append("authority.policy_source must be .hermes/repo-policy.yaml")
 
     roles = policy.get("roles") or {}
+    workflow = policy.get("workflow") or {}
     branches = policy.get("branches") or {}
     runtime = policy.get("runtime") or {}
     closeout_sections = set((policy.get("closeout") or {}).get("required_sections") or [])
@@ -69,6 +71,16 @@ def contract_errors(policy: dict) -> list[str]:
         errors.append(f"missing closeout sections: {missing_closeout}")
 
     if repo_class == "product":
+        expected_workflow = {
+            "canonical_landing": "develop",
+            "work_done_means": "pushed_to_develop",
+            "release_source": "develop",
+            "release_target": "main",
+            "live_apply": "deploy_gate",
+        }
+        for key, expected in expected_workflow.items():
+            if workflow.get(key) != expected:
+                errors.append(f"product workflow.{key} must be {expected}")
         if roles.get("landing") != "develop":
             errors.append("product roles.landing must be develop")
         if branches.get("landing") != "develop":
@@ -79,6 +91,10 @@ def contract_errors(policy: dict) -> list[str]:
             errors.append("product roles.live_apply must be deploy_gate")
 
     if repo_class == "runtime_tooling":
+        if workflow.get("canonical_landing") != "verified_landing":
+            errors.append("runtime_tooling workflow.canonical_landing must be verified_landing")
+        if workflow.get("live_apply") != "gateway_runtime_queue":
+            errors.append("runtime_tooling workflow.live_apply must be gateway_runtime_queue")
         if roles.get("live_apply") != "gateway_runtime_queue":
             errors.append("runtime_tooling roles.live_apply must be gateway_runtime_queue")
         if runtime.get("live_apply_queue") != "required":
@@ -98,6 +114,8 @@ def test_schema_file_is_valid_json_and_documents_fail_closed_contract() -> None:
     assert schema["properties"]["version"]["const"] == 1
     assert schema["properties"]["authority"]["properties"]["policy_source"]["const"] == ".hermes/repo-policy.yaml"
     assert "Policy drift detected" in schema["description"]
+    assert "workflow" in schema["required"]
+    assert "work_done_means" in schema["properties"]["workflow"]["required"]
 
 
 @pytest.mark.parametrize(

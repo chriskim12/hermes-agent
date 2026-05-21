@@ -1,46 +1,48 @@
-# Invalid fixture: product repos must use develop as the landing role/branch in v1.
 version: 1
-
 repo:
   name: invalid-product-main-landing
   class: product
-
 authority:
   policy_source: .hermes/repo-policy.yaml
-
 roles:
   work: task_branch
   landing: verified_fork_main
   release: release_pr_to_main
   live_apply: deploy_gate
-
+workflow:
+  canonical_landing: verified_fork_main
+  work_done_means: local_commit
+  release_source: main
+  release_target: main
+  live_apply: deploy_gate
 branches:
   landing: main
   release_base: main
-
 gates:
   green_allowed:
-    - code_changes
-    - tests
+  - code_changes
+  - tests
   yellow_queue:
-    - policy_migration_needed
+  - policy_migration_needed
   red_requires_explicit_approval:
-    - merge
-    - deploy
-    - prod_mutation
-    - env_secret_change
-    - billing_pricing_change
-
+  - merge
+  - deploy
+  - prod_mutation
+  - env_secret_change
+  - billing_pricing_change
 runtime:
   restart_policy: not_applicable
   live_apply_queue: not_applicable
-
 closeout:
   required_sections:
-    - Policy check
-    - Green 완료
-    - Yellow 대기
-    - Red 필요
-    - 검증
-    - Git 상태
-    - Live 상태
+  - 결론
+  - 실제 반영
+  - 아직 안 한 것
+  - 다음 판단
+  - Policy check
+  - Green 완료
+  - Yellow 대기
+  - Red 필요
+  - 검증
+  - Git 상태
+  - Live 상태

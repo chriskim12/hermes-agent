@@ -14,12 +14,17 @@ REQUIRED_TOP_LEVEL = {
     "repo",
     "authority",
     "roles",
+    "workflow",
     "branches",
     "gates",
     "runtime",
     "closeout",
 }
 REQUIRED_CLOSEOUT = {
+    "결론",
+    "실제 반영",
+    "아직 안 한 것",
+    "다음 판단",
     "Policy check",
     "Green 완료",
     "Yellow 대기",
@@ -127,6 +132,7 @@ def _add_contract_issues(policy: dict[str, Any], issues: list[RepoPolicyIssue]) 
         issues.append(RepoPolicyIssue("invalid_policy_source", "Policy drift detected: authority.policy_source must be .hermes/repo-policy.yaml"))
 
     roles = _mapping(policy.get("roles"))
+    workflow = _mapping(policy.get("workflow"))
     branches = _mapping(policy.get("branches"))
     runtime = _mapping(policy.get("runtime"))
     gates = _mapping(policy.get("gates"))
@@ -143,6 +149,14 @@ def _add_contract_issues(policy: dict[str, Any], issues: list[RepoPolicyIssue]) 
         issues.append(RepoPolicyIssue("missing_red_gates", f"Policy drift detected: missing baseline Red gates: {missing_red}"))
 
     if repo_class == "product":
+        if workflow.get("canonical_landing") != "develop":
+            issues.append(RepoPolicyIssue("product_workflow_landing_not_develop", "Policy drift detected: product workflow.canonical_landing must be develop"))
+        if workflow.get("work_done_means") != "pushed_to_develop":
+            issues.append(RepoPolicyIssue("product_work_done_not_develop", "Policy drift detected: product work_done_means must be pushed_to_develop"))
+        if workflow.get("release_source") != "develop" or workflow.get("release_target") != "main":
+            issues.append(RepoPolicyIssue("product_release_path_not_develop_to_main", "Policy drift detected: product release path must be develop->main"))
+        if workflow.get("live_apply") != "deploy_gate":
+            issues.append(RepoPolicyIssue("product_workflow_live_apply_not_deploy_gate", "Policy drift detected: product workflow.live_apply must be deploy_gate"))
         if roles.get("landing") != "develop":
             issues.append(RepoPolicyIssue("product_landing_not_develop", "Policy drift detected: product roles.landing must be develop"))
         if branches.get("landing") != "develop":
@@ -153,6 +167,10 @@ def _add_contract_issues(policy: dict[str, Any], issues: list[RepoPolicyIssue]) 
             issues.append(RepoPolicyIssue("product_live_apply_not_deploy_gate", "Policy drift detected: product roles.live_apply must be deploy_gate"))
 
     if repo_class == "runtime_tooling":
+        if workflow.get("canonical_landing") not in {"verified_landing", "verified_fork_main"}:
+            issues.append(RepoPolicyIssue("runtime_workflow_landing_not_verified", "Policy drift detected: runtime_tooling workflow.canonical_landing must be verified_landing or verified_fork_main"))
+        if workflow.get("live_apply") != "gateway_runtime_queue":
+            issues.append(RepoPolicyIssue("runtime_workflow_live_apply_missing_queue", "Policy drift detected: runtime_tooling workflow.live_apply must be gateway_runtime_queue"))
         if roles.get("live_apply") != "gateway_runtime_queue":
             issues.append(RepoPolicyIssue("runtime_live_apply_missing_queue", "Policy drift detected: runtime_tooling roles.live_apply must be gateway_runtime_queue"))
         if runtime.get("live_apply_queue") != "required":
@@ -217,6 +235,14 @@ def check_repo_policy(repo_path: str | Path) -> RepoPolicyCheckResult:
         repo_class = repo_data.get("class")
         if repo_class == "product" and not observed.get("has_develop"):
             issues.append(RepoPolicyIssue("product_develop_not_observed", "Policy drift detected: product policy requires develop, but no local or remote develop ref was observed"))
+        workflow = _mapping(policy.get("workflow"))
+        if workflow:
+            authority["workflow"] = {
+                "canonical_landing": workflow.get("canonical_landing"),
+                "work_done_means": workflow.get("work_done_means"),
+                "release_path": f"{workflow.get('release_source')}->{workflow.get('release_target')}" if workflow.get("release_source") and workflow.get("release_target") else None,
+                "live_apply": workflow.get("live_apply"),
+            }
         issues.extend(_agents_conflicts(repo))
 
     ok = not issues

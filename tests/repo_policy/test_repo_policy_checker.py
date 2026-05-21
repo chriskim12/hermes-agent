@@ -51,8 +51,23 @@ def test_product_policy_passes_when_develop_is_observed(git_repo: Path) -> None:
     assert result["status"] == "pass"
     assert result["repo_class"] == "product"
     assert result["observed"]["has_develop"] is True
+    assert result["authority"]["workflow"]["work_done_means"] == "pushed_to_develop"
+    assert result["authority"]["workflow"]["release_path"] == "develop->main"
     assert result["authority"]["green_only"] is True
     assert result["authority"]["red_still_requires_explicit_approval"] is True
+
+
+def test_product_policy_fails_when_workflow_does_not_define_develop_landing(git_repo: Path) -> None:
+    run(["git", "branch", "develop"], git_repo)
+    install_policy(git_repo, "product-develop.yaml")
+    policy_path = git_repo / ".hermes" / "repo-policy.yaml"
+    text = policy_path.read_text(encoding="utf-8")
+    policy_path.write_text(text.replace("work_done_means: pushed_to_develop", "work_done_means: local_commit"), encoding="utf-8")
+
+    result = check_repo_policy(git_repo).as_dict()
+
+    assert result["ok"] is False
+    assert "product_work_done_not_develop" in issue_codes(result)
 
 
 def test_missing_policy_fails_closed(git_repo: Path) -> None:

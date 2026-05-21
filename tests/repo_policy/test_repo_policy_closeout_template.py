@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from agent.repo_policy_closeout import (
+    HUMAN_CLOSEOUT_SECTIONS,
     RUNTIME_TOOLING_EXTRA_SECTIONS,
+    REQUIRED_LEDGER_SECTIONS,
     STANDARD_CLOSEOUT_SECTIONS,
     missing_policy_check_is_incomplete,
     render_closeout_template,
@@ -14,6 +16,17 @@ def test_standard_template_contains_all_required_sections() -> None:
 
     assert validate_closeout_sections(template).ok is True
     for section in STANDARD_CLOSEOUT_SECTIONS:
+        assert section in template
+
+
+def test_standard_template_leads_with_human_operational_story_before_ledger() -> None:
+    template = render_closeout_template()
+
+    first_policy_index = template.index("Policy check")
+    for section in HUMAN_CLOSEOUT_SECTIONS:
+        assert section in template
+        assert template.index(section) < first_policy_index
+    for section in REQUIRED_LEDGER_SECTIONS:
         assert section in template
 
 
