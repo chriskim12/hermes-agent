@@ -425,6 +425,85 @@ Done criteria:
     assert stale["review_ready_input_eligible"] is False
 
 
+def test_retry_controller_queues_exactly_one_remediation_on_verifier_fail():
+    from gateway.kanban_autopilot import plan_verifier_retry_controller
+
+    criterion_results = _verifier_results()
+    criterion_results[0] = {**criterion_results[0], "status": "FAIL", "remediation": "Fix first criterion."}
+    result = plan_verifier_retry_controller(
+        {**_worker_done_evidence(), "worker_identity": "arisu"},
+        {"verifier_identity": "yuuka", "criterion_results": criterion_results},
+        attempt=1,
+    )
+
+    assert result["next_state"] == "queue_remediation"
+    assert result["queued_remediation_count"] == 1
+    assert result["queued_actions"][0]["type"] == "remediation"
+    assert result["queued_actions"][0]["attempt"] == 2
+    assert result["kanban_evidence_patch"]["verification_attempt"] == 1
+    assert result["side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0}
+
+
+def test_retry_controller_persists_attempt_and_blocks_after_three_failures():
+    from gateway.kanban_autopilot import plan_verifier_retry_controller
+
+    criterion_results = _verifier_results()
+    criterion_results[0] = {**criterion_results[0], "status": "FAIL"}
+    result = plan_verifier_retry_controller(
+        {**_worker_done_evidence(), "worker_identity": "arisu", "verification_attempt": 3},
+        {"verifier_identity": "yuuka", "criterion_results": criterion_results},
+    )
+
+    assert result["next_state"] == "blocked"
+    assert result["blocked"] is True
+    assert result["queued_remediation_count"] == 0
+    assert result["attempt"] == 3
+    assert "max_verification_attempts_exhausted" in result["reason_codes"]
+    assert result["kanban_evidence_patch"]["next_controller_state"] == "blocked"
+
+
+def test_retry_controller_pass_allows_review_ready_input_without_dispatch():
+    from gateway.kanban_autopilot import plan_verifier_retry_controller
+
+    result = plan_verifier_retry_controller(
+        {**_worker_done_evidence(), "worker_identity": "arisu"},
+        {"verifier_identity": "yuuka", "criterion_results": _verifier_results()},
+    )
+
+    assert result["next_state"] == "verifier_pass"
+    assert result["review_ready_input_eligible"] is True
+    assert result["queued_actions"] == []
+    assert result["side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0}
+
+
+def test_retry_controller_refinement_required_does_not_queue_worker_retry():
+    from gateway.kanban_autopilot import plan_verifier_retry_controller
+
+    result = plan_verifier_retry_controller(
+        {**_worker_done_evidence(), "worker_identity": "arisu", "task_body": "Goal: too vague", "criteria_hash": ""},
+        {"verifier_identity": "yuuka", "criterion_results": []},
+    )
+
+    assert result["next_state"] == "refinement_required"
+    assert result["queued_remediation_count"] == 0
+    assert result["review_ready_input_eligible"] is False
+    assert "missing_done_criteria_ledger" in result["reason_codes"]
+
+
+def test_retry_controller_blocked_verdict_does_not_queue_remediation():
+    from gateway.kanban_autopilot import plan_verifier_retry_controller
+
+    result = plan_verifier_retry_controller(
+        {**_worker_done_evidence(), "worker_identity": "arisu"},
+        {"verifier_identity": "yuuka", "blocker_reason_codes": ["missing_authority"]},
+    )
+
+    assert result["next_state"] == "blocked"
+    assert result["blocked"] is True
+    assert result["queued_actions"] == []
+    assert "missing_authority" in result["reason_codes"]
+
+
 def test_ready_gate_rejects_missing_or_ambiguous_done_criteria_and_accepts_explicit_criteria():
     from gateway.kanban_autopilot import evaluate_autopilot_ready_gate
 

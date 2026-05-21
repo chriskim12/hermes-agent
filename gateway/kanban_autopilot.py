@@ -536,6 +536,103 @@ def evaluate_verifier_verdict(
     }
 
 
+def plan_verifier_retry_controller(
+    worker_evidence: dict[str, Any],
+    verifier_evidence: dict[str, Any] | None = None,
+    *,
+    task_body: Any = None,
+    task_spec: Any = None,
+    attempt: int | None = None,
+    max_attempts: int = 3,
+) -> dict[str, Any]:
+    """Plan the Kanban-visible verifier/remediation transition after worker_done.
+
+    This is check-only controller logic. It derives the next Kanban-visible
+    action from worker_done + verifier verdict, persists attempt facts in the
+    returned evidence shape, and never claims, spawns, mutates, restarts, merges,
+    deploys, or touches external authority by itself.
+    """
+
+    raw_attempt = attempt
+    if raw_attempt is None:
+        for key in ("verification_attempt", "attempt", "retry_count"):
+            value = worker_evidence.get(key)
+            if value is not None:
+                raw_attempt = value
+                break
+    try:
+        attempt_number = int(raw_attempt) if raw_attempt is not None else 1
+    except (TypeError, ValueError):
+        attempt_number = 1
+    attempt_number = max(1, attempt_number)
+    max_attempts = max(1, int(max_attempts or 1))
+    verifier = evaluate_verifier_verdict(
+        worker_evidence,
+        verifier_evidence or {},
+        task_body=task_body,
+        task_spec=task_spec,
+    )
+    verdict = verifier.get("verdict")
+    queue: list[dict[str, Any]] = []
+    reason_codes: list[str] = list(verifier.get("reason_codes") or [])
+    blocked = False
+    review_ready_input_eligible = False
+    if verdict == "PASS":
+        next_state = "verifier_pass"
+        review_ready_input_eligible = True
+    elif verdict == "FAIL":
+        if attempt_number >= max_attempts:
+            next_state = "blocked"
+            blocked = True
+            reason_codes.append("max_verification_attempts_exhausted")
+        else:
+            next_state = "queue_remediation"
+            queue.append(
+                {
+                    "type": "remediation",
+                    "attempt": attempt_number + 1,
+                    "reason_codes": list(verifier.get("reason_codes") or []),
+                    "remediation_instructions": verifier.get("remediation_instructions") or [],
+                }
+            )
+    elif verdict == "REFINEMENT_REQUIRED":
+        next_state = "refinement_required"
+    elif verdict == "BLOCKED":
+        next_state = "blocked"
+        blocked = True
+    else:
+        next_state = "blocked"
+        blocked = True
+        reason_codes.append("unknown_verifier_verdict")
+    reason_codes = list(dict.fromkeys(reason_codes))
+    return {
+        "controller": "autopilot_verifier_retry_controller.v1",
+        "next_state": next_state,
+        "verifier_verdict": verifier,
+        "attempt": attempt_number,
+        "max_attempts": max_attempts,
+        "retry_remaining": max(0, max_attempts - attempt_number),
+        "queued_actions": queue,
+        "queued_remediation_count": len(queue),
+        "review_ready_input_eligible": review_ready_input_eligible,
+        "blocked": blocked,
+        "reason_codes": reason_codes,
+        "kanban_evidence_patch": {
+            "verification_attempt": attempt_number,
+            "max_verification_attempts": max_attempts,
+            "last_verifier_verdict": verdict,
+            "last_verifier_reason_codes": verifier.get("reason_codes") or [],
+            "next_controller_state": next_state,
+        },
+        "side_effects": {"claimed": 0, "spawned": 0, "mutated": 0},
+        "human_reason": (
+            "verifier PASS: review_ready input may be built"
+            if review_ready_input_eligible
+            else "verifier controller state: " + next_state + (" (" + ", ".join(reason_codes) + ")" if reason_codes else "")
+        ),
+    }
+
+
 def validate_worker_done_evidence(
     evidence: dict[str, Any],
     task_body: Any = None,
