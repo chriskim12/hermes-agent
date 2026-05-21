@@ -603,6 +603,83 @@ def build_autopilot_review_package(
     }
 
 
+def evaluate_autopilot_promotion_policy(proof: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate whether first live pickup proof may promote to bounded check-only mode.
+
+    BO-119 intentionally promotes only the *policy state* to a narrow,
+    parent-scoped, check-only bounded mode. It does not grant live dispatch,
+    worker claim/spawn, PR/push, merge, gateway restart/reload, or config/env
+    mutation authority. Those remain current-turn approval gates.
+    """
+
+    reason_codes: list[str] = []
+    parent_public_id = str(proof.get("parent_public_id") or "").strip()
+    if not parent_public_id:
+        reason_codes.append("missing_parent_scope")
+    if proof.get("live_pickup_smoke_passed") is not True:
+        reason_codes.append("live_pickup_smoke_missing")
+    if proof.get("single_flight_guard_passed") is not True:
+        reason_codes.append("single_flight_guard_missing")
+    if proof.get("review_package_ready") is not True:
+        reason_codes.append("review_package_not_ready")
+    worker_done_children = list(proof.get("kanban_worker_done_children") or [])
+    if len(worker_done_children) < 3:
+        reason_codes.append("insufficient_worker_done_child_proofs")
+    if int(proof.get("active_flights") or 0) > 0:
+        reason_codes.append("active_flight_present")
+    max_open = int(proof.get("max_open_autopilot_prs") or _DEFAULT_CLOSED_LOOP_CAPS["max_open_autopilot_prs"])
+    if int(proof.get("open_autopilot_prs") or 0) >= max_open:
+        reason_codes.append("pr_backlog_cap_reached")
+    requested_mode = str(proof.get("requested_mode") or "bounded_multi_tick")
+    allowed_requested_modes = {"bounded_multi_tick", "parent_scoped"}
+    if requested_mode not in allowed_requested_modes:
+        reason_codes.append("requested_mode_not_allowed")
+    if proof.get("request_live_dispatch") is True:
+        reason_codes.append("live_dispatch_requires_current_turn_approval")
+    if proof.get("request_gateway_restart_reload") is True:
+        reason_codes.append("gateway_restart_reload_requires_current_turn_approval")
+    if proof.get("request_config_env_secret_mutation") is True:
+        reason_codes.append("config_env_secret_mutation_requires_current_turn_approval")
+    promotion_allowed = not reason_codes
+    authority = {
+        "ceiling": "review_ready_pr",
+        "worker_dispatch_claim_spawn_allowed": False,
+        "push_pr_allowed": False,
+        "merge_allowed": False,
+        "release_allowed": False,
+        "deploy_allowed": False,
+        "gateway_restart_reload_allowed": False,
+        "prod_customer_visible_allowed": False,
+        "config_env_secret_mutation_allowed": False,
+    }
+    caps = {
+        "max_tasks_per_run": _DEFAULT_CLOSED_LOOP_CAPS["max_tasks_per_run_early_bounded_multi_tick"],
+        "max_active_flights": _DEFAULT_CLOSED_LOOP_CAPS["max_active_flights"],
+        "max_dispatches_per_tick": _DEFAULT_CLOSED_LOOP_CAPS["max_dispatches_per_tick"],
+        "max_new_prs_per_run": _DEFAULT_CLOSED_LOOP_CAPS["max_new_prs_per_run"],
+        "max_consecutive_failures": _DEFAULT_CLOSED_LOOP_CAPS["max_consecutive_failures"],
+        "require_review_ready_contract_before_next_task": True,
+    }
+    return {
+        "promotion_allowed": promotion_allowed,
+        "promoted_mode": "bounded_multi_tick_check_only" if promotion_allowed else "blocked",
+        "reason_codes": reason_codes,
+        "scope": {
+            "parent_public_id": parent_public_id or None,
+            "scope_can_silently_widen": False,
+        },
+        "caps": caps,
+        "authority": authority,
+        "requires_current_turn_approval_for_live_dispatch": True,
+        "requires_current_turn_approval_for_push_pr": True,
+        "requires_current_turn_approval_for_gateway_restart_reload": True,
+        "handoff_success_is_worker_completion": False,
+        "worker_done_truth_source": "kanban_dispatcher_worker_done_evidence",
+        "next_state": "promote_check_only" if promotion_allowed else "needs_human",
+        "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
+    }
+
+
 def harden_autopilot_policy(contract: dict[str, Any]) -> dict[str, Any]:
     """Fail-closed policy hardening gate for closed-loop Autopilot."""
 

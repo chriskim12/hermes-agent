@@ -755,6 +755,62 @@ def test_review_package_proof_blocks_missing_pr_or_worker_evidence():
     assert package["next_state"] == "needs_human"
 
 
+def test_promotion_policy_allows_only_bounded_parent_scoped_check_only_after_proofs():
+    from gateway.kanban_autopilot import evaluate_autopilot_promotion_policy
+
+    result = evaluate_autopilot_promotion_policy({
+        "parent_public_id": "BO-114",
+        "live_pickup_smoke_passed": True,
+        "single_flight_guard_passed": True,
+        "review_package_ready": True,
+        "kanban_worker_done_children": ["BO-116", "BO-117", "BO-118"],
+        "active_flights": 0,
+        "open_autopilot_prs": 0,
+        "requested_mode": "bounded_multi_tick",
+    })
+
+    assert result["promotion_allowed"] is True
+    assert result["promoted_mode"] == "bounded_multi_tick_check_only"
+    assert result["scope"]["parent_public_id"] == "BO-114"
+    assert result["caps"]["max_tasks_per_run"] == 2
+    assert result["caps"]["max_active_flights"] == 1
+    assert result["authority"]["worker_dispatch_claim_spawn_allowed"] is False
+    assert result["authority"]["merge_allowed"] is False
+    assert result["authority"]["gateway_restart_reload_allowed"] is False
+    assert result["authority"]["config_env_secret_mutation_allowed"] is False
+    assert result["requires_current_turn_approval_for_live_dispatch"] is True
+    assert result["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0}
+    assert result["next_state"] == "promote_check_only"
+
+
+def test_promotion_policy_blocks_missing_proofs_or_authority_expansion():
+    from gateway.kanban_autopilot import evaluate_autopilot_promotion_policy
+
+    result = evaluate_autopilot_promotion_policy({
+        "parent_public_id": "BO-114",
+        "live_pickup_smoke_passed": True,
+        "single_flight_guard_passed": False,
+        "review_package_ready": False,
+        "active_flights": 1,
+        "open_autopilot_prs": 3,
+        "requested_mode": "global_queue_draining",
+        "request_live_dispatch": True,
+        "request_gateway_restart_reload": True,
+    })
+
+    assert result["promotion_allowed"] is False
+    assert result["promoted_mode"] == "blocked"
+    assert "single_flight_guard_missing" in result["reason_codes"]
+    assert "review_package_not_ready" in result["reason_codes"]
+    assert "active_flight_present" in result["reason_codes"]
+    assert "pr_backlog_cap_reached" in result["reason_codes"]
+    assert "requested_mode_not_allowed" in result["reason_codes"]
+    assert "live_dispatch_requires_current_turn_approval" in result["reason_codes"]
+    assert "gateway_restart_reload_requires_current_turn_approval" in result["reason_codes"]
+    assert result["next_state"] == "needs_human"
+    assert result["authority"]["worker_dispatch_claim_spawn_allowed"] is False
+
+
 def test_policy_hardening_rejects_forbidden_authority_expansion():
     from gateway.kanban_autopilot import get_closed_loop_operating_contract, harden_autopilot_policy
 
