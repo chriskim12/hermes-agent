@@ -363,3 +363,95 @@ def apply_artifact_cleanup_actions(
         })
         results.append(result)
     return results
+
+
+@dataclass(slots=True)
+class WorkspaceCleanupAction:
+    """A planned exact-path full-workspace cleanup action."""
+
+    task_id: str
+    workspace_path: str
+    size_bytes: int
+    candidate_state: str
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "workspace_path": self.workspace_path,
+            "size_bytes": self.size_bytes,
+            "candidate_state": self.candidate_state,
+            "reason": self.reason,
+        }
+
+
+def plan_workspace_cleanup_actions(
+    reports: Iterable[WorkspaceReport],
+) -> list[WorkspaceCleanupAction]:
+    """Plan full-workspace cleanup actions from strict classifier output."""
+    actions: list[WorkspaceCleanupAction] = []
+    for report in reports:
+        if report.state != "future-workspace-cleanup-candidate":
+            continue
+        git = report.gates.get("git") or {}
+        if git.get("is_git_worktree") is not True or git.get("dirty") is not False:
+            continue
+        if report.gates.get("active_refs") or report.gates.get("active_worker"):
+            continue
+        if not report.gates.get("has_evidence"):
+            continue
+        actions.append(
+            WorkspaceCleanupAction(
+                task_id=report.task_id,
+                workspace_path=report.workspace_path,
+                size_bytes=report.size_bytes,
+                candidate_state=report.state,
+                reason=report.reason,
+            )
+        )
+    actions.sort(key=lambda action: action.size_bytes, reverse=True)
+    return actions
+
+
+def apply_workspace_cleanup_actions(
+    actions: Iterable[WorkspaceCleanupAction],
+    *,
+    dry_run: bool = True,
+) -> list[dict[str, Any]]:
+    """Apply or preview exact full-workspace cleanup actions.
+
+    Full workspace cleanup is deliberately stricter than artifact cleanup. The
+    final guard rejects symlinks, non-directories, non-workspace-looking paths,
+    and any git worktree with a dirty status at apply time.
+    """
+    results: list[dict[str, Any]] = []
+    for action in actions:
+        workspace = Path(action.workspace_path)
+        guard_errors: list[str] = []
+        if workspace.is_symlink():
+            guard_errors.append("workspace_is_symlink")
+        if not workspace.exists():
+            guard_errors.append("workspace_missing")
+        if workspace.exists() and not workspace.is_dir():
+            guard_errors.append("workspace_not_directory")
+        if workspace.name != action.task_id:
+            guard_errors.append("workspace_basename_not_task_id")
+        gstate = git_state(workspace) if workspace.exists() else {"dirty": None}
+        if gstate.get("is_git_worktree") is not True:
+            guard_errors.append("workspace_not_git_worktree")
+        if gstate.get("dirty") is not False:
+            guard_errors.append("workspace_git_not_clean")
+
+        result = action.to_dict()
+        result.update({"dry_run": dry_run, "deleted": False, "guard_errors": guard_errors})
+        if guard_errors or dry_run:
+            results.append(result)
+            continue
+        before = path_size(workspace)
+        shutil.rmtree(workspace)
+        result.update({
+            "deleted": not workspace.exists(),
+            "reclaimed_bytes": before,
+        })
+        results.append(result)
+    return results

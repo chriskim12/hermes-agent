@@ -4,12 +4,16 @@ import sqlite3
 
 from hermes_cli.kanban_workspace_janitor import (
     CleanupAction,
+    WorkspaceCleanupAction,
+    WorkspaceReport,
     apply_artifact_cleanup_actions,
+    apply_workspace_cleanup_actions,
     classify_workspace,
     classify_workspaces,
     discover_artifacts,
     path_size,
     plan_artifact_cleanup_actions,
+    plan_workspace_cleanup_actions,
 )
 
 
@@ -262,3 +266,94 @@ def test_apply_artifact_cleanup_actions_apply_requires_exact_guards(tmp_path):
     assert "artifact_not_under_workspace" in results[0]["guard_errors"]
     assert results[1]["deleted"] is True
     assert not artifact.exists()
+
+
+def test_plan_workspace_cleanup_actions_requires_clean_git_and_evidence(tmp_path):
+    clean_report = WorkspaceReport(
+        task_id="t_clean",
+        workspace_path=str(tmp_path / "t_clean"),
+        state="future-workspace-cleanup-candidate",
+        reason="clean terminal workspace",
+        size_bytes=10,
+        task={"id": "t_clean"},
+        artifacts=[],
+        gates={
+            "git": {"is_git_worktree": True, "dirty": False},
+            "active_refs": [],
+            "active_worker": False,
+            "has_evidence": True,
+        },
+    )
+    dirty_report = WorkspaceReport(
+        task_id="t_dirty",
+        workspace_path=str(tmp_path / "t_dirty"),
+        state="future-workspace-cleanup-candidate",
+        reason="dirty terminal workspace",
+        size_bytes=20,
+        task={"id": "t_dirty"},
+        artifacts=[],
+        gates={
+            "git": {"is_git_worktree": True, "dirty": True},
+            "active_refs": [],
+            "active_worker": False,
+            "has_evidence": True,
+        },
+    )
+
+    actions = plan_workspace_cleanup_actions([dirty_report, clean_report])
+
+    assert len(actions) == 1
+    assert actions[0].task_id == "t_clean"
+
+
+def test_apply_workspace_cleanup_actions_dry_run_and_guards(tmp_path, monkeypatch):
+    workspace = tmp_path / "t_clean"
+    workspace.mkdir()
+    (workspace / ".git").mkdir()
+    (workspace / "file.txt").write_text("kept during dry run")
+    action = WorkspaceCleanupAction(
+        task_id="t_clean",
+        workspace_path=str(workspace),
+        size_bytes=1,
+        candidate_state="future-workspace-cleanup-candidate",
+        reason="fixture",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.kanban_workspace_janitor.git_state",
+        lambda path: {"is_git_worktree": True, "dirty": False, "status_short": ""},
+    )
+
+    result = apply_workspace_cleanup_actions([action])
+
+    assert result[0]["dry_run"] is True
+    assert result[0]["deleted"] is False
+    assert result[0]["guard_errors"] == []
+    assert workspace.exists()
+
+
+def test_apply_workspace_cleanup_actions_apply_rejects_dirty_and_deletes_clean(tmp_path, monkeypatch):
+    dirty = tmp_path / "t_dirty"
+    clean = tmp_path / "t_clean"
+    dirty.mkdir()
+    clean.mkdir()
+    (dirty / ".git").mkdir()
+    (clean / ".git").mkdir()
+    (clean / "file.txt").write_text("remove me")
+
+    def fake_git_state(path):
+        return {"is_git_worktree": True, "dirty": path.name == "t_dirty", "status_short": " M x" if path.name == "t_dirty" else ""}
+
+    monkeypatch.setattr("hermes_cli.kanban_workspace_janitor.git_state", fake_git_state)
+    results = apply_workspace_cleanup_actions(
+        [
+            WorkspaceCleanupAction("t_dirty", str(dirty), 1, "future-workspace-cleanup-candidate", "fixture"),
+            WorkspaceCleanupAction("t_clean", str(clean), 1, "future-workspace-cleanup-candidate", "fixture"),
+        ],
+        dry_run=False,
+    )
+
+    assert results[0]["deleted"] is False
+    assert "workspace_git_not_clean" in results[0]["guard_errors"]
+    assert dirty.exists()
+    assert results[1]["deleted"] is True
+    assert not clean.exists()
