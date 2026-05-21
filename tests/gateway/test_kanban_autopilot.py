@@ -735,6 +735,52 @@ def test_autopilot_dry_run_command_uses_closed_loop_simulator(tmp_path, monkeypa
     assert "would_select=1" in result.message
 
 
+def test_autopilot_dry_run_loads_live_kanban_candidates_when_not_injected(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway import kanban_autopilot
+
+    calls: list[dict] = []
+
+    def fake_loader(*, parent_public_id=None, tenant=None, limit=50):
+        calls.append({"parent_public_id": parent_public_id, "tenant": tenant, "limit": limit})
+        return [_ready_candidate("BO-115")]
+
+    monkeypatch.setattr(kanban_autopilot, "load_live_kanban_candidates", fake_loader, raising=False)
+    kanban_autopilot.handle_autopilot_command("on", actor="tester")
+
+    result = kanban_autopilot.handle_autopilot_command("dry-run BO-114", actor="tester")
+
+    assert result.ok is True
+    assert calls == [{"parent_public_id": "BO-114", "tenant": None, "limit": 50}]
+    assert result.decision["closed_loop"]["would_select"][0]["public_id"] == "BO-115"
+    assert result.decision["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0}
+
+
+def test_autopilot_once_loads_live_kanban_candidates_for_check_only_handoff(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway import kanban_autopilot
+
+    calls: list[dict] = []
+
+    def fake_loader(*, parent_public_id=None, tenant=None, limit=50):
+        calls.append({"parent_public_id": parent_public_id, "tenant": tenant, "limit": limit})
+        return [_ready_candidate("BO-115")]
+
+    monkeypatch.setattr(kanban_autopilot, "load_live_kanban_candidates", fake_loader, raising=False)
+    kanban_autopilot.handle_autopilot_command("on", actor="tester")
+
+    result = kanban_autopilot.handle_autopilot_command("once BO-114", actor="tester")
+
+    assert result.ok is True
+    assert calls == [{"parent_public_id": "BO-114", "tenant": None, "limit": 50}]
+    assert result.decision["status"] == "CHECK_ONLY_HANDOFF_READY"
+    assert result.decision["single_flight"]["selected"]["public_id"] == "BO-115"
+    assert result.decision["single_flight"]["handoff"]["check_only"] is True
+    assert result.decision["single_flight"]["handoff"]["would_dispatch"] is False
+
+
 def test_autopilot_once_command_uses_single_flight_check_only_not_completion(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 

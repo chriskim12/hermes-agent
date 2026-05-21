@@ -622,6 +622,130 @@ def _write_state(state: dict[str, Any], path: Optional[Path] = None) -> dict[str
     return _read_state(state_path)
 
 
+def _json_object_maybe(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {"raw": value}
+    return parsed if isinstance(parsed, dict) else {"raw": parsed}
+
+
+def _task_row_to_candidate(row: Any, *, parent_public_id: Optional[str] = None, relation_type: Optional[str] = None) -> dict[str, Any]:
+    routing = _json_object_maybe(row["routing_verdict"] if "routing_verdict" in row.keys() else None)
+    admission = _json_object_maybe(row["admission_snapshot"] if "admission_snapshot" in row.keys() else None)
+    closeout = _json_object_maybe(row["closeout_evidence"] if "closeout_evidence" in row.keys() else None)
+    skills: list[str] = []
+    if "skills" in row.keys() and row["skills"]:
+        try:
+            parsed_skills = json.loads(row["skills"])
+            if isinstance(parsed_skills, list):
+                skills = [str(skill) for skill in parsed_skills if skill]
+        except json.JSONDecodeError:
+            skills = []
+    candidate = {
+        "id": row["id"],
+        "task_id": row["id"],
+        "public_id": row["public_id"] if "public_id" in row.keys() else None,
+        "title": row["title"],
+        "body": row["body"],
+        "status": row["status"],
+        "assignee": row["assignee"],
+        "tenant": row["tenant"] if "tenant" in row.keys() else None,
+        "priority": row["priority"],
+        "routing_verdict": routing,
+        "admission_snapshot": admission,
+        "closeout_evidence": closeout,
+        "parent_public_id": parent_public_id,
+        "relation_type": relation_type,
+        "skills": skills,
+        "claim_lock": row["claim_lock"],
+        "worker_pid": row["worker_pid"] if "worker_pid" in row.keys() else None,
+        "current_run_id": row["current_run_id"] if "current_run_id" in row.keys() else None,
+    }
+    repo = admission.get("repo_full_name") or (admission.get("repo_intent") or {}).get("repo_full_name")
+    if repo:
+        candidate["repo_full_name"] = repo
+    return candidate
+
+
+def load_live_kanban_candidates(
+    *,
+    parent_public_id: Optional[str] = None,
+    tenant: Optional[str] = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Read live Kanban candidates for Autopilot without mutating the board.
+
+    If a parent/focus public id is supplied, only hierarchy children of that
+    parent are returned.  Without an explicit parent this deliberately returns
+    only ``ready`` tasks, keeping the read side narrow and side-effect free.
+    """
+
+    try:
+        from hermes_cli import kanban_db as kb
+    except Exception:
+        return []
+    with kb.connect() as conn:
+        if parent_public_id:
+            parent = conn.execute(
+                "SELECT id, public_id FROM tasks WHERE public_id = ? OR id = ? LIMIT 1",
+                (parent_public_id, parent_public_id),
+            ).fetchone()
+            if not parent:
+                return []
+            params: list[Any] = [parent["id"]]
+            query = """
+                SELECT c.*, l.relation_type AS relation_type, p.public_id AS parent_public_id
+                FROM task_links l
+                JOIN tasks p ON p.id = l.parent_id
+                JOIN tasks c ON c.id = l.child_id
+                WHERE l.parent_id = ? AND l.relation_type = 'hierarchy' AND c.status != 'archived'
+            """
+            if tenant:
+                query += " AND c.tenant = ?"
+                params.append(tenant)
+            query += " ORDER BY c.priority DESC, c.created_at ASC LIMIT ?"
+            params.append(max(1, int(limit)))
+            rows = conn.execute(query, params).fetchall()
+            return [
+                _task_row_to_candidate(row, parent_public_id=parent["public_id"] or parent_public_id, relation_type=row["relation_type"])
+                for row in rows
+            ]
+        params = []
+        query = "SELECT * FROM tasks WHERE status = 'ready'"
+        if tenant:
+            query += " AND tenant = ?"
+            params.append(tenant)
+        query += " ORDER BY priority DESC, created_at ASC LIMIT ?"
+        params.append(max(1, int(limit)))
+        rows = conn.execute(query, params).fetchall()
+        return [_task_row_to_candidate(row) for row in rows]
+
+
+def _candidate_scope_for(command: AutopilotCommand) -> dict[str, Any]:
+    state = _read_state()
+    raw_scope = str(command.value or state.get("focus") or "").strip()
+    scope: dict[str, Any] = {"parent_public_id": None, "tenant": None}
+    if raw_scope:
+        scope["parent_public_id"] = raw_scope.upper()
+    return scope
+
+
+def _resolve_candidates(command: AutopilotCommand, candidates: Optional[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    if candidates is not None:
+        return candidates
+    scope = _candidate_scope_for(command)
+    return load_live_kanban_candidates(
+        parent_public_id=scope.get("parent_public_id"),
+        tenant=scope.get("tenant"),
+        limit=50,
+    )
+
+
 def parse_autopilot_args(raw_args: str) -> AutopilotCommand:
     """Parse the deliberately narrow Phase-1 command surface."""
 
@@ -1049,11 +1173,11 @@ def handle_autopilot_command(
         )
 
     if command.action == "queue":
-        decision = _queue_decision(command, actor=actor, candidates=candidates)
+        decision = _queue_decision(command, actor=actor, candidates=_resolve_candidates(command, candidates))
         return AutopilotResult(True, command, _format_queue_message(decision), decision, False)
 
     if command.action == "dry-run":
-        decision = _closed_loop_dry_run_decision(command, actor=actor, candidates=candidates)
+        decision = _closed_loop_dry_run_decision(command, actor=actor, candidates=_resolve_candidates(command, candidates))
         return AutopilotResult(True, command, _format_closed_loop_dry_run_message(decision), decision, False)
 
     if command.action in {"status"}:
@@ -1061,7 +1185,7 @@ def handle_autopilot_command(
         return AutopilotResult(True, command, _format_status_message(decision), decision, False)
 
     if command.action == "once":
-        decision = _once_decision(command, actor=actor, candidates=candidates)
+        decision = _once_decision(command, actor=actor, candidates=_resolve_candidates(command, candidates))
         return AutopilotResult(True, command, _format_once_message(decision), decision, False)
 
     if command.action in _CONTROL_ACTIONS:
