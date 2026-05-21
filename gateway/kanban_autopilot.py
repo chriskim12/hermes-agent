@@ -303,6 +303,158 @@ def _done_criteria_validation_for_evidence(evidence: dict[str, Any]) -> dict[str
     return extracted
 
 
+def _criterion_requires_deterministic_verification(text: str) -> bool:
+    lowered = _normalize_done_criteria_text(text)
+    return any(token in lowered for token in ("test", "pytest", "check", "diff", "verification", "artifact"))
+
+
+def _normalize_artifact_refs(value: Any) -> list[str]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    else:
+        values = []
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
+def _normalize_worker_criterion_proofs(evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = evidence.get("criteria_proofs")
+    if raw is None:
+        raw = evidence.get("criterion_proofs")
+    if raw is None:
+        raw = evidence.get("per_criterion_proof")
+    if raw is None:
+        return []
+    normalized: list[dict[str, Any]] = []
+    if isinstance(raw, dict):
+        iterable = raw.items()
+    elif isinstance(raw, list):
+        iterable = enumerate(raw, start=1)
+    else:
+        return []
+    for key, value in iterable:
+        if isinstance(value, dict):
+            proof = dict(value)
+        else:
+            proof = {"proof": value}
+        proof_id = str(
+            proof.get("criterion_id")
+            or proof.get("criteria_id")
+            or proof.get("id")
+            or proof.get("done_criteria_id")
+            or key
+        ).strip()
+        if proof_id:
+            proof["criterion_id"] = proof_id
+        normalized.append(proof)
+    return normalized
+
+
+def _proof_supports_deterministic_verification(proof: dict[str, Any]) -> bool:
+    if proof.get("tests_passed") is True or proof.get("checks_passed") is True:
+        return True
+    for key in (
+        "tests",
+        "tests_run",
+        "test_command",
+        "checks",
+        "checks_run",
+        "check_command",
+        "verification",
+        "verification_command",
+    ):
+        value = proof.get(key)
+        if value not in (None, "", [], {}, ()):
+            return True
+    return False
+
+
+def validate_worker_done_evidence(
+    evidence: dict[str, Any],
+    task_body: Any = None,
+    task_spec: Any = None,
+) -> dict[str, Any]:
+    """Validate worker self-report evidence against the done-criteria ledger."""
+
+    reason_codes: list[str] = []
+    worker_done_observed = evidence.get("kanban_worker_done") is True or evidence.get("worker_done") is True
+    if not worker_done_observed:
+        reason_codes.append("missing_worker_done_observation")
+    source_evidence = dict(evidence)
+    if task_body is not None:
+        source_evidence["task_body"] = task_body
+    if task_spec is not None:
+        source_evidence["task_spec"] = task_spec
+    done_criteria = _done_criteria_validation_for_evidence(source_evidence)
+    if not done_criteria.get("ok"):
+        reason_codes.extend(done_criteria.get("reason_codes") or ["invalid_done_criteria_ledger"])
+        return {
+            "worker_done_evidence_valid": False,
+            "status": "blocked",
+            "reason_codes": reason_codes,
+            "human_reason": "Worker done evidence missing or invalid done criteria: " + ", ".join(reason_codes),
+            "done_criteria_ledger": done_criteria.get("done_criteria_ledger"),
+            "criteria_hash": done_criteria.get("criteria_hash"),
+            "criteria_version": done_criteria.get("criteria_version"),
+            "criteria_ids": done_criteria.get("criteria_ids") or [],
+            "criteria_proofs": [],
+            "worker_done_observed": worker_done_observed,
+            "authority_boundary_confirmed": False,
+            "cleanup_or_residue_proof": False,
+        }
+    provided_hash = _criteria_hash_from_evidence(evidence)
+    if not provided_hash:
+        reason_codes.append("missing_criteria_hash")
+    elif provided_hash != done_criteria["criteria_hash"]:
+        reason_codes.append("stale_criteria_hash")
+    criterion_proofs = _normalize_worker_criterion_proofs(evidence)
+    if not criterion_proofs:
+        reason_codes.append("missing_criterion_level_evidence")
+    proof_by_id: dict[str, dict[str, Any]] = {}
+    for proof in criterion_proofs:
+        proof_id = str(proof.get("criterion_id") or "").strip()
+        if proof_id:
+            proof_by_id[proof_id] = proof
+    if criterion_proofs:
+        for criterion in done_criteria["done_criteria_ledger"]["criteria"]:
+            proof = proof_by_id.get(criterion["id"])
+            if proof is None:
+                reason_codes.append(f"missing_proof_for_{criterion['id']}")
+                continue
+            proof_text = str(proof.get("proof") or proof.get("evidence") or proof.get("summary") or proof.get("result") or "").strip()
+            if not proof_text:
+                reason_codes.append(f"missing_proof_text_for_{criterion['id']}")
+            artifact_refs = _normalize_artifact_refs(proof.get("artifact_refs") or proof.get("artifact_ref") or proof.get("artifacts"))
+            if not artifact_refs:
+                reason_codes.append(f"missing_artifact_refs_for_{criterion['id']}")
+            if _criterion_requires_deterministic_verification(criterion["text"]) and not _proof_supports_deterministic_verification(proof):
+                reason_codes.append(f"missing_tests_or_checks_for_{criterion['id']}")
+    authority_boundary_confirmed = evidence.get("authority_boundary_confirmed")
+    if authority_boundary_confirmed is None:
+        authority_boundary_confirmed = evidence.get("boundaries_confirmed")
+    if authority_boundary_confirmed is not True:
+        reason_codes.append("missing_authority_boundary_confirmation")
+    cleanup_blockers = _worktree_cleanup_blockers(evidence)
+    if cleanup_blockers:
+        reason_codes.extend(cleanup_blockers)
+    accepted = not reason_codes
+    return {
+        "worker_done_evidence_valid": accepted,
+        "status": "accepted" if accepted else "blocked",
+        "reason_codes": reason_codes,
+        "human_reason": "worker done evidence satisfied" if accepted else "Worker done evidence missing or incomplete: " + ", ".join(reason_codes),
+        "done_criteria_ledger": done_criteria.get("done_criteria_ledger"),
+        "criteria_hash": done_criteria.get("criteria_hash"),
+        "criteria_version": done_criteria.get("criteria_version"),
+        "criteria_ids": done_criteria.get("criteria_ids") or [],
+        "criteria_proofs": criterion_proofs,
+        "worker_done_observed": worker_done_observed,
+        "authority_boundary_confirmed": authority_boundary_confirmed is True,
+        "cleanup_or_residue_proof": not cleanup_blockers,
+    }
+
+
 def get_closed_loop_operating_contract() -> dict[str, Any]:
     """Return the BO-091 closed-loop Autopilot ADR/operating contract.
 
@@ -1378,6 +1530,14 @@ def evaluate_review_ready_contract(
     done_criteria = _done_criteria_validation_for_evidence(evidence)
     if not done_criteria.get("ok"):
         reason_codes.extend(done_criteria.get("reason_codes") or ["invalid_done_criteria_ledger"])
+    worker_done_evidence = None
+    if evidence.get("kanban_worker_done") is True or evidence.get("worker_done") is True:
+        worker_done_evidence = validate_worker_done_evidence(
+            evidence,
+            task_body=evidence.get("task_body"),
+            task_spec=evidence.get("task_spec") or evidence.get("spec"),
+        )
+        reason_codes.extend(worker_done_evidence.get("reason_codes") or [])
     if _evidence_uses_task_worktree(evidence):
         reason_codes.extend(_worktree_cleanup_blockers(evidence))
     commit = str(required["commit"] or "").strip()
@@ -1408,6 +1568,7 @@ def evaluate_review_ready_contract(
         "done_criteria_ledger": done_criteria.get("done_criteria_ledger"),
         "criteria_hash": done_criteria.get("criteria_hash"),
         "criteria_version": done_criteria.get("criteria_version"),
+        "worker_done_evidence": worker_done_evidence,
         "merge_allowed": False,
         "release_allowed": False,
         "prod_customer_visible_allowed": False,
