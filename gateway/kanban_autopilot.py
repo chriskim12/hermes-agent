@@ -267,6 +267,22 @@ def simulate_closed_loop_ticks(candidates: list[dict[str, Any]], *, max_ticks: O
         "mutations_attempted": list(_MUTATIONS_ATTEMPTED),
     }
 
+def _candidate_active_flight(candidate: dict[str, Any]) -> Optional[dict[str, Any]]:
+    status = str(candidate.get("status") or "").lower()
+    claim_lock = candidate.get("claim_lock")
+    worker_pid = candidate.get("worker_pid")
+    current_run_id = candidate.get("current_run_id")
+    if status not in {"running", "claimed", "in_progress"} and not any([claim_lock, worker_pid, current_run_id]):
+        return None
+    return {
+        "public_id": candidate.get("public_id"),
+        "task_id": candidate.get("task_id") or candidate.get("id"),
+        "current_run_id": current_run_id,
+        "claim_lock": claim_lock,
+        "worker_pid": worker_pid,
+    }
+
+
 def activate_single_flight(
     candidates: list[dict[str, Any]],
     *,
@@ -278,6 +294,33 @@ def activate_single_flight(
     supplied check-only handoff probe, and returns explicit non-completion
     evidence. It never directly dispatches, claims, spawns, or mutates Kanban.
     """
+
+    active_flights = [flight for candidate in candidates if (flight := _candidate_active_flight(candidate))]
+    if active_flights:
+        skipped = [
+            {
+                "public_id": candidate.get("public_id"),
+                "task_id": candidate.get("task_id") or candidate.get("id"),
+                "status": "skipped",
+                "reason_codes": ["active_flight_already_present"],
+                "human_reason": "single-flight activation blocked because the scoped Kanban set already has an active worker flight",
+            }
+            for candidate in candidates
+            if not _candidate_active_flight(candidate)
+        ]
+        return {
+            "status": "active_flight_blocked",
+            "selected": None,
+            "skipped": skipped,
+            "handoff": None,
+            "check": {"allowed": False, "reason": "active_flight_already_present"},
+            "active_flights": active_flights,
+            "next_state": "needs_human",
+            "handoff_success_is_worker_completion": False,
+            "worker_done_observed": False,
+            "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
+            "mutations_attempted": list(_MUTATIONS_ATTEMPTED),
+        }
 
     simulation = simulate_closed_loop_ticks(candidates, max_ticks=1)
     selected = (simulation.get("would_select") or [])[:1]

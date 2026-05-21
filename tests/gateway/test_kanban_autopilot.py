@@ -519,6 +519,30 @@ def test_single_flight_activation_runs_one_check_only_handoff_and_no_dispatch(tm
     assert forbidden_calls == []
 
 
+def test_single_flight_activation_blocks_when_scope_already_has_active_flight(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import activate_single_flight, handle_autopilot_command
+
+    handle_autopilot_command("on", actor="tester")
+    active = _ready_candidate("BO-116")
+    active.update({"id": "t_active", "task_id": "t_active", "status": "running", "current_run_id": 42})
+    ready = _ready_candidate("BO-117")
+
+    result = activate_single_flight([active, ready])
+
+    assert result["status"] == "active_flight_blocked"
+    assert result["selected"] is None
+    assert result["handoff"] is None
+    assert result["next_state"] == "needs_human"
+    assert result["handoff_success_is_worker_completion"] is False
+    assert result["worker_done_observed"] is False
+    assert result["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0}
+    assert result["active_flights"] == [{"public_id": "BO-116", "task_id": "t_active", "current_run_id": 42, "claim_lock": None, "worker_pid": None}]
+    assert result["skipped"][0]["public_id"] == "BO-117"
+    assert result["skipped"][0]["reason_codes"] == ["active_flight_already_present"]
+
+
 def test_single_flight_activation_blocks_on_failed_check_without_completion(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
