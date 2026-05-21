@@ -594,7 +594,8 @@ def format_disk_pressure_report(report: Mapping[str, Any]) -> str:
     ])
     for item in top_paths:
         suffix = _format_bytes(int(item.get("size_bytes") or 0)) if item.get("exists") else "missing"
-        lines.append(f"- {item['path']}: {suffix}")
+        resolved = f" -> {item['resolved_path']}" if item.get("resolved_path") else ""
+        lines.append(f"- {item['path']}{resolved}: {suffix}")
 
     lines.extend(["", "Kanban workspace states:"])
     if state_counts:

@@ -434,3 +434,26 @@ def test_format_disk_pressure_report_includes_boundary_and_candidates():
     assert "root: 96.0% used" in rendered
     assert "cleanup candidates: artifacts=1, full_workspaces=0" in rendered
     assert "boundary: read-only" in rendered
+
+
+def test_format_disk_pressure_report_shows_resolved_symlink_target():
+    rendered = format_disk_pressure_report(
+        {
+            "root": {"used_percent": 91.0, "free_bytes": 1024},
+            "data": None,
+            "pressure_level": "warning",
+            "artifact_cleanup_candidates": [],
+            "workspace_cleanup_candidates": [],
+            "top_paths": [
+                {
+                    "path": "/home/ubuntu/.hermes/kanban/workspaces",
+                    "resolved_path": "/mnt/hermes-data/hermes/kanban-workspaces",
+                    "exists": True,
+                    "size_bytes": 2048,
+                }
+            ],
+            "workspace_state_counts": {},
+        }
+    )
+
+    assert "/home/ubuntu/.hermes/kanban/workspaces -> /mnt/hermes-data/hermes/kanban-workspaces" in rendered
