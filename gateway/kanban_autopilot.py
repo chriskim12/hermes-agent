@@ -534,6 +534,75 @@ def generate_autopilot_run_report(run: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_autopilot_review_package(
+    evidence: dict[str, Any],
+    *,
+    run_report: Optional[dict[str, Any]] = None,
+    expected_repo_full_name: str = "chriskim12/hermes-agent",
+) -> dict[str, Any]:
+    """Build a review-ready package proof without granting live authority.
+
+    BO-118 packages worker evidence, PR/check truth, and operator run facts in
+    one machine-readable shape.  It may prove review readiness, but it never
+    grants merge, release, deploy, gateway restart/reload, or worker-completion
+    authority from handoff alone.
+    """
+
+    closeout = evaluate_autopilot_closeout_progress(evidence)
+    review_contract = evaluate_review_ready_contract(evidence, expected_repo_full_name=expected_repo_full_name)
+    report = generate_autopilot_run_report(run_report or {})
+    reason_codes: list[str] = []
+    for code in closeout.get("reason_codes") or []:
+        if code not in reason_codes:
+            reason_codes.append(code)
+    for code in review_contract.get("reason_codes") or []:
+        if code not in reason_codes:
+            reason_codes.append(code)
+    review_ready = bool(closeout.get("may_continue") and review_contract.get("review_ready"))
+    pr_url = str(evidence.get("pr_url") or "").strip()
+    text_lines = [
+        "Autopilot review-ready PR package" if review_ready else "Autopilot review package blocked",
+        f"work_id={evidence.get('work_id') or 'unknown'}",
+        f"commit={evidence.get('commit') or evidence.get('head_sha') or 'missing'}",
+        f"branch={evidence.get('task_branch') or evidence.get('branch') or 'missing'}",
+        f"pr={pr_url or 'missing'}",
+        f"run_next_state={report['summary']['next_state']}",
+        "merge/release/deploy remains forbidden without current-turn approval.",
+        "handoff_success_is_worker_completion=False",
+    ]
+    return {
+        "status": "review_package_ready" if review_ready else "review_package_blocked",
+        "review_ready": review_ready,
+        "reason_codes": reason_codes,
+        "work_id": evidence.get("work_id"),
+        "commit": evidence.get("commit") or evidence.get("head_sha"),
+        "task_branch": evidence.get("task_branch") or evidence.get("branch"),
+        "pr": {
+            "url": pr_url,
+            "base": evidence.get("pr_base"),
+            "head": evidence.get("pr_head"),
+            "checks_passed": evidence.get("checks_passed") is True,
+        },
+        "run_report": report,
+        "closeout_progress": closeout,
+        "review_contract": review_contract,
+        "authority": {
+            "ceiling": "review_ready_pr",
+            "merge_allowed": False,
+            "release_allowed": False,
+            "deploy_allowed": False,
+            "gateway_restart_reload_allowed": False,
+            "prod_customer_visible_allowed": False,
+            "config_env_secret_mutation_allowed": False,
+        },
+        "worker_done_observed": evidence.get("kanban_worker_done") is True,
+        "handoff_success_is_worker_completion": False,
+        "next_state": "review_ready" if review_ready else "needs_human",
+        "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
+        "text": "\n".join(text_lines),
+    }
+
+
 def harden_autopilot_policy(contract: dict[str, Any]) -> dict[str, Any]:
     """Fail-closed policy hardening gate for closed-loop Autopilot."""
 

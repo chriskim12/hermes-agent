@@ -700,6 +700,61 @@ def test_operator_report_explains_zero_work():
     assert "no_progress" in report["text"]
 
 
+def test_review_package_proof_summarizes_pr_readiness_without_live_authority():
+    from gateway.kanban_autopilot import build_autopilot_review_package
+
+    evidence = {
+        "work_id": "BO-118",
+        "repo_full_name": "chriskim12/hermes-agent",
+        "commit": "91d572c971956e705cbfccc19990bf1ed128c239",
+        "task_branch": "bo-118-autopilot-review-package",
+        "pr_url": "https://github.com/chriskim12/hermes-agent/pull/118",
+        "pr_base": "main",
+        "pr_head": "bo-118-autopilot-review-package",
+        "checks_passed": True,
+        "worktree_clean": True,
+        "kanban_worker_done": True,
+        "boundaries_confirmed": True,
+    }
+    run_report = {
+        "executed": [{"public_id": "BO-116"}, {"public_id": "BO-117"}],
+        "skipped": [{"public_id": "BO-119", "reason_codes": ["not_in_scope_yet"]}],
+        "would_pause": [],
+        "next_state": "continue",
+    }
+
+    package = build_autopilot_review_package(evidence, run_report=run_report)
+
+    assert package["review_ready"] is True
+    assert package["status"] == "review_package_ready"
+    assert package["work_id"] == "BO-118"
+    assert package["pr"]["url"] == "https://github.com/chriskim12/hermes-agent/pull/118"
+    assert package["run_report"]["summary"]["executed_count"] == 2
+    assert package["authority"]["ceiling"] == "review_ready_pr"
+    assert package["authority"]["merge_allowed"] is False
+    assert package["authority"]["release_allowed"] is False
+    assert package["authority"]["gateway_restart_reload_allowed"] is False
+    assert package["authority"]["prod_customer_visible_allowed"] is False
+    assert package["worker_done_observed"] is True
+    assert package["handoff_success_is_worker_completion"] is False
+    assert package["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0}
+    assert "review-ready PR package" in package["text"]
+    assert "merge/release/deploy remains forbidden" in package["text"]
+
+
+def test_review_package_proof_blocks_missing_pr_or_worker_evidence():
+    from gateway.kanban_autopilot import build_autopilot_review_package
+
+    package = build_autopilot_review_package({"work_id": "BO-118", "commit": "91d572c971956e705cbfccc19990bf1ed128c239"})
+
+    assert package["review_ready"] is False
+    assert package["status"] == "review_package_blocked"
+    assert "worker_done_not_observed" in package["reason_codes"]
+    assert "missing_review_ready_contract" in package["reason_codes"]
+    assert package["authority"]["merge_allowed"] is False
+    assert package["next_state"] == "needs_human"
+
+
 def test_policy_hardening_rejects_forbidden_authority_expansion():
     from gateway.kanban_autopilot import get_closed_loop_operating_contract, harden_autopilot_policy
 
