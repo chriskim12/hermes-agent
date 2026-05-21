@@ -1753,3 +1753,94 @@ def test_autopilot_dispatch_injects_review_ready_pr_worker_env(monkeypatch):
     assert worker_env["HERMES_KANBAN_AUTOPILOT"] == "1"
     assert worker_env["HERMES_KANBAN_REVIEW_READY_PR_REQUIRED"] == "1"
     assert worker_env["HERMES_KANBAN_EXPECTED_REPO_FULL_NAME"] == "chriskim12/whystarve"
+
+
+def test_worktree_cleanup_registry_allows_removed_or_review_safe_retained_entries():
+    from gateway.kanban_autopilot import build_worktree_cleanup_registry, evaluate_pre_review_cleanup_gate
+
+    registry = build_worktree_cleanup_registry(
+        [
+            {
+                "public_id": "BO-151",
+                "path": "/repo/.worktrees/bo-151",
+                "branch": "work/BO-151-cleanup-registry",
+                "registered_git_worktree": True,
+                "cleanup_state": "removed",
+                "git_worktree_remove_verified": True,
+            },
+            {
+                "public_id": "BO-152",
+                "path": "/repo/.worktrees/bo-152",
+                "branch": "work/BO-152-operator-reporting",
+                "registered_git_worktree": True,
+                "cleanup_state": "retained",
+                "retained_reason": "open stacked fork PR review evidence",
+                "ttl": "until fork PR stack is merged or abandoned",
+                "review_safe": True,
+            },
+        ],
+        bundle_id="BO-145",
+    )
+
+    assert registry["review_ready_allowed"] is True
+    assert registry["cleanup_required"] is False
+    assert registry["destructive_cleanup_performed"] is False
+    gate = evaluate_pre_review_cleanup_gate(registry)
+    assert gate["review_ready_allowed"] is True
+    assert gate["post_merge_reconcile_still_required"] is True
+
+
+def test_worktree_cleanup_registry_blocks_pending_active_or_unverified_entries():
+    from gateway.kanban_autopilot import build_worktree_cleanup_registry, evaluate_pre_review_cleanup_gate
+
+    registry = build_worktree_cleanup_registry(
+        [
+            {"public_id": "BO-151", "path": "/repo/.worktrees/bo-151", "registered_git_worktree": True, "cleanup_state": "pending"},
+            {"public_id": "BO-152", "path": "/repo/.worktrees/bo-152", "registered_git_worktree": True, "cleanup_state": "retained", "retained_reason": "debug", "active_worker_pid": 123},
+            {"public_id": "BO-153", "path": "/repo/.worktrees/bo-153", "cleanup_state": "removed", "git_worktree_remove_verified": True},
+        ],
+        bundle_id="BO-145",
+    )
+
+    gate = evaluate_pre_review_cleanup_gate(registry)
+    assert gate["review_ready_allowed"] is False
+    assert "cleanup_required" in gate["reason_codes"]
+    assert "cleanup_pending" in gate["reason_codes"]
+    assert "active_reference_blocks_cleanup" in gate["reason_codes"]
+    assert "registered_git_worktree_not_verified" in gate["reason_codes"]
+
+
+def test_post_merge_cleanup_reconcile_requires_merged_pr_truth_and_resolved_registry():
+    from gateway.kanban_autopilot import build_worktree_cleanup_registry, reconcile_post_merge_cleanup
+
+    registry = build_worktree_cleanup_registry(
+        [
+            {
+                "public_id": "BO-151",
+                "path": "/repo/.worktrees/bo-151",
+                "registered_git_worktree": True,
+                "cleanup_state": "removed",
+                "git_worktree_remove_verified": True,
+            },
+            {
+                "public_id": "BO-152",
+                "path": "/repo/.worktrees/bo-152",
+                "registered_git_worktree": True,
+                "cleanup_state": "pending",
+            },
+        ],
+        bundle_id="BO-145",
+    )
+
+    result = reconcile_post_merge_cleanup(
+        registry,
+        merged_prs=[{"public_id": "BO-151", "state": "MERGED", "merge_commit_sha": "abc1234"}],
+    )
+
+    assert result["closed_allowed"] is False
+    assert result["gateway_restart_reload_allowed"] is False
+    assert result["canonical_materialization_allowed"] is False
+    assert result["reconciled"][0]["status"] == "reconciled"
+    assert result["stale_entries"][0]["public_id"] == "BO-152"
+    assert "missing_merged_pr_truth" in result["stale_entries"][0]["reason_codes"]
+    assert "pre_review_cleanup_not_resolved" in result["stale_entries"][0]["reason_codes"]
