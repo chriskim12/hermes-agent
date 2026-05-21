@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 
 DONE_CRITERIA_BODY = """
@@ -19,6 +20,64 @@ def _done_criteria_hash(body: str = DONE_CRITERIA_BODY) -> str:
     result = build_done_criteria_ledger(body)
     assert result["ok"] is True
     return result["criteria_hash"]
+
+
+def _worker_done_proofs(body: str = DONE_CRITERIA_BODY) -> list[dict[str, Any]]:
+    from gateway.kanban_autopilot import build_done_criteria_ledger
+
+    ledger = build_done_criteria_ledger(body)
+    assert ledger["ok"] is True
+    return [
+        {
+            "criterion_id": criterion["id"],
+            "proof": f"{criterion['text']} verified",
+            "artifact_refs": [f"artifacts/{criterion['id']}.md"],
+            **(
+                {"tests_run": 1, "tests_passed": True, "test_command": "python -m pytest tests/gateway/test_kanban_autopilot.py -q"}
+                if "test" in criterion["text"].lower()
+                else {}
+            ),
+            **(
+                {"checks_passed": True, "check_command": "git diff --check"}
+                if "check" in criterion["text"].lower() or "diff" in criterion["text"].lower()
+                else {}
+            ),
+        }
+        for criterion in ledger["done_criteria_ledger"]["criteria"]
+    ]
+
+
+def _worker_done_evidence(body: str = DONE_CRITERIA_BODY) -> dict[str, object]:
+    from gateway.kanban_autopilot import build_done_criteria_ledger
+
+    ledger = build_done_criteria_ledger(body)
+    assert ledger["ok"] is True
+    return {
+        "worker_done": True,
+        "kanban_worker_done": True,
+        "boundaries_confirmed": True,
+        "authority_boundary_confirmed": True,
+        "task_body": body,
+        "criteria_hash": ledger["criteria_hash"],
+        "criteria_proofs": _worker_done_proofs(body),
+        "cleanup": {"proof": "git status --short clean", "worktree_clean": True},
+        "workspace_kind": "worktree",
+    }
+
+
+def _review_ready_evidence(body: str = DONE_CRITERIA_BODY) -> dict[str, object]:
+    return {
+        "work_id": "BO-081",
+        "repo_full_name": "chriskim12/hermes-agent",
+        "commit": "8f0cbc56db6498e16c628e42430dbd6156d99fb3",
+        "task_branch": "yuuka/bo-081-autopilot-review-ready-contract",
+        "pr_url": "https://github.com/chriskim12/hermes-agent/pull/123",
+        "pr_base": "main",
+        "pr_head": "yuuka/bo-081-autopilot-review-ready-contract",
+        "checks_passed": True,
+        "worktree_clean": True,
+        **_worker_done_evidence(body),
+    }
 
 
 def test_autopilot_status_imports_and_reports_degraded_effective_mode(tmp_path, monkeypatch):
@@ -202,6 +261,63 @@ Done criteria:
     assert result["reason_codes"] == ["ambiguous_done_criteria_ledger"]
 
 
+def test_worker_done_evidence_rejects_missing_criterion_proofs():
+    from gateway.kanban_autopilot import validate_worker_done_evidence
+
+    result = validate_worker_done_evidence({**_worker_done_evidence(), "criteria_proofs": []}, task_body=DONE_CRITERIA_BODY)
+
+    assert result["worker_done_evidence_valid"] is False
+    assert "missing_criterion_level_evidence" in result["reason_codes"]
+
+
+def test_worker_done_evidence_rejects_missing_or_wrong_criteria_hash():
+    from gateway.kanban_autopilot import validate_worker_done_evidence
+
+    missing = validate_worker_done_evidence({k: v for k, v in _worker_done_evidence().items() if k != "criteria_hash"}, task_body=DONE_CRITERIA_BODY)
+    wrong = validate_worker_done_evidence({**_worker_done_evidence(), "criteria_hash": "0" * 64}, task_body=DONE_CRITERIA_BODY)
+
+    assert missing["worker_done_evidence_valid"] is False
+    assert "missing_criteria_hash" in missing["reason_codes"]
+    assert wrong["worker_done_evidence_valid"] is False
+    assert "stale_criteria_hash" in wrong["reason_codes"]
+
+
+def test_worker_done_evidence_rejects_missing_tests_checks_for_deterministic_criteria():
+    from gateway.kanban_autopilot import validate_worker_done_evidence
+
+    evidence = _worker_done_evidence()
+    evidence["criteria_proofs"] = [
+        {**evidence["criteria_proofs"][0], "tests_run": None, "tests_passed": None, "test_command": ""},
+        *evidence["criteria_proofs"][1:],
+    ]
+
+    result = validate_worker_done_evidence(evidence, task_body=DONE_CRITERIA_BODY)
+
+    assert result["worker_done_evidence_valid"] is False
+    assert any(code.startswith("missing_tests_or_checks_for_") for code in result["reason_codes"])
+
+
+def test_worker_done_evidence_rejects_missing_authority_boundary_confirmation():
+    from gateway.kanban_autopilot import validate_worker_done_evidence
+
+    result = validate_worker_done_evidence({**_worker_done_evidence(), "boundaries_confirmed": False, "authority_boundary_confirmed": False}, task_body=DONE_CRITERIA_BODY)
+
+    assert result["worker_done_evidence_valid"] is False
+    assert "missing_authority_boundary_confirmation" in result["reason_codes"]
+
+
+def test_worker_done_evidence_accepts_complete_worker_proof_contract():
+    from gateway.kanban_autopilot import validate_worker_done_evidence
+
+    result = validate_worker_done_evidence(_worker_done_evidence(), task_body=DONE_CRITERIA_BODY)
+
+    assert result["worker_done_evidence_valid"] is True
+    assert result["status"] == "accepted"
+    assert result["reason_codes"] == []
+    assert result["criteria_hash"] == _done_criteria_hash()
+    assert result["cleanup_or_residue_proof"] is True
+
+
 def test_ready_gate_rejects_missing_or_ambiguous_done_criteria_and_accepts_explicit_criteria():
     from gateway.kanban_autopilot import evaluate_autopilot_ready_gate
 
@@ -230,6 +346,7 @@ def test_review_ready_contract_rejects_stale_criteria_hash_and_requires_worktree
     from gateway.kanban_autopilot import evaluate_review_ready_contract
 
     evidence = {
+        **_worker_done_evidence(),
         "work_id": "BO-146",
         "repo_full_name": "chriskim12/hermes-agent",
         "commit": "8f0cbc56db6498e16c628e42430dbd6156d99fb3",
@@ -239,11 +356,10 @@ def test_review_ready_contract_rejects_stale_criteria_hash_and_requires_worktree
         "pr_head": "work/BO-146-done-criteria-ledger",
         "checks_passed": True,
         "worktree_clean": True,
-        "kanban_worker_done": True,
-        "boundaries_confirmed": True,
         "task_body": DONE_CRITERIA_BODY,
         "criteria_hash": "0" * 64,
         "workspace_kind": "worktree",
+        "cleanup": {},
     }
 
     stale = evaluate_review_ready_contract(evidence)
@@ -260,6 +376,7 @@ def test_review_ready_contract_rejects_stale_criteria_hash_and_requires_worktree
     retained = evaluate_review_ready_contract({
         **evidence,
         "criteria_hash": current_hash,
+        "cleanup": {},
         "residue": {
             "items": [
                 {"path": ".worktrees/bo-146-done-criteria-ledger", "disposition": "retained", "reason": "review evidence", "ttl": "2026-06-01"}
@@ -335,6 +452,7 @@ def test_autopilot_queue_dry_run_reports_gate_results_without_spawning(tmp_path,
 
 def _ready_candidate(public_id: str = "BO-100") -> dict:
     return {
+        **_worker_done_evidence(),
         "id": "t_good",
         "public_id": public_id,
         "status": "ready",
@@ -418,6 +536,7 @@ def test_review_ready_contract_requires_pr_and_checks_without_merging():
     assert missing["release_allowed"] is False
 
     satisfied = evaluate_review_ready_contract({
+        **_worker_done_evidence(),
         "work_id": "BO-081",
         "repo_full_name": "chriskim12/hermes-agent",
         "commit": "8f0cbc56db6498e16c628e42430dbd6156d99fb3",
@@ -427,8 +546,6 @@ def test_review_ready_contract_requires_pr_and_checks_without_merging():
         "pr_head": "yuuka/bo-081-autopilot-review-ready-contract",
         "checks_passed": True,
         "worktree_clean": True,
-        "kanban_worker_done": True,
-        "boundaries_confirmed": True,
         "task_body": DONE_CRITERIA_BODY,
     })
     assert satisfied["review_ready"] is True
@@ -441,6 +558,7 @@ def test_review_ready_contract_rejects_wrong_repo_and_release_base():
     from gateway.kanban_autopilot import evaluate_review_ready_contract
 
     result = evaluate_review_ready_contract({
+        **_worker_done_evidence(),
         "work_id": "BO-081",
         "repo_full_name": "evil/repo",
         "commit": "8f0cbc56db6498e16c628e42430dbd6156d99fb3",
@@ -450,8 +568,6 @@ def test_review_ready_contract_rejects_wrong_repo_and_release_base():
         "pr_head": "other",
         "checks_passed": True,
         "worktree_clean": True,
-        "kanban_worker_done": True,
-        "boundaries_confirmed": True,
     }, expected_repo_full_name="chriskim12/hermes-agent")
 
     assert result["review_ready"] is False
@@ -459,6 +575,60 @@ def test_review_ready_contract_rejects_wrong_repo_and_release_base():
     assert "release_base_requires_separate_approval" in result["reason_codes"]
     assert "pr_head_task_branch_mismatch" in result["reason_codes"]
     assert result["merge_allowed"] is False
+
+
+def test_worker_done_evidence_requires_criterion_level_proofs():
+    from gateway.kanban_autopilot import validate_worker_done_evidence
+
+    evidence = _worker_done_evidence()
+    evidence.pop("criteria_proofs")
+
+    result = validate_worker_done_evidence(evidence, task_body=DONE_CRITERIA_BODY)
+
+    assert result["worker_done_evidence_valid"] is False
+    assert "missing_criterion_level_evidence" in result["reason_codes"]
+
+
+def test_worker_done_evidence_rejects_stale_criteria_hash():
+    from gateway.kanban_autopilot import validate_worker_done_evidence
+
+    evidence = _worker_done_evidence()
+    evidence["criteria_hash"] = "0" * 64
+
+    result = validate_worker_done_evidence(evidence, task_body=DONE_CRITERIA_BODY)
+
+    assert result["worker_done_evidence_valid"] is False
+    assert "stale_criteria_hash" in result["reason_codes"]
+
+
+def test_worker_done_evidence_rejects_missing_boundary_confirmation():
+    from gateway.kanban_autopilot import validate_worker_done_evidence
+
+    evidence = _worker_done_evidence()
+    evidence.pop("authority_boundary_confirmed")
+    evidence.pop("boundaries_confirmed")
+
+    result = validate_worker_done_evidence(evidence, task_body=DONE_CRITERIA_BODY)
+
+    assert result["worker_done_evidence_valid"] is False
+    assert "missing_authority_boundary_confirmation" in result["reason_codes"]
+
+
+def test_worker_done_evidence_rejects_missing_deterministic_verification_for_test_criteria():
+    from gateway.kanban_autopilot import validate_worker_done_evidence
+
+    evidence = _worker_done_evidence()
+    for proof in evidence["criteria_proofs"]:
+        if proof["criterion_id"] == "dc-01-focused-tests-pass":
+            proof.pop("tests_run", None)
+            proof.pop("tests_passed", None)
+            proof.pop("test_command", None)
+            break
+
+    result = validate_worker_done_evidence(evidence, task_body=DONE_CRITERIA_BODY)
+
+    assert result["worker_done_evidence_valid"] is False
+    assert "missing_tests_or_checks_for_dc-01-focused-tests-pass" in result["reason_codes"]
 
 
 def test_hard_stop_pauses_lane_and_blocks_eligibility_until_recovered(tmp_path, monkeypatch):
@@ -710,6 +880,7 @@ def test_closeout_progress_gate_blocks_missing_evidence_and_pr_backlog():
     assert "missing_review_ready_contract" in missing["reason_codes"]
 
     good = {
+        **_worker_done_evidence(),
         "work_id": "BO-094",
         "repo_full_name": "chriskim12/hermes-agent",
         "commit": "8f0cbc56db6498e16c628e42430dbd6156d99fb3",
@@ -719,8 +890,6 @@ def test_closeout_progress_gate_blocks_missing_evidence_and_pr_backlog():
         "pr_head": "bo-094",
         "checks_passed": True,
         "worktree_clean": True,
-        "kanban_worker_done": True,
-        "boundaries_confirmed": True,
         "task_body": DONE_CRITERIA_BODY,
     }
     backlog_blocked = evaluate_autopilot_closeout_progress(good, open_autopilot_prs=2, max_open_autopilot_prs=2)
@@ -846,6 +1015,7 @@ def test_review_package_proof_summarizes_pr_readiness_without_live_authority():
     from gateway.kanban_autopilot import build_autopilot_review_package
 
     evidence = {
+        **_worker_done_evidence(),
         "work_id": "BO-118",
         "repo_full_name": "chriskim12/hermes-agent",
         "commit": "91d572c971956e705cbfccc19990bf1ed128c239",
@@ -855,8 +1025,6 @@ def test_review_package_proof_summarizes_pr_readiness_without_live_authority():
         "pr_head": "bo-118-autopilot-review-package",
         "checks_passed": True,
         "worktree_clean": True,
-        "kanban_worker_done": True,
-        "boundaries_confirmed": True,
         "task_body": DONE_CRITERIA_BODY,
     }
     run_report = {
