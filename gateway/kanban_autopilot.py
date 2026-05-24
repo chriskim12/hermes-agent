@@ -1824,8 +1824,9 @@ def load_live_kanban_candidates(
     """Read live Kanban candidates for Autopilot without mutating the board.
 
     If a parent/focus public id is supplied, only hierarchy children of that
-    parent are returned.  Without an explicit parent this deliberately returns
-    only ``ready`` tasks, keeping the read side narrow and side-effect free.
+    parent are returned. Without an explicit parent this returns ready tasks plus
+    active flight rows so the global/default-policy single-flight guard can see
+    an already-running worker before dispatching another task.
     """
 
     try:
@@ -1858,14 +1859,30 @@ def load_live_kanban_candidates(
                 _task_row_to_candidate(row, parent_public_id=parent["public_id"] or parent_public_id, relation_type=row["relation_type"])
                 for row in rows
             ]
-        params = []
-        query = "SELECT * FROM tasks WHERE status = 'ready'"
-        if tenant:
-            query += " AND tenant = ?"
-            params.append(tenant)
-        query += " ORDER BY priority DESC, created_at ASC LIMIT ?"
-        params.append(max(1, int(limit)))
-        rows = conn.execute(query, params).fetchall()
+        tenant_clause = " AND tenant = ?" if tenant else ""
+        tenant_params: list[Any] = [tenant] if tenant else []
+        active_query = f"""
+            SELECT * FROM tasks
+            WHERE status != 'archived'
+              AND (
+                status IN ('running', 'claimed', 'in_progress')
+                OR claim_lock IS NOT NULL
+                OR worker_pid IS NOT NULL
+                OR current_run_id IS NOT NULL
+              )
+              {tenant_clause}
+            ORDER BY priority DESC, created_at ASC
+        """
+        ready_query = f"""
+            SELECT * FROM tasks
+            WHERE status = 'ready'
+              {tenant_clause}
+            ORDER BY priority DESC, created_at ASC LIMIT ?
+        """
+        rows = list(conn.execute(active_query, tenant_params).fetchall())
+        seen_ids = {row["id"] for row in rows}
+        ready_rows = conn.execute(ready_query, [*tenant_params, max(1, int(limit))]).fetchall()
+        rows.extend(row for row in ready_rows if row["id"] not in seen_ids)
         return [_task_row_to_candidate(row) for row in rows]
 
 
@@ -2127,12 +2144,12 @@ def evaluate_dispatcher_eligibility(candidates: list[dict[str, Any]]) -> dict[st
                 "reason_codes": ["autopilot_lane_paused"],
                 "human_reason": f"Autopilot lane is paused: {tenant}",
             }
-        elif effective not in {"blocked", "default_policy_loop", "parent_scoped", "bounded_multi_tick"}:
+        elif effective not in {"default_policy_loop", "parent_scoped", "bounded_multi_tick"}:
             gate = {
                 **gate,
                 "autopilot_ready": False,
                 "status": "rejected",
-                "reason_codes": ["autopilot_effective_mode_not_blocked_pending_dispatch_gate"],
+                "reason_codes": ["autopilot_effective_mode_not_dispatch_enabled"],
                 "human_reason": "Autopilot controller is not in a dispatch-enabled mode.",
             }
         if gate["autopilot_ready"]:

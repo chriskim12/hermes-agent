@@ -397,10 +397,19 @@ def _check_statuses(evidence: Mapping[str, Any]) -> list[str]:
     return blockers
 
 
+def _verifier_pass_present(evidence: Mapping[str, Any]) -> bool:
+    verdict = evidence.get("verifier_verdict") or evidence.get("verifier")
+    if isinstance(verdict, Mapping):
+        return _lower(verdict.get("verdict") or verdict.get("status")) == "pass"
+    return _lower(verdict) == "pass"
+
+
 def _review_ready_blockers(evidence: Mapping[str, Any]) -> list[str]:
     blockers: list[str] = []
     if not _has_worker_evidence(evidence):
         blockers.append("missing_worker_evidence")
+    if not _verifier_pass_present(evidence):
+        blockers.append("missing_verifier_pass")
     blockers.extend(_check_pr(evidence))
     blockers.extend(_check_statuses(evidence))
     blockers.extend(_residue_blockers(evidence))

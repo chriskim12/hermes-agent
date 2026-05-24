@@ -688,7 +688,7 @@ def test_dispatcher_eligibility_bridge_requires_controller_on_and_ready_gate(tmp
 
     stopped = evaluate_dispatcher_eligibility([_ready_candidate()])
     assert stopped["eligible"] == []
-    assert stopped["ineligible"][0]["reason_codes"] == ["autopilot_effective_mode_not_blocked_pending_dispatch_gate"]
+    assert stopped["ineligible"][0]["reason_codes"] == ["autopilot_effective_mode_not_dispatch_enabled"]
 
     handle_autopilot_command("on", actor="tester")
     verdict = evaluate_dispatcher_eligibility([_ready_candidate(), {"id": "t_raw", "public_id": "BO-999", "status": "ready", "body": "raw"}])
@@ -699,6 +699,23 @@ def test_dispatcher_eligibility_bridge_requires_controller_on_and_ready_gate(tmp
     assert verdict["handoff_target"] == "existing_kanban_dispatcher"
     assert verdict["second_dispatcher_created"] is False
     assert verdict["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0}
+
+
+def test_dispatcher_eligibility_rejects_legacy_enabled_blocked_mode(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "gateway_autopilot_state.json").write_text(
+        json.dumps({"version": 1, "enabled": True, "desired_mode": "enabled", "updated_by": "legacy"}),
+        encoding="utf-8",
+    )
+
+    from gateway.kanban_autopilot import evaluate_dispatcher_eligibility
+
+    verdict = evaluate_dispatcher_eligibility([_ready_candidate("BO-LEGACY")])
+
+    assert verdict["controller_effective_mode"] == "blocked"
+    assert verdict["eligible"] == []
+    assert verdict["ineligible"][0]["public_id"] == "BO-LEGACY"
+    assert verdict["ineligible"][0]["reason_codes"] == ["autopilot_effective_mode_not_dispatch_enabled"]
 
 
 def test_autopilot_queue_includes_dispatcher_eligibility_without_dispatching(tmp_path, monkeypatch):
@@ -833,6 +850,78 @@ def test_worker_done_evidence_rejects_missing_deterministic_verification_for_tes
 
     assert result["worker_done_evidence_valid"] is False
     assert "missing_tests_or_checks_for_dc-01-focused-tests-pass" in result["reason_codes"]
+
+
+def test_default_live_candidate_load_includes_active_flights_for_global_single_flight(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import activate_single_flight, load_live_kanban_candidates
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        active_id = kb.create_task(
+            conn,
+            title="active autopilot worker",
+            body="already running",
+            assignee="worker",
+            public_id="BO-ACTIVE",
+        )
+        kb.create_task(
+            conn,
+            title="ready autopilot worker",
+            body=_ready_candidate("BO-READY")["body"],
+            assignee="worker",
+            public_id="BO-READY",
+            routing_verdict={"verdict": "Hermes direct", "reason": "test"},
+            closeout_evidence=_worker_done_evidence(),
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'running', current_run_id = 'run-1', claim_lock = 'lock-1', worker_pid = 4242 WHERE id = ?",
+            (active_id,),
+        )
+
+    candidates = load_live_kanban_candidates()
+
+    assert {candidate["public_id"] for candidate in candidates} >= {"BO-ACTIVE", "BO-READY"}
+    decision = activate_single_flight(candidates)
+    assert decision["status"] == "active_flight_blocked"
+    assert decision["active_flights"][0]["public_id"] == "BO-ACTIVE"
+
+
+def test_default_live_candidate_load_does_not_limit_out_active_flights(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import load_live_kanban_candidates
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        active_id = kb.create_task(
+            conn,
+            title="low priority active worker",
+            body="already running",
+            assignee="worker",
+            public_id="BO-ACTIVE-LIMIT",
+            priority=-100,
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'running', current_run_id = 'run-limit', claim_lock = 'lock-limit' WHERE id = ?",
+            (active_id,),
+        )
+        for index in range(60):
+            kb.create_task(
+                conn,
+                title=f"high priority ready {index}",
+                body=_ready_candidate(f"BO-READY-{index}")["body"],
+                assignee="worker",
+                public_id=f"BO-READY-{index}",
+                priority=100,
+                routing_verdict={"verdict": "Hermes direct", "reason": "test"},
+                closeout_evidence=_worker_done_evidence(),
+            )
+
+    candidates = load_live_kanban_candidates(limit=50)
+
+    assert "BO-ACTIVE-LIMIT" in {candidate["public_id"] for candidate in candidates}
 
 
 def test_hard_stop_pauses_lane_and_blocks_eligibility_until_recovered(tmp_path, monkeypatch):
