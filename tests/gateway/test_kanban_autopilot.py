@@ -3,6 +3,82 @@
 from __future__ import annotations
 
 import json
+from typing import Any
+
+
+DONE_CRITERIA_BODY = """
+Done criteria:
+- Focused tests pass.
+- Git diff check passes.
+- Boundaries remain confirmed.
+"""
+
+
+def _done_criteria_hash(body: str = DONE_CRITERIA_BODY) -> str:
+    from gateway.kanban_autopilot import build_done_criteria_ledger
+
+    result = build_done_criteria_ledger(body)
+    assert result["ok"] is True
+    return result["criteria_hash"]
+
+
+def _worker_done_proofs(body: str = DONE_CRITERIA_BODY) -> list[dict[str, Any]]:
+    from gateway.kanban_autopilot import build_done_criteria_ledger
+
+    ledger = build_done_criteria_ledger(body)
+    assert ledger["ok"] is True
+    return [
+        {
+            "criterion_id": criterion["id"],
+            "proof": f"{criterion['text']} verified",
+            "artifact_refs": [f"artifacts/{criterion['id']}.md"],
+            **(
+                {"tests_run": 1, "tests_passed": True, "test_command": "python -m pytest tests/gateway/test_kanban_autopilot.py -q"}
+                if "test" in criterion["text"].lower()
+                else {}
+            ),
+            **(
+                {"checks_passed": True, "check_command": "git diff --check"}
+                if "check" in criterion["text"].lower() or "diff" in criterion["text"].lower()
+                else {}
+            ),
+        }
+        for criterion in ledger["done_criteria_ledger"]["criteria"]
+    ]
+
+
+def _worker_done_evidence(body: str = DONE_CRITERIA_BODY) -> dict[str, object]:
+    from gateway.kanban_autopilot import build_done_criteria_ledger
+
+    ledger = build_done_criteria_ledger(body)
+    assert ledger["ok"] is True
+    return {
+        "worker_done": True,
+        "kanban_worker_done": True,
+        "boundaries_confirmed": True,
+        "authority_boundary_confirmed": True,
+        "task_body": body,
+        "criteria_hash": ledger["criteria_hash"],
+        "criteria_proofs": _worker_done_proofs(body),
+        "cleanup": {"proof": "git status --short clean", "worktree_clean": True},
+        "workspace_kind": "worktree",
+    }
+
+
+def _review_ready_evidence(body: str = DONE_CRITERIA_BODY) -> dict[str, object]:
+    return {
+        "work_id": "BO-081",
+        "repo_full_name": "chriskim12/hermes-agent",
+        "commit": "8f0cbc56db6498e16c628e42430dbd6156d99fb3",
+        "task_branch": "yuuka/bo-081-autopilot-review-ready-contract",
+        "pr_url": "https://github.com/chriskim12/hermes-agent/pull/123",
+        "pr_base": "main",
+        "pr_head": "yuuka/bo-081-autopilot-review-ready-contract",
+        "checks_passed": True,
+        "worktree_clean": True,
+        "verifier_verdict": {"verdict": "PASS", "criterion_results": _verifier_results(body)},
+        **_worker_done_evidence(body),
+    }
 
 
 def test_autopilot_status_imports_and_reports_degraded_effective_mode(tmp_path, monkeypatch):
@@ -139,6 +215,381 @@ def test_ready_gate_rejects_raw_kanban_ready_without_executable_contract():
     assert result["human_reason"]
 
 
+def test_done_criteria_ledger_extracts_stable_ids_and_deterministic_hash():
+    from gateway.kanban_autopilot import build_done_criteria_ledger
+
+    body = """
+Goal: ship a bounded validator.
+Done criteria:
+- Focused tests pass.
+- Git diff check passes.
+- Boundaries remain confirmed.
+Verification requirements: pytest and diff check.
+"""
+
+    first = build_done_criteria_ledger(body)
+    second = build_done_criteria_ledger(body)
+
+    assert first["ok"] is True
+    assert first["criteria_hash"] == second["criteria_hash"]
+    assert first["criteria_version"] == 1
+    assert first["criteria_ids"] == [
+        "dc-01-focused-tests-pass",
+        "dc-02-git-diff-check-passes",
+        "dc-03-boundaries-remain-confirmed",
+    ]
+    assert first["done_criteria_ledger"]["schema"] == "autopilot_done_criteria_ledger.v1"
+
+
+def test_done_criteria_ledger_rejects_missing_done_criteria():
+    from gateway.kanban_autopilot import build_done_criteria_ledger
+
+    result = build_done_criteria_ledger("Goal: do a thing. Verification requirements: pytest.")
+
+    assert result["ok"] is False
+    assert "missing_done_criteria_ledger" in result["reason_codes"]
+
+
+def test_done_criteria_ledger_rejects_ambiguous_done_criteria():
+    from gateway.kanban_autopilot import build_done_criteria_ledger
+
+    result = build_done_criteria_ledger("""
+Done criteria:
+- Tests pass or some other verification is acceptable.
+""")
+
+    assert result["ok"] is False
+    assert result["reason_codes"] == ["ambiguous_done_criteria_ledger"]
+
+
+def test_worker_done_evidence_rejects_missing_criterion_proofs():
+    from gateway.kanban_autopilot import validate_worker_done_evidence
+
+    result = validate_worker_done_evidence({**_worker_done_evidence(), "criteria_proofs": []}, task_body=DONE_CRITERIA_BODY)
+
+    assert result["worker_done_evidence_valid"] is False
+    assert "missing_criterion_level_evidence" in result["reason_codes"]
+
+
+def test_worker_done_evidence_rejects_missing_or_wrong_criteria_hash():
+    from gateway.kanban_autopilot import validate_worker_done_evidence
+
+    missing = validate_worker_done_evidence({k: v for k, v in _worker_done_evidence().items() if k != "criteria_hash"}, task_body=DONE_CRITERIA_BODY)
+    wrong = validate_worker_done_evidence({**_worker_done_evidence(), "criteria_hash": "0" * 64}, task_body=DONE_CRITERIA_BODY)
+
+    assert missing["worker_done_evidence_valid"] is False
+    assert "missing_criteria_hash" in missing["reason_codes"]
+    assert wrong["worker_done_evidence_valid"] is False
+    assert "stale_criteria_hash" in wrong["reason_codes"]
+
+
+def test_worker_done_evidence_rejects_missing_tests_checks_for_deterministic_criteria():
+    from gateway.kanban_autopilot import validate_worker_done_evidence
+
+    evidence = _worker_done_evidence()
+    evidence["criteria_proofs"] = [
+        {**evidence["criteria_proofs"][0], "tests_run": None, "tests_passed": None, "test_command": ""},
+        *evidence["criteria_proofs"][1:],
+    ]
+
+    result = validate_worker_done_evidence(evidence, task_body=DONE_CRITERIA_BODY)
+
+    assert result["worker_done_evidence_valid"] is False
+    assert any(code.startswith("missing_tests_or_checks_for_") for code in result["reason_codes"])
+
+
+def test_worker_done_evidence_rejects_missing_authority_boundary_confirmation():
+    from gateway.kanban_autopilot import validate_worker_done_evidence
+
+    result = validate_worker_done_evidence({**_worker_done_evidence(), "boundaries_confirmed": False, "authority_boundary_confirmed": False}, task_body=DONE_CRITERIA_BODY)
+
+    assert result["worker_done_evidence_valid"] is False
+    assert "missing_authority_boundary_confirmation" in result["reason_codes"]
+
+
+def test_worker_done_evidence_accepts_complete_worker_proof_contract():
+    from gateway.kanban_autopilot import validate_worker_done_evidence
+
+    result = validate_worker_done_evidence(_worker_done_evidence(), task_body=DONE_CRITERIA_BODY)
+
+    assert result["worker_done_evidence_valid"] is True
+    assert result["status"] == "accepted"
+    assert result["reason_codes"] == []
+    assert result["criteria_hash"] == _done_criteria_hash()
+    assert result["cleanup_or_residue_proof"] is True
+
+
+def _verifier_results(body: str = DONE_CRITERIA_BODY, status: str = "PASS") -> list[dict[str, Any]]:
+    from gateway.kanban_autopilot import build_done_criteria_ledger
+
+    ledger = build_done_criteria_ledger(body)
+    assert ledger["ok"] is True
+    return [
+        {
+            "criterion_id": criterion["id"],
+            "status": status,
+            "evidence": f"verifier independently checked {criterion['id']}",
+        }
+        for criterion in ledger["done_criteria_ledger"]["criteria"]
+    ]
+
+
+def test_verifier_verdict_pass_requires_distinct_identity_and_all_criteria_evidence():
+    from gateway.kanban_autopilot import evaluate_verifier_verdict
+
+    result = evaluate_verifier_verdict(
+        {**_worker_done_evidence(), "worker_identity": "arisu"},
+        {"verifier_identity": "yuuka", "criterion_results": _verifier_results()},
+    )
+
+    assert result["verdict"] == "PASS"
+    assert result["review_ready_input_eligible"] is True
+    assert set(item["criterion_id"] for item in result["criterion_results"]) == set(result["criteria_ids"])
+    assert result["side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0}
+
+
+def test_verifier_verdict_rejects_worker_self_approval():
+    from gateway.kanban_autopilot import evaluate_verifier_verdict
+
+    result = evaluate_verifier_verdict(
+        {**_worker_done_evidence(), "worker_identity": "arisu"},
+        {"verifier_identity": "arisu", "criterion_results": _verifier_results()},
+    )
+
+    assert result["verdict"] == "FAIL"
+    assert result["review_ready_input_eligible"] is False
+    assert "verifier_same_as_worker" in result["reason_codes"]
+    assert any("distinct" in item for item in result["remediation_instructions"])
+
+
+def test_verifier_verdict_fail_includes_actionable_remediation_and_keeps_worker_done():
+    from gateway.kanban_autopilot import evaluate_verifier_verdict
+
+    criterion_results = _verifier_results()
+    criterion_results[0] = {
+        **criterion_results[0],
+        "status": "FAIL",
+        "remediation": "Add focused pytest evidence for the first criterion.",
+    }
+    result = evaluate_verifier_verdict(
+        {**_worker_done_evidence(), "worker_identity": "arisu"},
+        {"verifier_identity": "yuuka", "criterion_results": criterion_results},
+    )
+
+    assert result["verdict"] == "FAIL"
+    assert result["worker_done_retained"] is True
+    assert result["worker_done_evidence"]["worker_done_evidence_valid"] is True
+    assert result["review_ready_input_eligible"] is False
+    assert any(code.startswith("verifier_failed_") for code in result["reason_codes"])
+    assert "Add focused pytest evidence for the first criterion." in result["remediation_instructions"]
+
+
+def test_verifier_verdict_blocked_reports_blocker_reason_codes():
+    from gateway.kanban_autopilot import evaluate_verifier_verdict
+
+    result = evaluate_verifier_verdict(
+        {**_worker_done_evidence(), "worker_identity": "arisu"},
+        {"verifier_identity": "yuuka", "blocker_reason_codes": ["missing_live_pr_context"]},
+    )
+
+    assert result["verdict"] == "BLOCKED"
+    assert result["review_ready_input_eligible"] is False
+    assert result["blocker_reason_codes"] == ["missing_live_pr_context"]
+
+
+def test_verifier_verdict_requires_refinement_for_missing_ambiguous_or_stale_ledger():
+    from gateway.kanban_autopilot import evaluate_verifier_verdict
+
+    missing = evaluate_verifier_verdict(
+        {**_worker_done_evidence(), "worker_identity": "arisu", "task_body": "Goal: too vague", "criteria_hash": ""},
+        {"verifier_identity": "yuuka", "criterion_results": []},
+    )
+    ambiguous_body = """
+Done criteria:
+- Maybe pass tests or etc.
+"""
+    ambiguous = evaluate_verifier_verdict(
+        {**_worker_done_evidence(), "worker_identity": "arisu", "task_body": ambiguous_body, "criteria_hash": ""},
+        {"verifier_identity": "yuuka", "criterion_results": []},
+    )
+    stale = evaluate_verifier_verdict(
+        {**_worker_done_evidence(), "worker_identity": "arisu", "criteria_hash": "0" * 64},
+        {"verifier_identity": "yuuka", "criterion_results": _verifier_results()},
+    )
+
+    assert missing["verdict"] == "REFINEMENT_REQUIRED"
+    assert "missing_done_criteria_ledger" in missing["reason_codes"]
+    assert ambiguous["verdict"] == "REFINEMENT_REQUIRED"
+    assert "ambiguous_done_criteria_ledger" in ambiguous["reason_codes"]
+    assert stale["verdict"] == "REFINEMENT_REQUIRED"
+    assert "stale_criteria_hash" in stale["reason_codes"]
+    assert stale["review_ready_input_eligible"] is False
+
+
+def test_retry_controller_queues_exactly_one_remediation_on_verifier_fail():
+    from gateway.kanban_autopilot import plan_verifier_retry_controller
+
+    criterion_results = _verifier_results()
+    criterion_results[0] = {**criterion_results[0], "status": "FAIL", "remediation": "Fix first criterion."}
+    result = plan_verifier_retry_controller(
+        {**_worker_done_evidence(), "worker_identity": "arisu"},
+        {"verifier_identity": "yuuka", "criterion_results": criterion_results},
+        attempt=1,
+    )
+
+    assert result["next_state"] == "queue_remediation"
+    assert result["queued_remediation_count"] == 1
+    assert result["queued_actions"][0]["type"] == "remediation"
+    assert result["queued_actions"][0]["attempt"] == 2
+    assert result["kanban_evidence_patch"]["verification_attempt"] == 1
+    assert result["side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0}
+
+
+def test_retry_controller_persists_attempt_and_blocks_after_three_failures():
+    from gateway.kanban_autopilot import plan_verifier_retry_controller
+
+    criterion_results = _verifier_results()
+    criterion_results[0] = {**criterion_results[0], "status": "FAIL"}
+    result = plan_verifier_retry_controller(
+        {**_worker_done_evidence(), "worker_identity": "arisu", "verification_attempt": 3},
+        {"verifier_identity": "yuuka", "criterion_results": criterion_results},
+    )
+
+    assert result["next_state"] == "blocked"
+    assert result["blocked"] is True
+    assert result["queued_remediation_count"] == 0
+    assert result["attempt"] == 3
+    assert "max_verification_attempts_exhausted" in result["reason_codes"]
+    assert result["kanban_evidence_patch"]["next_controller_state"] == "blocked"
+
+
+def test_retry_controller_pass_allows_review_ready_input_without_dispatch():
+    from gateway.kanban_autopilot import plan_verifier_retry_controller
+
+    result = plan_verifier_retry_controller(
+        {**_worker_done_evidence(), "worker_identity": "arisu"},
+        {"verifier_identity": "yuuka", "criterion_results": _verifier_results()},
+    )
+
+    assert result["next_state"] == "verifier_pass"
+    assert result["review_ready_input_eligible"] is True
+    assert result["queued_actions"] == []
+    assert result["side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0}
+
+
+def test_retry_controller_refinement_required_does_not_queue_worker_retry():
+    from gateway.kanban_autopilot import plan_verifier_retry_controller
+
+    result = plan_verifier_retry_controller(
+        {**_worker_done_evidence(), "worker_identity": "arisu", "task_body": "Goal: too vague", "criteria_hash": ""},
+        {"verifier_identity": "yuuka", "criterion_results": []},
+    )
+
+    assert result["next_state"] == "refinement_required"
+    assert result["queued_remediation_count"] == 0
+    assert result["review_ready_input_eligible"] is False
+    assert "missing_done_criteria_ledger" in result["reason_codes"]
+
+
+def test_retry_controller_blocked_verdict_does_not_queue_remediation():
+    from gateway.kanban_autopilot import plan_verifier_retry_controller
+
+    result = plan_verifier_retry_controller(
+        {**_worker_done_evidence(), "worker_identity": "arisu"},
+        {"verifier_identity": "yuuka", "blocker_reason_codes": ["missing_authority"]},
+    )
+
+    assert result["next_state"] == "blocked"
+    assert result["blocked"] is True
+    assert result["queued_actions"] == []
+    assert "missing_authority" in result["reason_codes"]
+
+
+def test_ready_gate_rejects_missing_or_ambiguous_done_criteria_and_accepts_explicit_criteria():
+    from gateway.kanban_autopilot import evaluate_autopilot_ready_gate
+
+    missing = _ready_candidate("BO-146")
+    missing["body"] = missing["body"].split("Done criteria:", 1)[0]
+    missing_result = evaluate_autopilot_ready_gate(missing)
+    assert missing_result["autopilot_ready"] is False
+    assert "missing_done_criteria_ledger" in missing_result["reason_codes"]
+
+    ambiguous = _ready_candidate("BO-147")
+    ambiguous["body"] = ambiguous["body"].replace(
+        "- Focused tests pass.",
+        "- Focused tests pass or some other verification is fine.",
+    )
+    ambiguous_result = evaluate_autopilot_ready_gate(ambiguous)
+    assert ambiguous_result["autopilot_ready"] is False
+    assert "ambiguous_done_criteria_ledger" in ambiguous_result["reason_codes"]
+
+    explicit = evaluate_autopilot_ready_gate(_ready_candidate("BO-148"))
+    assert explicit["autopilot_ready"] is True
+    assert explicit["criteria_hash"]
+    assert explicit["criteria_ids"]
+
+
+def test_review_ready_contract_rejects_stale_criteria_hash_and_requires_worktree_cleanup_proof():
+    from gateway.kanban_autopilot import evaluate_review_ready_contract
+
+    evidence = {
+        **_worker_done_evidence(),
+        "work_id": "BO-146",
+        "repo_full_name": "chriskim12/hermes-agent",
+        "commit": "8f0cbc56db6498e16c628e42430dbd6156d99fb3",
+        "task_branch": "work/BO-146-done-criteria-ledger",
+        "pr_url": "https://github.com/chriskim12/hermes-agent/pull/146",
+        "pr_base": "main",
+        "pr_head": "work/BO-146-done-criteria-ledger",
+        "checks_passed": True,
+        "worktree_clean": True,
+        "task_body": DONE_CRITERIA_BODY,
+        "criteria_hash": "0" * 64,
+        "workspace_kind": "worktree",
+        "cleanup": {},
+        "verifier_verdict": {"verdict": "PASS", "criterion_results": _verifier_results()},
+    }
+
+    stale = evaluate_review_ready_contract(evidence)
+    assert stale["review_ready"] is False
+    assert "stale_criteria_hash" in stale["reason_codes"]
+    assert "missing_cleanup_proof" in stale["reason_codes"]
+
+    current_hash = _done_criteria_hash()
+    missing_cleanup = evaluate_review_ready_contract({**evidence, "criteria_hash": current_hash})
+    assert missing_cleanup["review_ready"] is False
+    assert "stale_criteria_hash" not in missing_cleanup["reason_codes"]
+    assert "missing_cleanup_proof" in missing_cleanup["reason_codes"]
+
+    retained = evaluate_review_ready_contract({
+        **evidence,
+        "criteria_hash": current_hash,
+        "cleanup": {},
+        "residue": {
+            "items": [
+                {"path": ".worktrees/bo-146-done-criteria-ledger", "disposition": "retained", "reason": "review evidence", "ttl": "2026-06-01"}
+            ]
+        },
+    })
+    assert retained["review_ready"] is True
+    assert retained["reason_codes"] == []
+
+
+def test_review_ready_contract_requires_verifier_pass():
+    from gateway.kanban_autopilot import evaluate_review_ready_contract
+
+    missing = evaluate_review_ready_contract({k: v for k, v in _review_ready_evidence().items() if k != "verifier_verdict"})
+    failed = evaluate_review_ready_contract({**_review_ready_evidence(), "verifier_verdict": {"verdict": "FAIL", "reason_codes": ["criterion_failed"]}})
+    passed = evaluate_review_ready_contract(_review_ready_evidence())
+
+    assert missing["review_ready"] is False
+    assert "missing_verifier_pass" in missing["reason_codes"]
+    assert failed["review_ready"] is False
+    assert "missing_verifier_pass" in failed["reason_codes"]
+    assert passed["review_ready"] is True
+    assert "missing_verifier_pass" not in passed["reason_codes"]
+
+
 def test_ready_gate_accepts_native_contract_but_never_claims_or_spawns(monkeypatch):
     from gateway import kanban_autopilot
 
@@ -168,6 +619,10 @@ Repo/lane truth: chriskim12/hermes-agent on a task branch.
 Risk flags: no env, secret, prod, billing, customer-visible, or restart action.
 Dependencies/blockers: none.
 Review package expectation: changed files, tests, commit, boundaries.
+Done criteria:
+- Focused tests pass.
+- Git diff check passes.
+- Boundaries remain confirmed.
 """,
         "routing_verdict": {"verdict": "Hermes direct"},
         "admission_snapshot": {"repo_full_name": "chriskim12/hermes-agent"},
@@ -200,6 +655,7 @@ def test_autopilot_queue_dry_run_reports_gate_results_without_spawning(tmp_path,
 
 def _ready_candidate(public_id: str = "BO-100") -> dict:
     return {
+        **_worker_done_evidence(),
         "id": "t_good",
         "public_id": public_id,
         "status": "ready",
@@ -215,6 +671,10 @@ Repo/lane truth: chriskim12/hermes-agent on a task branch.
 Risk flags: no env, secret, prod, billing, customer-visible, or restart action.
 Dependencies/blockers: none.
 Review package expectation: changed files, tests, commit, boundaries.
+Done criteria:
+- Focused tests pass.
+- Git diff check passes.
+- Boundaries remain confirmed.
 """,
         "routing_verdict": {"verdict": "Hermes direct"},
         "admission_snapshot": {"repo_full_name": "chriskim12/hermes-agent"},
@@ -228,7 +688,7 @@ def test_dispatcher_eligibility_bridge_requires_controller_on_and_ready_gate(tmp
 
     stopped = evaluate_dispatcher_eligibility([_ready_candidate()])
     assert stopped["eligible"] == []
-    assert stopped["ineligible"][0]["reason_codes"] == ["autopilot_effective_mode_not_blocked_pending_dispatch_gate"]
+    assert stopped["ineligible"][0]["reason_codes"] == ["autopilot_effective_mode_not_dispatch_enabled"]
 
     handle_autopilot_command("on", actor="tester")
     verdict = evaluate_dispatcher_eligibility([_ready_candidate(), {"id": "t_raw", "public_id": "BO-999", "status": "ready", "body": "raw"}])
@@ -239,6 +699,23 @@ def test_dispatcher_eligibility_bridge_requires_controller_on_and_ready_gate(tmp
     assert verdict["handoff_target"] == "existing_kanban_dispatcher"
     assert verdict["second_dispatcher_created"] is False
     assert verdict["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0}
+
+
+def test_dispatcher_eligibility_rejects_legacy_enabled_blocked_mode(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "gateway_autopilot_state.json").write_text(
+        json.dumps({"version": 1, "enabled": True, "desired_mode": "enabled", "updated_by": "legacy"}),
+        encoding="utf-8",
+    )
+
+    from gateway.kanban_autopilot import evaluate_dispatcher_eligibility
+
+    verdict = evaluate_dispatcher_eligibility([_ready_candidate("BO-LEGACY")])
+
+    assert verdict["controller_effective_mode"] == "blocked"
+    assert verdict["eligible"] == []
+    assert verdict["ineligible"][0]["public_id"] == "BO-LEGACY"
+    assert verdict["ineligible"][0]["reason_codes"] == ["autopilot_effective_mode_not_dispatch_enabled"]
 
 
 def test_autopilot_queue_includes_dispatcher_eligibility_without_dispatching(tmp_path, monkeypatch):
@@ -279,6 +756,7 @@ def test_review_ready_contract_requires_pr_and_checks_without_merging():
     assert missing["release_allowed"] is False
 
     satisfied = evaluate_review_ready_contract({
+        **_worker_done_evidence(),
         "work_id": "BO-081",
         "repo_full_name": "chriskim12/hermes-agent",
         "commit": "8f0cbc56db6498e16c628e42430dbd6156d99fb3",
@@ -288,8 +766,8 @@ def test_review_ready_contract_requires_pr_and_checks_without_merging():
         "pr_head": "yuuka/bo-081-autopilot-review-ready-contract",
         "checks_passed": True,
         "worktree_clean": True,
-        "kanban_worker_done": True,
-        "boundaries_confirmed": True,
+        "task_body": DONE_CRITERIA_BODY,
+        "verifier_verdict": {"verdict": "PASS", "criterion_results": _verifier_results()},
     })
     assert satisfied["review_ready"] is True
     assert satisfied["reason_codes"] == []
@@ -301,6 +779,7 @@ def test_review_ready_contract_rejects_wrong_repo_and_release_base():
     from gateway.kanban_autopilot import evaluate_review_ready_contract
 
     result = evaluate_review_ready_contract({
+        **_worker_done_evidence(),
         "work_id": "BO-081",
         "repo_full_name": "evil/repo",
         "commit": "8f0cbc56db6498e16c628e42430dbd6156d99fb3",
@@ -310,8 +789,6 @@ def test_review_ready_contract_rejects_wrong_repo_and_release_base():
         "pr_head": "other",
         "checks_passed": True,
         "worktree_clean": True,
-        "kanban_worker_done": True,
-        "boundaries_confirmed": True,
     }, expected_repo_full_name="chriskim12/hermes-agent")
 
     assert result["review_ready"] is False
@@ -319,6 +796,132 @@ def test_review_ready_contract_rejects_wrong_repo_and_release_base():
     assert "release_base_requires_separate_approval" in result["reason_codes"]
     assert "pr_head_task_branch_mismatch" in result["reason_codes"]
     assert result["merge_allowed"] is False
+
+
+def test_worker_done_evidence_requires_criterion_level_proofs():
+    from gateway.kanban_autopilot import validate_worker_done_evidence
+
+    evidence = _worker_done_evidence()
+    evidence.pop("criteria_proofs")
+
+    result = validate_worker_done_evidence(evidence, task_body=DONE_CRITERIA_BODY)
+
+    assert result["worker_done_evidence_valid"] is False
+    assert "missing_criterion_level_evidence" in result["reason_codes"]
+
+
+def test_worker_done_evidence_rejects_stale_criteria_hash():
+    from gateway.kanban_autopilot import validate_worker_done_evidence
+
+    evidence = _worker_done_evidence()
+    evidence["criteria_hash"] = "0" * 64
+
+    result = validate_worker_done_evidence(evidence, task_body=DONE_CRITERIA_BODY)
+
+    assert result["worker_done_evidence_valid"] is False
+    assert "stale_criteria_hash" in result["reason_codes"]
+
+
+def test_worker_done_evidence_rejects_missing_boundary_confirmation():
+    from gateway.kanban_autopilot import validate_worker_done_evidence
+
+    evidence = _worker_done_evidence()
+    evidence.pop("authority_boundary_confirmed")
+    evidence.pop("boundaries_confirmed")
+
+    result = validate_worker_done_evidence(evidence, task_body=DONE_CRITERIA_BODY)
+
+    assert result["worker_done_evidence_valid"] is False
+    assert "missing_authority_boundary_confirmation" in result["reason_codes"]
+
+
+def test_worker_done_evidence_rejects_missing_deterministic_verification_for_test_criteria():
+    from gateway.kanban_autopilot import validate_worker_done_evidence
+
+    evidence = _worker_done_evidence()
+    for proof in evidence["criteria_proofs"]:
+        if proof["criterion_id"] == "dc-01-focused-tests-pass":
+            proof.pop("tests_run", None)
+            proof.pop("tests_passed", None)
+            proof.pop("test_command", None)
+            break
+
+    result = validate_worker_done_evidence(evidence, task_body=DONE_CRITERIA_BODY)
+
+    assert result["worker_done_evidence_valid"] is False
+    assert "missing_tests_or_checks_for_dc-01-focused-tests-pass" in result["reason_codes"]
+
+
+def test_default_live_candidate_load_includes_active_flights_for_global_single_flight(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import activate_single_flight, load_live_kanban_candidates
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        active_id = kb.create_task(
+            conn,
+            title="active autopilot worker",
+            body="already running",
+            assignee="worker",
+            public_id="BO-ACTIVE",
+        )
+        kb.create_task(
+            conn,
+            title="ready autopilot worker",
+            body=_ready_candidate("BO-READY")["body"],
+            assignee="worker",
+            public_id="BO-READY",
+            routing_verdict={"verdict": "Hermes direct", "reason": "test"},
+            closeout_evidence=_worker_done_evidence(),
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'running', current_run_id = 'run-1', claim_lock = 'lock-1', worker_pid = 4242 WHERE id = ?",
+            (active_id,),
+        )
+
+    candidates = load_live_kanban_candidates()
+
+    assert {candidate["public_id"] for candidate in candidates} >= {"BO-ACTIVE", "BO-READY"}
+    decision = activate_single_flight(candidates)
+    assert decision["status"] == "active_flight_blocked"
+    assert decision["active_flights"][0]["public_id"] == "BO-ACTIVE"
+
+
+def test_default_live_candidate_load_does_not_limit_out_active_flights(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import load_live_kanban_candidates
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        active_id = kb.create_task(
+            conn,
+            title="low priority active worker",
+            body="already running",
+            assignee="worker",
+            public_id="BO-ACTIVE-LIMIT",
+            priority=-100,
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'running', current_run_id = 'run-limit', claim_lock = 'lock-limit' WHERE id = ?",
+            (active_id,),
+        )
+        for index in range(60):
+            kb.create_task(
+                conn,
+                title=f"high priority ready {index}",
+                body=_ready_candidate(f"BO-READY-{index}")["body"],
+                assignee="worker",
+                public_id=f"BO-READY-{index}",
+                priority=100,
+                routing_verdict={"verdict": "Hermes direct", "reason": "test"},
+                closeout_evidence=_worker_done_evidence(),
+            )
+
+    candidates = load_live_kanban_candidates(limit=50)
+
+    assert "BO-ACTIVE-LIMIT" in {candidate["public_id"] for candidate in candidates}
 
 
 def test_hard_stop_pauses_lane_and_blocks_eligibility_until_recovered(tmp_path, monkeypatch):
@@ -570,6 +1173,7 @@ def test_closeout_progress_gate_blocks_missing_evidence_and_pr_backlog():
     assert "missing_review_ready_contract" in missing["reason_codes"]
 
     good = {
+        **_worker_done_evidence(),
         "work_id": "BO-094",
         "repo_full_name": "chriskim12/hermes-agent",
         "commit": "8f0cbc56db6498e16c628e42430dbd6156d99fb3",
@@ -579,8 +1183,8 @@ def test_closeout_progress_gate_blocks_missing_evidence_and_pr_backlog():
         "pr_head": "bo-094",
         "checks_passed": True,
         "worktree_clean": True,
-        "kanban_worker_done": True,
-        "boundaries_confirmed": True,
+        "task_body": DONE_CRITERIA_BODY,
+        "verifier_verdict": {"verdict": "PASS", "criterion_results": _verifier_results()},
     }
     backlog_blocked = evaluate_autopilot_closeout_progress(good, open_autopilot_prs=2, max_open_autopilot_prs=2)
     assert backlog_blocked["may_continue"] is False
@@ -603,6 +1207,7 @@ def test_closeout_progress_gate_allows_explicit_no_code_evidence_without_pr():
         "verification": "documentation reviewed and tests not applicable",
         "kanban_worker_done": True,
         "boundaries_confirmed": True,
+        "task_body": DONE_CRITERIA_BODY,
     })
 
     assert result["may_continue"] is True
@@ -704,6 +1309,7 @@ def test_review_package_proof_summarizes_pr_readiness_without_live_authority():
     from gateway.kanban_autopilot import build_autopilot_review_package
 
     evidence = {
+        **_worker_done_evidence(),
         "work_id": "BO-118",
         "repo_full_name": "chriskim12/hermes-agent",
         "commit": "91d572c971956e705cbfccc19990bf1ed128c239",
@@ -713,8 +1319,8 @@ def test_review_package_proof_summarizes_pr_readiness_without_live_authority():
         "pr_head": "bo-118-autopilot-review-package",
         "checks_passed": True,
         "worktree_clean": True,
-        "kanban_worker_done": True,
-        "boundaries_confirmed": True,
+        "task_body": DONE_CRITERIA_BODY,
+        "verifier_verdict": {"verdict": "PASS", "criterion_results": _verifier_results()},
     }
     run_report = {
         "executed": [{"public_id": "BO-116"}, {"public_id": "BO-117"}],
@@ -1236,3 +1842,211 @@ def test_autopilot_dispatch_injects_review_ready_pr_worker_env(monkeypatch):
     assert worker_env["HERMES_KANBAN_AUTOPILOT"] == "1"
     assert worker_env["HERMES_KANBAN_REVIEW_READY_PR_REQUIRED"] == "1"
     assert worker_env["HERMES_KANBAN_EXPECTED_REPO_FULL_NAME"] == "chriskim12/whystarve"
+
+
+def test_worktree_cleanup_registry_allows_removed_or_review_safe_retained_entries():
+    from gateway.kanban_autopilot import build_worktree_cleanup_registry, evaluate_pre_review_cleanup_gate
+
+    registry = build_worktree_cleanup_registry(
+        [
+            {
+                "public_id": "BO-151",
+                "path": "/repo/.worktrees/bo-151",
+                "branch": "work/BO-151-cleanup-registry",
+                "registered_git_worktree": True,
+                "cleanup_state": "removed",
+                "git_worktree_remove_verified": True,
+            },
+            {
+                "public_id": "BO-152",
+                "path": "/repo/.worktrees/bo-152",
+                "branch": "work/BO-152-operator-reporting",
+                "registered_git_worktree": True,
+                "cleanup_state": "retained",
+                "retained_reason": "open stacked fork PR review evidence",
+                "ttl": "until fork PR stack is merged or abandoned",
+                "review_safe": True,
+            },
+        ],
+        bundle_id="BO-145",
+    )
+
+    assert registry["review_ready_allowed"] is True
+    assert registry["cleanup_required"] is False
+    assert registry["destructive_cleanup_performed"] is False
+    gate = evaluate_pre_review_cleanup_gate(registry)
+    assert gate["review_ready_allowed"] is True
+    assert gate["post_merge_reconcile_still_required"] is True
+
+
+def test_worktree_cleanup_registry_blocks_pending_active_or_unverified_entries():
+    from gateway.kanban_autopilot import build_worktree_cleanup_registry, evaluate_pre_review_cleanup_gate
+
+    registry = build_worktree_cleanup_registry(
+        [
+            {"public_id": "BO-151", "path": "/repo/.worktrees/bo-151", "registered_git_worktree": True, "cleanup_state": "pending"},
+            {"public_id": "BO-152", "path": "/repo/.worktrees/bo-152", "registered_git_worktree": True, "cleanup_state": "retained", "retained_reason": "debug", "active_worker_pid": 123},
+            {"public_id": "BO-153", "path": "/repo/.worktrees/bo-153", "cleanup_state": "removed", "git_worktree_remove_verified": True},
+        ],
+        bundle_id="BO-145",
+    )
+
+    gate = evaluate_pre_review_cleanup_gate(registry)
+    assert gate["review_ready_allowed"] is False
+    assert "cleanup_required" in gate["reason_codes"]
+    assert "cleanup_pending" in gate["reason_codes"]
+    assert "active_reference_blocks_cleanup" in gate["reason_codes"]
+    assert "registered_git_worktree_not_verified" in gate["reason_codes"]
+
+
+def test_post_merge_cleanup_reconcile_requires_merged_pr_truth_and_resolved_registry():
+    from gateway.kanban_autopilot import build_worktree_cleanup_registry, reconcile_post_merge_cleanup
+
+    registry = build_worktree_cleanup_registry(
+        [
+            {
+                "public_id": "BO-151",
+                "path": "/repo/.worktrees/bo-151",
+                "registered_git_worktree": True,
+                "cleanup_state": "removed",
+                "git_worktree_remove_verified": True,
+            },
+            {
+                "public_id": "BO-152",
+                "path": "/repo/.worktrees/bo-152",
+                "registered_git_worktree": True,
+                "cleanup_state": "pending",
+            },
+        ],
+        bundle_id="BO-145",
+    )
+
+    result = reconcile_post_merge_cleanup(
+        registry,
+        merged_prs=[{"public_id": "BO-151", "state": "MERGED", "merge_commit_sha": "abc1234"}],
+    )
+
+    assert result["closed_allowed"] is False
+    assert result["gateway_restart_reload_allowed"] is False
+    assert result["canonical_materialization_allowed"] is False
+    assert result["reconciled"][0]["status"] == "reconciled"
+    assert result["stale_entries"][0]["public_id"] == "BO-152"
+    assert "missing_merged_pr_truth" in result["stale_entries"][0]["reason_codes"]
+    assert "pre_review_cleanup_not_resolved" in result["stale_entries"][0]["reason_codes"]
+
+
+def test_verifier_failure_operator_report_shows_retry_and_missing_criteria():
+    from gateway.kanban_autopilot import generate_verifier_failure_operator_report
+
+    report = generate_verifier_failure_operator_report(
+        {"verdict": "FAIL", "missing_criteria": ["dc-02-tests", "dc-04-cleanup"]},
+        {"retry_allowed": True, "retry_count": 0, "max_retries": 1},
+    )
+
+    assert report["summary"]["verdict"] == "FAIL"
+    assert report["summary"]["next_state"] == "retry_queued"
+    assert report["summary"]["retry_allowed"] is True
+    assert report["missing_criteria"] == ["dc-02-tests", "dc-04-cleanup"]
+    assert "dc-04-cleanup" in report["text"]
+    assert report["authority"]["review_ready_allowed"] is False
+    assert report["authority"]["merge_allowed"] is False
+
+
+def test_verifier_failure_operator_report_shows_remediation_child_or_needs_human():
+    from gateway.kanban_autopilot import generate_verifier_failure_operator_report
+
+    child = generate_verifier_failure_operator_report(
+        {"verdict": "FAIL", "reason_codes": ["missing_pr"]},
+        {"retry_allowed": False, "retry_count": 1, "max_retries": 1, "remediation_child": "BO-999"},
+    )
+    blocked = generate_verifier_failure_operator_report(
+        {"verdict": "BLOCKED", "missing_criteria": ["scope_escape"]},
+        {"retry_allowed": False, "retry_count": 1, "max_retries": 1, "blocked_reason": "scope expansion needs Chris"},
+    )
+
+    assert child["summary"]["next_state"] == "remediation_child_queued"
+    assert child["remediation"]["remediation_child"] == "BO-999"
+    assert blocked["summary"]["needs_human"] is True
+    assert blocked["summary"]["next_state"] == "needs_human"
+    assert "scope expansion needs Chris" in blocked["text"]
+
+
+def test_verifier_pass_operator_report_allows_only_review_ready_gate():
+    from gateway.kanban_autopilot import generate_verifier_failure_operator_report
+
+    report = generate_verifier_failure_operator_report({"verdict": "PASS"}, {"retry_allowed": False, "retry_count": 0, "max_retries": 1})
+
+    assert report["summary"]["next_state"] == "review_ready_gate"
+    assert report["authority"]["review_ready_allowed"] is True
+    assert report["authority"]["gateway_restart_reload_allowed"] is False
+    assert report["authority"]["config_env_secret_mutation_allowed"] is False
+
+
+def test_e2e_check_only_worker_verifier_retry_and_success_paths_pass():
+    from gateway.kanban_autopilot import prove_worker_verifier_retry_loop_check_only
+
+    failure_path = prove_worker_verifier_retry_loop_check_only([
+        {"kind": "worker_completed", "public_id": "BO-153"},
+        {"kind": "verifier_intake", "public_id": "BO-153"},
+        {"kind": "verifier_result", "verdict": "FAIL", "missing_criteria": ["dc-02"]},
+        {"kind": "retry_queued", "public_id": "BO-153", "attempt": 2},
+        {"kind": "parent_matrix_updated", "parent_public_id": "BO-145"},
+    ])
+    success_path = prove_worker_verifier_retry_loop_check_only([
+        {"kind": "worker_completed", "public_id": "BO-153"},
+        {"kind": "verifier_intake", "public_id": "BO-153"},
+        {"kind": "verifier_result", "verdict": "PASS"},
+        {"kind": "cleanup_checked", "public_id": "BO-153"},
+        {"kind": "review_ready_promoted", "public_id": "BO-153"},
+        {"kind": "parent_matrix_updated", "parent_public_id": "BO-145"},
+    ])
+
+    assert failure_path["passed"] is True
+    assert failure_path["outcomes"][0]["next_state"] == "retry_or_remediation"
+    assert success_path["passed"] is True
+    assert success_path["outcomes"][0]["next_state"] == "review_ready"
+    assert success_path["authority"]["check_only"] is True
+    assert success_path["authority"]["gateway_restart_reload_allowed"] is False
+    assert success_path["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0}
+
+
+def test_e2e_check_only_blocks_pass_without_cleanup_or_parent_matrix():
+    from gateway.kanban_autopilot import prove_worker_verifier_retry_loop_check_only
+
+    result = prove_worker_verifier_retry_loop_check_only([
+        {"kind": "worker_completed", "public_id": "BO-153"},
+        {"kind": "verifier_intake", "public_id": "BO-153"},
+        {"kind": "verifier_result", "verdict": "PASS"},
+    ])
+
+    assert result["passed"] is False
+    assert "verifier_pass_without_cleanup_check" in result["reason_codes"]
+    assert "verifier_pass_without_review_ready_promotion" in result["reason_codes"]
+    assert "missing_parent_matrix_update" in result["reason_codes"]
+    assert result["next_state"] == "needs_human"
+
+
+def test_e2e_check_only_blocks_unblocked_forbidden_mutation_attempt():
+    from gateway.kanban_autopilot import prove_worker_verifier_retry_loop_check_only
+
+    blocked = prove_worker_verifier_retry_loop_check_only([
+        {"kind": "worker_completed"},
+        {"kind": "verifier_intake"},
+        {"kind": "verifier_result", "verdict": "FAIL"},
+        {"kind": "remediation_child_queued", "public_id": "BO-999"},
+        {"kind": "forbidden_mutation_attempt", "mutation": "gateway_restart"},
+        {"kind": "authority_blocked", "mutation": "gateway_restart"},
+        {"kind": "parent_matrix_updated"},
+    ])
+    unblocked = prove_worker_verifier_retry_loop_check_only([
+        {"kind": "worker_completed"},
+        {"kind": "verifier_intake"},
+        {"kind": "verifier_result", "verdict": "FAIL"},
+        {"kind": "retry_queued"},
+        {"kind": "forbidden_mutation_attempt", "mutation": "gateway_restart"},
+        {"kind": "parent_matrix_updated"},
+    ])
+
+    assert blocked["passed"] is True
+    assert unblocked["passed"] is False
+    assert "forbidden_attempt_not_blocked" in unblocked["reason_codes"]

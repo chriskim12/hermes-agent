@@ -65,6 +65,7 @@ def _review_ready_evidence(repo: Path, **overrides):
             "live": True,
         },
         "checks": [{"name": "tests", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+        "verifier_verdict": {"verdict": "PASS"},
         "cleanup": {"proof": "worktree cleanup verified", "worktree_clean": True},
         "residue": _valid_residue(),
         "evidence": {"changed_files": ["hermes_cli/kanban_closeout.py"], "tests_run": ["targeted"]},

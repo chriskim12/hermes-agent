@@ -8,6 +8,7 @@ policy scope, while `/autopilot on <parent>` narrows the same bounded loop.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -35,6 +36,36 @@ _READY_GATE_REQUIREMENTS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("missing_dependencies_blockers", ("dependencies/blockers", "dependencies:", "blockers:", "none"), "dependencies/blockers"),
     ("missing_review_package_expectation", ("review package", "review_ready", "changed files", "commit"), "review package expectation"),
 )
+_DONE_CRITERIA_LEDGER_SCHEMA = "autopilot_done_criteria_ledger.v1"
+_DONE_CRITERIA_LEDGER_VERSION = 1
+_DONE_CRITERIA_SECTION_HEADERS = (
+    "done criteria",
+    "done criteria ledger",
+)
+_DONE_CRITERIA_HEADER_RE = re.compile(
+    r"^\s*(?P<header>done criteria|done criteria ledger)\s*:\s*(?P<inline>.*\S)?\s*$",
+    re.IGNORECASE,
+)
+_DONE_CRITERIA_ITEM_RE = re.compile(r"^\s*(?:[-*+•]|(?:\d+|[A-Za-z])[.)])\s+(?P<text>.+\S)\s*$")
+_DONE_CRITERIA_AMBIGUOUS_RE = re.compile(
+    r"\b(?:and/or|either\b|maybe\b|perhaps\b|some\s+way|tbd\b|to\s+be\s+determined|etc\.?|or\b)"
+    r"|\b\w+\s*/\s*\w+\b",
+    re.IGNORECASE,
+)
+_KNOWN_TASK_SECTION_HEADERS = {
+    "goal",
+    "end-state/output",
+    "scope/non-goals",
+    "acceptance criteria",
+    "verification requirements",
+    "authority boundary",
+    "repo/lane truth",
+    "risk flags",
+    "dependencies/blockers",
+    "review package expectation",
+    "done criteria",
+    "done criteria ledger",
+}
 _PR_URL_RE = re.compile(r"^https://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/pull/\d+/?$")
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
 _RELEASE_ONLY_BASES = {"prod", "production"}
@@ -64,6 +95,627 @@ _DEFAULT_CLOSED_LOOP_CAPS = {
     "require_clean_closeout_per_task": True,
     "require_review_ready_contract_before_next_task": True,
 }
+
+
+def _normalize_done_criteria_text(text: Any) -> str:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip().strip("•*-:;.,")
+    return normalized.lower()
+
+
+def _slugify_done_criteria_text(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug or "criterion"
+
+
+def _done_criteria_is_ambiguous(text: str) -> bool:
+    lowered = text.lower()
+    return bool(_DONE_CRITERIA_AMBIGUOUS_RE.search(lowered))
+
+
+def _extract_done_criteria_lines(body: str) -> tuple[list[str], str | None]:
+    items: list[str] = []
+    section: str | None = None
+    collecting = False
+    for raw_line in body.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+        header_match = _DONE_CRITERIA_HEADER_RE.match(stripped)
+        if header_match:
+            section = header_match.group("header").lower()
+            collecting = True
+            inline = _normalize_done_criteria_text(header_match.group("inline"))
+            if inline:
+                items.append(inline)
+            continue
+        if not collecting:
+            continue
+        current_header = stripped.split(":", 1)[0].strip().lower() if ":" in stripped else ""
+        if current_header in _KNOWN_TASK_SECTION_HEADERS and current_header not in _DONE_CRITERIA_SECTION_HEADERS:
+            break
+        item_match = _DONE_CRITERIA_ITEM_RE.match(stripped)
+        if item_match:
+            items.append(_normalize_done_criteria_text(item_match.group("text")))
+            continue
+        if items:
+            items[-1] = _normalize_done_criteria_text(f"{items[-1]} {stripped}")
+        else:
+            items.append(_normalize_done_criteria_text(stripped))
+    return items, section
+
+
+def build_done_criteria_ledger(body: Any) -> dict[str, Any]:
+    text = str(body or "")
+    items, section = _extract_done_criteria_lines(text)
+    reason_codes: list[str] = []
+    if not items:
+        reason_codes.append("missing_done_criteria_ledger")
+        return {
+            "ok": False,
+            "status": "rejected",
+            "reason_codes": reason_codes,
+            "human_reason": "Missing explicit done criteria ledger section.",
+            "done_criteria_ledger": None,
+        }
+    criteria: list[dict[str, Any]] = []
+    ambiguous_items: list[str] = []
+    slug_counts: dict[str, int] = {}
+    for index, raw_item in enumerate(items, start=1):
+        normalized = _normalize_done_criteria_text(raw_item)
+        if not normalized:
+            continue
+        if _done_criteria_is_ambiguous(normalized):
+            ambiguous_items.append(normalized)
+        slug = _slugify_done_criteria_text(normalized)
+        slug_counts[slug] = slug_counts.get(slug, 0) + 1
+        suffix = f"-{slug_counts[slug]}" if slug_counts[slug] > 1 else ""
+        criteria.append(
+            {
+                "id": f"dc-{index:02d}-{slug}{suffix}",
+                "text": normalized,
+            }
+        )
+    if not criteria:
+        reason_codes.append("missing_done_criteria_ledger")
+        return {
+            "ok": False,
+            "status": "rejected",
+            "reason_codes": reason_codes,
+            "human_reason": "Missing explicit done criteria ledger section.",
+            "done_criteria_ledger": None,
+        }
+    if ambiguous_items:
+        return {
+            "ok": False,
+            "status": "rejected",
+            "reason_codes": ["ambiguous_done_criteria_ledger"],
+            "human_reason": "Ambiguous done criteria require refinement: " + ", ".join(ambiguous_items),
+            "done_criteria_ledger": None,
+        }
+    normalized_ledger = {
+        "schema": _DONE_CRITERIA_LEDGER_SCHEMA,
+        "version": _DONE_CRITERIA_LEDGER_VERSION,
+        "criteria": criteria,
+    }
+    criteria_hash = hashlib.sha256(
+        json.dumps(normalized_ledger, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    ledger = {
+        **normalized_ledger,
+        "criteria_hash": criteria_hash,
+    }
+    return {
+        "ok": True,
+        "status": "accepted",
+        "reason_codes": [],
+        "human_reason": "done criteria ledger extracted",
+        "done_criteria_ledger": ledger,
+        "criteria_hash": criteria_hash,
+        "criteria_version": _DONE_CRITERIA_LEDGER_VERSION,
+        "criteria_ids": [criterion["id"] for criterion in criteria],
+        "source_section": section or "done criteria",
+    }
+
+
+def _criteria_hash_from_evidence(evidence: dict[str, Any]) -> str:
+    for key in ("done_criteria_hash", "criteria_hash"):
+        value = str(evidence.get(key) or "").strip()
+        if value:
+            return value
+    ledger = evidence.get("done_criteria_ledger")
+    if isinstance(ledger, dict):
+        value = str(ledger.get("criteria_hash") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _evidence_uses_task_worktree(evidence: dict[str, Any]) -> bool:
+    workspace_kind = str(evidence.get("workspace_kind") or "").strip().lower()
+    return bool(
+        evidence.get("task_owned_worktree") is True
+        or workspace_kind == "worktree"
+        or str(evidence.get("worktree_path") or "").strip()
+    )
+
+
+def _worktree_cleanup_blockers(evidence: dict[str, Any]) -> list[str]:
+    cleanup = evidence.get("cleanup") if isinstance(evidence.get("cleanup"), dict) else {}
+    git = evidence.get("git") if isinstance(evidence.get("git"), dict) else {}
+    proof = str(cleanup.get("proof") or evidence.get("cleanup_proof") or "").strip()
+    worktree_clean = cleanup.get("worktree_clean")
+    git_clean = git.get("worktree_clean")
+    status_short = str(git.get("status_short") or "").strip()
+    if proof and worktree_clean is not False and git_clean is not False and not status_short:
+        return []
+    residue = evidence.get("residue")
+    if not isinstance(residue, dict):
+        return ["missing_cleanup_proof"]
+    items = residue.get("items")
+    if not isinstance(items, list):
+        return ["missing_cleanup_proof"]
+    blockers: list[str] = []
+    retained_seen = False
+    for raw_item in items:
+        if not isinstance(raw_item, dict):
+            continue
+        disposition = str(raw_item.get("disposition") or "").strip().lower()
+        if disposition == "retained":
+            retained_seen = True
+            if not str(raw_item.get("reason") or "").strip():
+                blockers.append("retained_residue_missing_reason")
+            ttl = str(raw_item.get("ttl") or raw_item.get("revisit_at") or raw_item.get("expires_at") or "").strip()
+            if not ttl:
+                blockers.append("retained_residue_missing_ttl")
+    if retained_seen and not blockers:
+        return []
+    return blockers or ["missing_cleanup_proof"]
+
+
+def _done_criteria_validation_for_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+    source_text = str(
+        evidence.get("task_body")
+        or evidence.get("body")
+        or evidence.get("task_spec")
+        or evidence.get("spec")
+        or ""
+    )
+    if not source_text:
+        return {
+            "ok": False,
+            "reason_codes": ["missing_done_criteria_ledger"],
+            "human_reason": "Missing explicit done criteria ledger source text.",
+            "done_criteria_ledger": None,
+        }
+    extracted = build_done_criteria_ledger(source_text)
+    if not extracted.get("ok"):
+        return extracted
+    expected_hash = _criteria_hash_from_evidence(evidence)
+    if expected_hash and expected_hash != extracted["criteria_hash"]:
+        return {
+            "ok": False,
+            "reason_codes": ["stale_criteria_hash"],
+            "human_reason": "Stale done criteria hash no longer matches the current ledger.",
+            "done_criteria_ledger": extracted.get("done_criteria_ledger"),
+            "criteria_hash": extracted["criteria_hash"],
+        }
+    return extracted
+
+
+def _criterion_requires_deterministic_verification(text: str) -> bool:
+    lowered = _normalize_done_criteria_text(text)
+    return any(token in lowered for token in ("test", "pytest", "check", "diff", "verification", "artifact"))
+
+
+def _normalize_artifact_refs(value: Any) -> list[str]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    else:
+        values = []
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
+def _normalize_worker_criterion_proofs(evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = evidence.get("criteria_proofs")
+    if raw is None:
+        raw = evidence.get("criterion_proofs")
+    if raw is None:
+        raw = evidence.get("per_criterion_proof")
+    if raw is None:
+        return []
+    normalized: list[dict[str, Any]] = []
+    if isinstance(raw, dict):
+        iterable = raw.items()
+    elif isinstance(raw, list):
+        iterable = enumerate(raw, start=1)
+    else:
+        return []
+    for key, value in iterable:
+        if isinstance(value, dict):
+            proof = dict(value)
+        else:
+            proof = {"proof": value}
+        proof_id = str(
+            proof.get("criterion_id")
+            or proof.get("criteria_id")
+            or proof.get("id")
+            or proof.get("done_criteria_id")
+            or key
+        ).strip()
+        if proof_id:
+            proof["criterion_id"] = proof_id
+        normalized.append(proof)
+    return normalized
+
+
+def _proof_supports_deterministic_verification(proof: dict[str, Any]) -> bool:
+    if proof.get("tests_passed") is True or proof.get("checks_passed") is True:
+        return True
+    for key in (
+        "tests",
+        "tests_run",
+        "test_command",
+        "checks",
+        "checks_run",
+        "check_command",
+        "verification",
+        "verification_command",
+    ):
+        value = proof.get(key)
+        if value not in (None, "", [], {}, ()):
+            return True
+    return False
+
+
+def _normalize_verifier_criterion_results(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    normalized: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        iterable = value.items()
+    elif isinstance(value, list):
+        iterable = enumerate(value, start=1)
+    else:
+        return []
+    for key, raw in iterable:
+        if isinstance(raw, dict):
+            result = dict(raw)
+        else:
+            result = {"status": raw}
+        criterion_id = str(
+            result.get("criterion_id")
+            or result.get("criteria_id")
+            or result.get("id")
+            or result.get("done_criteria_id")
+            or key
+        ).strip()
+        if criterion_id:
+            result["criterion_id"] = criterion_id
+        normalized.append(result)
+    return normalized
+
+
+def _verifier_result_passed(result: dict[str, Any]) -> bool:
+    status = str(result.get("status") or result.get("verdict") or result.get("result") or "").strip().lower()
+    return status in {"pass", "passed", "ok", "success", "satisfied"} or result.get("passed") is True
+
+
+def _verifier_result_failed(result: dict[str, Any]) -> bool:
+    status = str(result.get("status") or result.get("verdict") or result.get("result") or "").strip().lower()
+    return status in {"fail", "failed", "error", "rejected", "unsatisfied"} or result.get("passed") is False
+
+
+def evaluate_verifier_verdict(
+    worker_evidence: dict[str, Any],
+    verifier_evidence: dict[str, Any] | None = None,
+    *,
+    task_body: Any = None,
+    task_spec: Any = None,
+) -> dict[str, Any]:
+    """Build an independent verifier verdict over worker_done evidence.
+
+    The verifier is deliberately a separate contract from worker_done and from
+    review_ready.  It is pure/read-only: no Kanban transition, claim, spawn, PR,
+    merge, release, restart, or provider/customer mutation happens here.
+    """
+
+    verifier_evidence = dict(verifier_evidence or {})
+    source_evidence = dict(worker_evidence)
+    if task_body is not None:
+        source_evidence["task_body"] = task_body
+    if task_spec is not None:
+        source_evidence["task_spec"] = task_spec
+    reason_codes: list[str] = []
+    remediation: list[str] = []
+    blocker_reason_codes = [
+        str(code).strip()
+        for code in (verifier_evidence.get("blocker_reason_codes") or verifier_evidence.get("blockers") or [])
+        if str(code).strip()
+    ]
+    if blocker_reason_codes:
+        return {
+            "verdict": "BLOCKED",
+            "status": "blocked",
+            "reason_codes": blocker_reason_codes,
+            "blocker_reason_codes": blocker_reason_codes,
+            "remediation_instructions": verifier_evidence.get("remediation_instructions") or [],
+            "criterion_results": [],
+            "criteria_ids": [],
+            "criteria_hash": _criteria_hash_from_evidence(source_evidence),
+            "worker_done_evidence": None,
+            "worker_done_retained": source_evidence.get("worker_done") is True or source_evidence.get("kanban_worker_done") is True,
+            "review_ready_input_eligible": False,
+            "human_reason": "Verifier blocked by external or authority reason: " + ", ".join(blocker_reason_codes),
+            "side_effects": {"claimed": 0, "spawned": 0, "mutated": 0},
+        }
+
+    worker_validation = validate_worker_done_evidence(source_evidence, task_body=source_evidence.get("task_body"), task_spec=source_evidence.get("task_spec"))
+    ledger_reason_codes = worker_validation.get("reason_codes") or []
+    refinement_codes = {
+        "missing_done_criteria_ledger",
+        "ambiguous_done_criteria_ledger",
+        "stale_criteria_hash",
+    }
+    if any(code in refinement_codes for code in ledger_reason_codes):
+        selected_codes = [code for code in ledger_reason_codes if code in refinement_codes]
+        return {
+            "verdict": "REFINEMENT_REQUIRED",
+            "status": "refinement_required",
+            "reason_codes": selected_codes,
+            "blocker_reason_codes": [],
+            "remediation_instructions": ["Refine the Done Criteria Ledger and rerun worker evidence against the current criteria_hash."],
+            "criterion_results": [],
+            "criteria_ids": worker_validation.get("criteria_ids") or [],
+            "criteria_hash": worker_validation.get("criteria_hash") or _criteria_hash_from_evidence(source_evidence),
+            "worker_done_evidence": worker_validation,
+            "worker_done_retained": source_evidence.get("worker_done") is True or source_evidence.get("kanban_worker_done") is True,
+            "review_ready_input_eligible": False,
+            "human_reason": "Verifier requires task refinement before implementation evidence can be accepted: " + ", ".join(selected_codes),
+            "side_effects": {"claimed": 0, "spawned": 0, "mutated": 0},
+        }
+
+    worker_identity = str(source_evidence.get("worker_identity") or source_evidence.get("worker") or source_evidence.get("assignee") or "").strip()
+    verifier_identity = str(verifier_evidence.get("verifier_identity") or verifier_evidence.get("verifier") or verifier_evidence.get("reviewer") or "").strip()
+    if not verifier_identity:
+        reason_codes.append("missing_verifier_identity")
+        remediation.append("Provide verifier_identity for the independent verifier run.")
+    if worker_identity and verifier_identity and worker_identity == verifier_identity:
+        reason_codes.append("verifier_same_as_worker")
+        remediation.append("Use a verifier identity distinct from the worker identity.")
+    if not worker_validation.get("worker_done_evidence_valid"):
+        reason_codes.extend(worker_validation.get("reason_codes") or ["invalid_worker_done_evidence"])
+        remediation.append("Remediate worker_done evidence until every Done criterion has artifact-backed proof and required checks.")
+
+    criterion_results = _normalize_verifier_criterion_results(
+        verifier_evidence.get("criterion_results")
+        if verifier_evidence.get("criterion_results") is not None
+        else verifier_evidence.get("criteria_results")
+    )
+    result_by_id = {str(result.get("criterion_id") or "").strip(): result for result in criterion_results if str(result.get("criterion_id") or "").strip()}
+    criteria_ids = list(worker_validation.get("criteria_ids") or [])
+    if not criterion_results:
+        reason_codes.append("missing_verifier_criterion_results")
+        remediation.append("Add verifier criterion_results with PASS/FAIL status and evidence for every Done criterion id.")
+    for criterion_id in criteria_ids:
+        result = result_by_id.get(criterion_id)
+        if result is None:
+            reason_codes.append(f"missing_verifier_result_for_{criterion_id}")
+            remediation.append(f"Verify criterion {criterion_id} and record a criterion-level verdict.")
+            continue
+        evidence_text = str(result.get("evidence") or result.get("proof") or result.get("summary") or "").strip()
+        if not evidence_text:
+            reason_codes.append(f"missing_verifier_evidence_for_{criterion_id}")
+            remediation.append(f"Add verifier evidence/proof text for criterion {criterion_id}.")
+        if _verifier_result_failed(result):
+            reason_codes.append(f"verifier_failed_{criterion_id}")
+            instruction = str(result.get("remediation") or result.get("remediation_instruction") or result.get("action") or "").strip()
+            remediation.append(instruction or f"Remediate failed criterion {criterion_id} and rerun verifier.")
+        elif not _verifier_result_passed(result):
+            reason_codes.append(f"verifier_result_not_pass_for_{criterion_id}")
+            remediation.append(f"Set criterion {criterion_id} to PASS only after verifier evidence proves it.")
+    accepted = not reason_codes
+    deduped_reason_codes = list(dict.fromkeys(reason_codes))
+    deduped_remediation = list(dict.fromkeys(item for item in remediation if str(item).strip()))
+    return {
+        "verdict": "PASS" if accepted else "FAIL",
+        "status": "passed" if accepted else "failed",
+        "reason_codes": deduped_reason_codes,
+        "blocker_reason_codes": [],
+        "remediation_instructions": deduped_remediation,
+        "criterion_results": criterion_results,
+        "criteria_ids": criteria_ids,
+        "criteria_hash": worker_validation.get("criteria_hash"),
+        "worker_done_evidence": worker_validation,
+        "worker_done_retained": source_evidence.get("worker_done") is True or source_evidence.get("kanban_worker_done") is True,
+        "review_ready_input_eligible": accepted,
+        "human_reason": "verifier PASS: all done criteria independently satisfied" if accepted else "verifier FAIL: " + ", ".join(deduped_reason_codes),
+        "side_effects": {"claimed": 0, "spawned": 0, "mutated": 0},
+    }
+
+
+def plan_verifier_retry_controller(
+    worker_evidence: dict[str, Any],
+    verifier_evidence: dict[str, Any] | None = None,
+    *,
+    task_body: Any = None,
+    task_spec: Any = None,
+    attempt: int | None = None,
+    max_attempts: int = 3,
+) -> dict[str, Any]:
+    """Plan the Kanban-visible verifier/remediation transition after worker_done.
+
+    This is check-only controller logic. It derives the next Kanban-visible
+    action from worker_done + verifier verdict, persists attempt facts in the
+    returned evidence shape, and never claims, spawns, mutates, restarts, merges,
+    deploys, or touches external authority by itself.
+    """
+
+    raw_attempt = attempt
+    if raw_attempt is None:
+        for key in ("verification_attempt", "attempt", "retry_count"):
+            value = worker_evidence.get(key)
+            if value is not None:
+                raw_attempt = value
+                break
+    try:
+        attempt_number = int(raw_attempt) if raw_attempt is not None else 1
+    except (TypeError, ValueError):
+        attempt_number = 1
+    attempt_number = max(1, attempt_number)
+    max_attempts = max(1, int(max_attempts or 1))
+    verifier = evaluate_verifier_verdict(
+        worker_evidence,
+        verifier_evidence or {},
+        task_body=task_body,
+        task_spec=task_spec,
+    )
+    verdict = verifier.get("verdict")
+    queue: list[dict[str, Any]] = []
+    reason_codes: list[str] = list(verifier.get("reason_codes") or [])
+    blocked = False
+    review_ready_input_eligible = False
+    if verdict == "PASS":
+        next_state = "verifier_pass"
+        review_ready_input_eligible = True
+    elif verdict == "FAIL":
+        if attempt_number >= max_attempts:
+            next_state = "blocked"
+            blocked = True
+            reason_codes.append("max_verification_attempts_exhausted")
+        else:
+            next_state = "queue_remediation"
+            queue.append(
+                {
+                    "type": "remediation",
+                    "attempt": attempt_number + 1,
+                    "reason_codes": list(verifier.get("reason_codes") or []),
+                    "remediation_instructions": verifier.get("remediation_instructions") or [],
+                }
+            )
+    elif verdict == "REFINEMENT_REQUIRED":
+        next_state = "refinement_required"
+    elif verdict == "BLOCKED":
+        next_state = "blocked"
+        blocked = True
+    else:
+        next_state = "blocked"
+        blocked = True
+        reason_codes.append("unknown_verifier_verdict")
+    reason_codes = list(dict.fromkeys(reason_codes))
+    return {
+        "controller": "autopilot_verifier_retry_controller.v1",
+        "next_state": next_state,
+        "verifier_verdict": verifier,
+        "attempt": attempt_number,
+        "max_attempts": max_attempts,
+        "retry_remaining": max(0, max_attempts - attempt_number),
+        "queued_actions": queue,
+        "queued_remediation_count": len(queue),
+        "review_ready_input_eligible": review_ready_input_eligible,
+        "blocked": blocked,
+        "reason_codes": reason_codes,
+        "kanban_evidence_patch": {
+            "verification_attempt": attempt_number,
+            "max_verification_attempts": max_attempts,
+            "last_verifier_verdict": verdict,
+            "last_verifier_reason_codes": verifier.get("reason_codes") or [],
+            "next_controller_state": next_state,
+        },
+        "side_effects": {"claimed": 0, "spawned": 0, "mutated": 0},
+        "human_reason": (
+            "verifier PASS: review_ready input may be built"
+            if review_ready_input_eligible
+            else "verifier controller state: " + next_state + (" (" + ", ".join(reason_codes) + ")" if reason_codes else "")
+        ),
+    }
+
+
+def validate_worker_done_evidence(
+    evidence: dict[str, Any],
+    task_body: Any = None,
+    task_spec: Any = None,
+) -> dict[str, Any]:
+    """Validate worker self-report evidence against the done-criteria ledger."""
+
+    reason_codes: list[str] = []
+    worker_done_observed = evidence.get("kanban_worker_done") is True or evidence.get("worker_done") is True
+    if not worker_done_observed:
+        reason_codes.append("missing_worker_done_observation")
+    source_evidence = dict(evidence)
+    if task_body is not None:
+        source_evidence["task_body"] = task_body
+    if task_spec is not None:
+        source_evidence["task_spec"] = task_spec
+    done_criteria = _done_criteria_validation_for_evidence(source_evidence)
+    if not done_criteria.get("ok"):
+        reason_codes.extend(done_criteria.get("reason_codes") or ["invalid_done_criteria_ledger"])
+        return {
+            "worker_done_evidence_valid": False,
+            "status": "blocked",
+            "reason_codes": reason_codes,
+            "human_reason": "Worker done evidence missing or invalid done criteria: " + ", ".join(reason_codes),
+            "done_criteria_ledger": done_criteria.get("done_criteria_ledger"),
+            "criteria_hash": done_criteria.get("criteria_hash"),
+            "criteria_version": done_criteria.get("criteria_version"),
+            "criteria_ids": done_criteria.get("criteria_ids") or [],
+            "criteria_proofs": [],
+            "worker_done_observed": worker_done_observed,
+            "authority_boundary_confirmed": False,
+            "cleanup_or_residue_proof": False,
+        }
+    provided_hash = _criteria_hash_from_evidence(evidence)
+    if not provided_hash:
+        reason_codes.append("missing_criteria_hash")
+    elif provided_hash != done_criteria["criteria_hash"]:
+        reason_codes.append("stale_criteria_hash")
+    criterion_proofs = _normalize_worker_criterion_proofs(evidence)
+    if not criterion_proofs:
+        reason_codes.append("missing_criterion_level_evidence")
+    proof_by_id: dict[str, dict[str, Any]] = {}
+    for proof in criterion_proofs:
+        proof_id = str(proof.get("criterion_id") or "").strip()
+        if proof_id:
+            proof_by_id[proof_id] = proof
+    if criterion_proofs:
+        for criterion in done_criteria["done_criteria_ledger"]["criteria"]:
+            proof = proof_by_id.get(criterion["id"])
+            if proof is None:
+                reason_codes.append(f"missing_proof_for_{criterion['id']}")
+                continue
+            proof_text = str(proof.get("proof") or proof.get("evidence") or proof.get("summary") or proof.get("result") or "").strip()
+            if not proof_text:
+                reason_codes.append(f"missing_proof_text_for_{criterion['id']}")
+            artifact_refs = _normalize_artifact_refs(proof.get("artifact_refs") or proof.get("artifact_ref") or proof.get("artifacts"))
+            if not artifact_refs:
+                reason_codes.append(f"missing_artifact_refs_for_{criterion['id']}")
+            if _criterion_requires_deterministic_verification(criterion["text"]) and not _proof_supports_deterministic_verification(proof):
+                reason_codes.append(f"missing_tests_or_checks_for_{criterion['id']}")
+    authority_boundary_confirmed = evidence.get("authority_boundary_confirmed")
+    if authority_boundary_confirmed is None:
+        authority_boundary_confirmed = evidence.get("boundaries_confirmed")
+    if authority_boundary_confirmed is not True:
+        reason_codes.append("missing_authority_boundary_confirmation")
+    cleanup_blockers = _worktree_cleanup_blockers(evidence)
+    if cleanup_blockers:
+        reason_codes.extend(cleanup_blockers)
+    accepted = not reason_codes
+    return {
+        "worker_done_evidence_valid": accepted,
+        "status": "accepted" if accepted else "blocked",
+        "reason_codes": reason_codes,
+        "human_reason": "worker done evidence satisfied" if accepted else "Worker done evidence missing or incomplete: " + ", ".join(reason_codes),
+        "done_criteria_ledger": done_criteria.get("done_criteria_ledger"),
+        "criteria_hash": done_criteria.get("criteria_hash"),
+        "criteria_version": done_criteria.get("criteria_version"),
+        "criteria_ids": done_criteria.get("criteria_ids") or [],
+        "criteria_proofs": criterion_proofs,
+        "worker_done_observed": worker_done_observed,
+        "authority_boundary_confirmed": authority_boundary_confirmed is True,
+        "cleanup_or_residue_proof": not cleanup_blockers,
+    }
 
 
 def get_closed_loop_operating_contract() -> dict[str, Any]:
@@ -598,6 +1250,72 @@ def generate_autopilot_run_report(run: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def generate_verifier_failure_operator_report(verifier_result: dict[str, Any], remediation_state: dict[str, Any]) -> dict[str, Any]:
+    """Summarize verifier failures and remediation state for operators.
+
+    BO-152 makes failed verifier outcomes readable without granting recovery
+    authority.  The report is intentionally deterministic and check-only: it
+    names missing criteria, retry/remediation disposition, next owner, and the
+    authority boundary so an operator can see why review_ready is blocked.
+    """
+
+    verdict = str(verifier_result.get("verdict") or "UNKNOWN").upper()
+    missing = list(verifier_result.get("missing_criteria") or verifier_result.get("reason_codes") or [])
+    retry_count = int(remediation_state.get("retry_count") or 0)
+    max_retries = int(remediation_state.get("max_retries") or 0)
+    remediation_child = remediation_state.get("remediation_child")
+    retry_allowed = bool(remediation_state.get("retry_allowed")) and retry_count < max_retries
+    needs_human = verdict in {"BLOCKED", "REFINEMENT_REQUIRED"} or (verdict == "FAIL" and not retry_allowed and not remediation_child)
+    if verdict == "PASS":
+        next_state = "review_ready_gate"
+    elif retry_allowed:
+        next_state = "retry_queued"
+    elif remediation_child:
+        next_state = "remediation_child_queued"
+    else:
+        next_state = "needs_human"
+    lines = [
+        "Autopilot verifier report",
+        f"verdict={verdict}",
+        f"next_state={next_state}",
+    ]
+    if missing:
+        lines.append("missing=" + ",".join(str(item) for item in missing))
+    lines.append(f"retry={retry_count}/{max_retries}")
+    if remediation_child:
+        lines.append(f"remediation_child={remediation_child}")
+    if remediation_state.get("blocked_reason"):
+        lines.append(f"blocked_reason={remediation_state.get('blocked_reason')}")
+    return {
+        "summary": {
+            "verdict": verdict,
+            "missing_criteria_count": len(missing),
+            "retry_count": retry_count,
+            "max_retries": max_retries,
+            "retry_allowed": retry_allowed,
+            "needs_human": needs_human,
+            "next_state": next_state,
+        },
+        "missing_criteria": missing,
+        "remediation": {
+            "retry_allowed": retry_allowed,
+            "retry_count": retry_count,
+            "max_retries": max_retries,
+            "remediation_child": remediation_child,
+            "blocked_reason": remediation_state.get("blocked_reason"),
+        },
+        "authority": {
+            "review_ready_allowed": verdict == "PASS",
+            "merge_allowed": False,
+            "release_allowed": False,
+            "gateway_restart_reload_allowed": False,
+            "config_env_secret_mutation_allowed": False,
+        },
+        "text": "\n".join(lines),
+    }
+
+
+
 def build_autopilot_review_package(
     evidence: dict[str, Any],
     *,
@@ -665,6 +1383,178 @@ def build_autopilot_review_package(
         "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
         "text": "\n".join(text_lines),
     }
+
+
+def build_worktree_cleanup_registry(entries: list[dict[str, Any]], *, bundle_id: Optional[str] = None) -> dict[str, Any]:
+    """Normalize task-owned worktree cleanup state without deleting anything.
+
+    BO-151 keeps cleanup accounting explicit: registered git worktrees need
+    review-safe disposition before ``review_ready`` and a separate post-merge
+    reconcile ledger after Chris accepts/merges the PR stack.  This helper is
+    pure/check-only; it records which entries would block instead of attempting
+    ``git worktree remove`` or branch pruning itself.
+    """
+
+    normalized: list[dict[str, Any]] = []
+    blockers: list[dict[str, Any]] = []
+    for raw in entries:
+        entry = dict(raw)
+        public_id = entry.get("public_id") or entry.get("card_id") or entry.get("task_id")
+        cleanup_state = str(entry.get("cleanup_state") or "pending").strip().lower()
+        reason_codes: list[str] = []
+        if not str(entry.get("path") or "").strip():
+            reason_codes.append("missing_worktree_path")
+        if entry.get("registered_git_worktree") is not True:
+            reason_codes.append("registered_git_worktree_not_verified")
+        if cleanup_state == "removed":
+            if entry.get("git_worktree_remove_verified") is not True:
+                reason_codes.append("missing_git_worktree_remove_proof")
+        elif cleanup_state == "retained":
+            if not str(entry.get("retained_reason") or "").strip():
+                reason_codes.append("missing_retained_reason")
+            if not str(entry.get("ttl") or entry.get("revisit_at") or "").strip():
+                reason_codes.append("missing_retained_ttl")
+            if entry.get("review_safe") is not True:
+                reason_codes.append("retained_residue_not_review_safe")
+        else:
+            reason_codes.append("cleanup_pending")
+        if entry.get("active_process_cwd") or entry.get("active_tmux_cwd") or entry.get("active_worker_pid"):
+            reason_codes.append("active_reference_blocks_cleanup")
+        status = "ok" if not reason_codes else "blocked"
+        item = {**entry, "public_id": public_id, "cleanup_state": cleanup_state, "status": status, "reason_codes": reason_codes}
+        normalized.append(item)
+        if reason_codes:
+            blockers.append({"public_id": public_id, "path": entry.get("path"), "reason_codes": reason_codes})
+    return {
+        "bundle_id": bundle_id,
+        "entries": normalized,
+        "blocked_entries": blockers,
+        "cleanup_required": bool(blockers),
+        "review_ready_allowed": not blockers,
+        "destructive_cleanup_performed": False,
+        "required_apply_primitive": "git_worktree_remove_then_prune_verify",
+    }
+
+
+def evaluate_pre_review_cleanup_gate(registry: dict[str, Any]) -> dict[str, Any]:
+    """Gate review_ready on removed or safely-retained task worktrees."""
+
+    blockers = list(registry.get("blocked_entries") or [])
+    reason_codes = ["cleanup_required"] if blockers else []
+    for blocker in blockers:
+        for code in blocker.get("reason_codes") or []:
+            if code not in reason_codes:
+                reason_codes.append(code)
+    return {
+        "review_ready_allowed": not blockers,
+        "cleanup_required": bool(blockers),
+        "reason_codes": reason_codes,
+        "blocked_entries": blockers,
+        "post_merge_reconcile_still_required": True,
+        "destructive_cleanup_performed": False,
+    }
+
+
+def reconcile_post_merge_cleanup(registry: dict[str, Any], *, merged_prs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build a post-merge cleanup reconcile ledger from existing proof.
+
+    The reconcile remains check-only here: it verifies that every retained or
+    removed worktree entry has corresponding merged/accepted PR evidence and no
+    stale cleanup blockers.  Runtime materialization and gateway restart remain
+    outside this authority ceiling.
+    """
+
+    merged_by_public_id = {str(pr.get("public_id") or pr.get("work_id") or ""): pr for pr in merged_prs}
+    entries = registry.get("entries") or []
+    stale: list[dict[str, Any]] = []
+    reconciled: list[dict[str, Any]] = []
+    for entry in entries:
+        public_id = str(entry.get("public_id") or "")
+        pr = merged_by_public_id.get(public_id)
+        reasons: list[str] = []
+        if not pr or pr.get("state") != "MERGED":
+            reasons.append("missing_merged_pr_truth")
+        if entry.get("status") != "ok":
+            reasons.append("pre_review_cleanup_not_resolved")
+        item = {"public_id": public_id, "path": entry.get("path"), "merged_pr": pr, "reason_codes": reasons, "status": "reconciled" if not reasons else "blocked"}
+        reconciled.append(item)
+        if reasons:
+            stale.append(item)
+    return {
+        "reconciled": reconciled,
+        "stale_entries": stale,
+        "closed_allowed": not stale,
+        "gateway_restart_reload_allowed": False,
+        "canonical_materialization_allowed": False,
+        "destructive_cleanup_performed": False,
+    }
+
+
+
+def prove_worker_verifier_retry_loop_check_only(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Check an end-to-end worker→verifier→retry/review_ready event trace.
+
+    BO-153's proof is deliberately check-only: it accepts fixture events and
+    verifies that a completed worker event leads either to verifier FAIL with a
+    retry/remediation disposition, or verifier PASS with cleanup-checked
+    review_ready.  It records forbidden authority as false and performs no
+    Kanban, GitHub, cleanup, restart, or provider mutation.
+    """
+
+    by_kind: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        by_kind.setdefault(str(event.get("kind") or ""), []).append(event)
+    reason_codes: list[str] = []
+    if not by_kind.get("worker_completed"):
+        reason_codes.append("missing_worker_completed_event")
+    if not by_kind.get("verifier_intake"):
+        reason_codes.append("missing_verifier_intake_event")
+    verifier_events = by_kind.get("verifier_result") or []
+    if not verifier_events:
+        reason_codes.append("missing_verifier_result_event")
+    outcomes: list[dict[str, Any]] = []
+    for event in verifier_events:
+        verdict = str(event.get("verdict") or "").upper()
+        if verdict == "FAIL":
+            retry = bool(by_kind.get("retry_queued") or by_kind.get("remediation_child_queued"))
+            if not retry:
+                reason_codes.append("verifier_fail_without_retry_or_remediation")
+            outcomes.append({"verdict": verdict, "next_state": "retry_or_remediation" if retry else "needs_human"})
+        elif verdict == "PASS":
+            cleanup = bool(by_kind.get("cleanup_checked"))
+            review_ready = bool(by_kind.get("review_ready_promoted"))
+            if not cleanup:
+                reason_codes.append("verifier_pass_without_cleanup_check")
+            if not review_ready:
+                reason_codes.append("verifier_pass_without_review_ready_promotion")
+            outcomes.append({"verdict": verdict, "next_state": "review_ready" if cleanup and review_ready else "blocked"})
+        else:
+            reason_codes.append("unknown_verifier_verdict")
+            outcomes.append({"verdict": verdict or "UNKNOWN", "next_state": "needs_human"})
+    forbidden_attempts = [event for event in events if str(event.get("kind") or "") == "forbidden_mutation_attempt"]
+    if forbidden_attempts and not by_kind.get("authority_blocked"):
+        reason_codes.append("forbidden_attempt_not_blocked")
+    parent_matrix_updated = bool(by_kind.get("parent_matrix_updated"))
+    if not parent_matrix_updated:
+        reason_codes.append("missing_parent_matrix_update")
+    return {
+        "passed": not reason_codes,
+        "reason_codes": reason_codes,
+        "outcomes": outcomes,
+        "observed": {kind: len(items) for kind, items in sorted(by_kind.items())},
+        "parent_matrix_updated": parent_matrix_updated,
+        "authority": {
+            "check_only": True,
+            "merge_allowed": False,
+            "release_allowed": False,
+            "gateway_restart_reload_allowed": False,
+            "config_env_secret_mutation_allowed": False,
+            "prod_customer_visible_allowed": False,
+        },
+        "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
+        "next_state": "proof_passed" if not reason_codes else "needs_human",
+    }
+
 
 
 def evaluate_autopilot_promotion_policy(proof: dict[str, Any]) -> dict[str, Any]:
@@ -934,8 +1824,9 @@ def load_live_kanban_candidates(
     """Read live Kanban candidates for Autopilot without mutating the board.
 
     If a parent/focus public id is supplied, only hierarchy children of that
-    parent are returned.  Without an explicit parent this deliberately returns
-    only ``ready`` tasks, keeping the read side narrow and side-effect free.
+    parent are returned. Without an explicit parent this returns ready tasks plus
+    active flight rows so the global/default-policy single-flight guard can see
+    an already-running worker before dispatching another task.
     """
 
     try:
@@ -968,14 +1859,30 @@ def load_live_kanban_candidates(
                 _task_row_to_candidate(row, parent_public_id=parent["public_id"] or parent_public_id, relation_type=row["relation_type"])
                 for row in rows
             ]
-        params = []
-        query = "SELECT * FROM tasks WHERE status = 'ready'"
-        if tenant:
-            query += " AND tenant = ?"
-            params.append(tenant)
-        query += " ORDER BY priority DESC, created_at ASC LIMIT ?"
-        params.append(max(1, int(limit)))
-        rows = conn.execute(query, params).fetchall()
+        tenant_clause = " AND tenant = ?" if tenant else ""
+        tenant_params: list[Any] = [tenant] if tenant else []
+        active_query = f"""
+            SELECT * FROM tasks
+            WHERE status != 'archived'
+              AND (
+                status IN ('running', 'claimed', 'in_progress')
+                OR claim_lock IS NOT NULL
+                OR worker_pid IS NOT NULL
+                OR current_run_id IS NOT NULL
+              )
+              {tenant_clause}
+            ORDER BY priority DESC, created_at ASC
+        """
+        ready_query = f"""
+            SELECT * FROM tasks
+            WHERE status = 'ready'
+              {tenant_clause}
+            ORDER BY priority DESC, created_at ASC LIMIT ?
+        """
+        rows = list(conn.execute(active_query, tenant_params).fetchall())
+        seen_ids = {row["id"] for row in rows}
+        ready_rows = conn.execute(ready_query, [*tenant_params, max(1, int(limit))]).fetchall()
+        rows.extend(row for row in ready_rows if row["id"] not in seen_ids)
         return [_task_row_to_candidate(row) for row in rows]
 
 
@@ -1080,6 +1987,10 @@ def evaluate_autopilot_ready_gate(candidate: dict[str, Any]) -> dict[str, Any]:
         if not any(marker in haystack for marker in markers):
             reason_codes.append(code)
             missing_labels.append(label)
+    done_criteria = build_done_criteria_ledger(body)
+    if not done_criteria.get("ok"):
+        reason_codes.extend(done_criteria.get("reason_codes") or ["invalid_done_criteria_ledger"])
+        missing_labels.append("explicit done criteria ledger")
     routing = candidate.get("routing_verdict") or {}
     if isinstance(routing, str):
         try:
@@ -1098,6 +2009,10 @@ def evaluate_autopilot_ready_gate(candidate: dict[str, Any]) -> dict[str, Any]:
         "status": "accepted" if accepted else "rejected",
         "reason_codes": reason_codes,
         "human_reason": "ready for autopilot dry-run selection" if accepted else "Missing executable contract fields: " + ", ".join(missing_labels),
+        "done_criteria_ledger": done_criteria.get("done_criteria_ledger"),
+        "criteria_hash": done_criteria.get("criteria_hash"),
+        "criteria_version": done_criteria.get("criteria_version"),
+        "criteria_ids": done_criteria.get("criteria_ids") or [],
         "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0},
     }
 
@@ -1130,6 +2045,37 @@ def evaluate_review_ready_contract(
     for field, value in bool_required.items():
         if value is not True:
             reason_codes.append(f"missing_{field}")
+    done_criteria = _done_criteria_validation_for_evidence(evidence)
+    if not done_criteria.get("ok"):
+        reason_codes.extend(done_criteria.get("reason_codes") or ["invalid_done_criteria_ledger"])
+    worker_done_evidence = None
+    if evidence.get("kanban_worker_done") is True or evidence.get("worker_done") is True:
+        worker_done_evidence = validate_worker_done_evidence(
+            evidence,
+            task_body=evidence.get("task_body"),
+            task_spec=evidence.get("task_spec") or evidence.get("spec"),
+        )
+        reason_codes.extend(worker_done_evidence.get("reason_codes") or [])
+    if _evidence_uses_task_worktree(evidence):
+        reason_codes.extend(_worktree_cleanup_blockers(evidence))
+    verifier_verdict = evidence.get("verifier_verdict")
+    if isinstance(verifier_verdict, dict):
+        verifier_pass = str(verifier_verdict.get("verdict") or "").strip().upper() == "PASS"
+        if not verifier_pass:
+            reason_codes.append("missing_verifier_pass")
+    elif isinstance(verifier_verdict, str):
+        verifier_pass = verifier_verdict.strip().upper() == "PASS"
+        if not verifier_pass:
+            reason_codes.append("missing_verifier_pass")
+    else:
+        verifier_payload = evidence.get("verifier_evidence")
+        if isinstance(verifier_payload, dict):
+            verifier_verdict = evaluate_verifier_verdict(evidence, verifier_payload)
+            if verifier_verdict.get("verdict") != "PASS":
+                reason_codes.append("missing_verifier_pass")
+        else:
+            verifier_verdict = None
+            reason_codes.append("missing_verifier_pass")
     commit = str(required["commit"] or "").strip()
     if commit and not _SHA_RE.fullmatch(commit):
         reason_codes.append("commit_not_sha_like")
@@ -1155,6 +2101,10 @@ def evaluate_review_ready_contract(
         "review_ready": not reason_codes,
         "status": "review_ready" if not reason_codes else "blocked",
         "reason_codes": reason_codes,
+        "done_criteria_ledger": done_criteria.get("done_criteria_ledger"),
+        "criteria_hash": done_criteria.get("criteria_hash"),
+        "criteria_version": done_criteria.get("criteria_version"),
+        "worker_done_evidence": worker_done_evidence,
         "merge_allowed": False,
         "release_allowed": False,
         "prod_customer_visible_allowed": False,
@@ -1194,12 +2144,12 @@ def evaluate_dispatcher_eligibility(candidates: list[dict[str, Any]]) -> dict[st
                 "reason_codes": ["autopilot_lane_paused"],
                 "human_reason": f"Autopilot lane is paused: {tenant}",
             }
-        elif effective not in {"blocked", "default_policy_loop", "parent_scoped", "bounded_multi_tick"}:
+        elif effective not in {"default_policy_loop", "parent_scoped", "bounded_multi_tick"}:
             gate = {
                 **gate,
                 "autopilot_ready": False,
                 "status": "rejected",
-                "reason_codes": ["autopilot_effective_mode_not_blocked_pending_dispatch_gate"],
+                "reason_codes": ["autopilot_effective_mode_not_dispatch_enabled"],
                 "human_reason": "Autopilot controller is not in a dispatch-enabled mode.",
             }
         if gate["autopilot_ready"]:
