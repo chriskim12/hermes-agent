@@ -539,7 +539,11 @@ def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path)
     calls = []
 
     def fake_run(cmd, cwd=None, **_kwargs):
-        calls.append((cmd, cwd))
+        # Background update-prefetch threads can also call subprocess.run in the
+        # same interpreter while this module-level monkeypatch is active. Keep
+        # this assertion scoped to the TUI dev prebuild subprocess this test owns.
+        if cwd == str(ink_dir):
+            calls.append((cmd, cwd))
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
