@@ -11655,16 +11655,20 @@ def main():
         help="Bitwarden Secrets Manager integration",
     )
 
-    # Lazy import — only pays for itself when this subcommand is actually used.
+    # Lazy imports — only pay for themselves when this subcommand is actually used.
     from hermes_cli import secrets_cli as _secrets_cli
+    from hermes_cli.secrets import register_secrets_subparsers
 
     _secrets_cli.register_cli(secrets_bw)
+    register_secrets_subparsers(secrets_parser, secrets_subparsers)
 
     def _dispatch_secrets(args):  # noqa: ANN001
         sub = getattr(args, "secrets_command", None)
         source = getattr(args, "secrets_source", None)
         bw_sub = getattr(args, "secrets_bw_command", None)
         if sub in ("source", "provider") and source in ("bitwarden", "bw") and bw_sub is not None:
+            return args.func(args)
+        if hasattr(args, "func") and args.func is not _dispatch_secrets:
             return args.func(args)
         secrets_parser.print_help()
         return 0
