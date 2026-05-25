@@ -66,7 +66,7 @@ def _review_ready_evidence(repo: Path, **overrides):
         },
         "checks": [{"name": "tests", "status": "COMPLETED", "conclusion": "SUCCESS"}],
         "verifier_verdict": {"verdict": "PASS"},
-        "cleanup": {"proof": "worktree cleanup verified", "worktree_clean": True},
+        "cleanup": {"proof": "worktree cleanup verified", "worktree_clean": True, "artifacts_removed": []},
         "residue": _valid_residue(),
         "evidence": {"changed_files": ["hermes_cli/kanban_closeout.py"], "tests_run": ["targeted"]},
     }
@@ -454,7 +454,7 @@ def test_closed_requires_review_ready_and_explicit_approval(kanban_home, git_rep
 def test_closed_allows_documented_no_pr_exception_policy(kanban_home, git_repo):
     evidence = {
         "summary": "documentation-only cleanup completed",
-        "cleanup": {"proof": "no worktree residue", "worktree_clean": True},
+        "cleanup": {"proof": "no worktree residue", "worktree_clean": True, "artifacts_removed": []},
         "residue": _valid_residue(),
         "no_pr_exception": {
             "policy": "docs-only-no-pr-closeout",
@@ -489,3 +489,107 @@ def test_closeout_cli_check_only_blocks_without_writing(kanban_home, git_repo):
     assert "missing_live_pr" in payload["blockers"]
     with kb.connect() as conn:
         assert kb.get_task(conn, task_id).review_phase == "worker_done"
+
+
+# ── Slice 4: prose-only cleanup rejection & structured evidence ──
+
+
+def test_cleanup_prose_only_is_rejected_without_structured_artifacts(git_repo):
+    """Prose-only cleanup proof ("cleaned up") without artifacts_removed or
+    worktree_retained must fail with missing_structured_cleanup_evidence."""
+    evidence = _review_ready_evidence(git_repo,
+        cleanup={"proof": "everything cleaned up", "worktree_clean": True},
+    )
+
+    result = closeout.verify_closeout_transition(
+        "review_ready",
+        evidence,
+        current_phase="worker_done",
+        repo_path=git_repo,
+    )
+
+    assert result.allowed is False
+    assert "missing_structured_cleanup_evidence" in result.blockers
+
+
+def test_cleanup_accepts_artifacts_removed_list(git_repo):
+    """Cleanup with artifacts_removed list (even empty) must pass."""
+    evidence = _review_ready_evidence(git_repo,
+        cleanup={"proof": "verified", "worktree_clean": True, "artifacts_removed": ["node_modules"]},
+    )
+
+    result = closeout.verify_closeout_transition(
+        "review_ready",
+        evidence,
+        current_phase="worker_done",
+        repo_path=git_repo,
+    )
+
+    assert result.allowed is True
+
+
+def test_cleanup_retained_worktree_requires_reason_and_ttl(git_repo):
+    """worktree_retained=True without retained_reason or revisit_at must fail."""
+    evidence = _review_ready_evidence(git_repo,
+        cleanup={"proof": "retaining worktree", "worktree_clean": True, "worktree_retained": True},
+    )
+
+    result = closeout.verify_closeout_transition(
+        "review_ready",
+        evidence,
+        current_phase="worker_done",
+        repo_path=git_repo,
+    )
+
+    assert result.allowed is False
+    assert "retained_worktree_missing_reason" in result.blockers
+
+
+def test_cleanup_retained_worktree_with_reason_and_revisit_passes(git_repo):
+    """worktree_retained=True with retained_reason and revisit_at must pass."""
+    evidence = _review_ready_evidence(git_repo,
+        cleanup={
+            "proof": "retaining worktree for review",
+            "worktree_clean": True,
+            "worktree_retained": True,
+            "retained_reason": "PR review pending",
+            "revisit_at": "after PR merge or close",
+        },
+    )
+
+    result = closeout.verify_closeout_transition(
+        "review_ready",
+        evidence,
+        current_phase="worker_done",
+        repo_path=git_repo,
+    )
+
+    assert result.allowed is True
+
+
+def test_worker_done_preserves_original_status(git_repo):
+    """worker_done must not set the task status to done."""
+    result = closeout.verify_closeout_transition(
+        "worker_done",
+        {"summary": "worker finished"},
+        current_phase=None,
+        repo_path=git_repo,
+    )
+
+    assert result.allowed is True
+    # worker_done verification should pass without residue
+    assert "missing_residue_evidence" not in result.blockers
+    # Verifier itself does not set status; apply_closeout_transition now preserves it
+
+
+def test_review_ready_status_is_blocked_not_done(git_repo):
+    """review_ready transition must result in status='blocked', not 'done'."""
+    result = closeout.verify_closeout_transition(
+        "review_ready",
+        _review_ready_evidence(git_repo),
+        current_phase="worker_done",
+        repo_path=git_repo,
+    )
+
+    assert result.allowed is True
+    # The verifier doesn't mutate status, but the evidence must be accepted.

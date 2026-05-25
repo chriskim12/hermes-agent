@@ -241,6 +241,7 @@ def _cleanup_proven(evidence: Mapping[str, Any]) -> tuple[bool, str | None]:
     proof = _text(cleanup.get("proof")) or _text(evidence.get("cleanup_proof"))
     if not proof:
         return False, "missing_cleanup_proof"
+
     git = _as_mapping(evidence.get("git"))
     for value in (cleanup.get("worktree_clean"), git.get("worktree_clean")):
         if value is False:
@@ -248,6 +249,18 @@ def _cleanup_proven(evidence: Mapping[str, Any]) -> tuple[bool, str | None]:
     status_short = _text(git.get("status_short"))
     if status_short:
         return False, "dirty_worktree"
+
+    # Require structured evidence — prose-only "cleaned up" is insufficient.
+    artifacts_removed = cleanup.get("artifacts_removed")
+    worktree_retained = cleanup.get("worktree_retained")
+    if artifacts_removed is None and worktree_retained is None:
+        return False, "missing_structured_cleanup_evidence"
+    if worktree_retained is True:
+        if not _text(cleanup.get("retained_reason")):
+            return False, "retained_worktree_missing_reason"
+        if not _has_ttl_or_revisit(cleanup):
+            return False, "retained_worktree_missing_ttl"
+
     return True, None
 
 
