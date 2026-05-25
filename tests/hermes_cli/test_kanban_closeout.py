@@ -615,7 +615,11 @@ def _closed_evidence(repo: Path, **overrides):
         },
         "checks": [{"name": "tests", "status": "COMPLETED", "conclusion": "SUCCESS"}],
         "verifier_verdict": {"verdict": "PASS"},
-        "cleanup": {"proof": "worktree removed, branch deleted, git prune complete", "worktree_clean": True},
+        "cleanup": {
+            "proof": "worktree removed, branch deleted, git prune complete",
+            "worktree_clean": True,
+            "artifacts_removed": ["task worktree"],
+        },
         "residue": _valid_residue(),
         "approval": {"decision": "approved", "approved_by": "reviewer"},
         "evidence": {"changed_files": ["hermes_cli/kanban_closeout.py"], "tests_run": ["targeted"]},
