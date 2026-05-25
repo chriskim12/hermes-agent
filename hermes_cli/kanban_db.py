@@ -2040,7 +2040,8 @@ def apply_closeout_transition(
     The verifier lives in :mod:`hermes_cli.kanban_closeout`; this DB helper only
     applies already-verified facts to the governance columns.  Final ``closed``
     maps to raw task ``done`` status because v1 task statuses do not have a
-    separate ``closed`` enum.  Earlier review phases never imply final closure.
+    separate ``closed`` enum.  ``worker_done`` and ``review_ready`` remain raw
+    ``blocked`` states so board-visible Done cannot appear before closeout.
     """
     if review_phase not in VALID_REVIEW_PHASES:
         raise ValueError(f"review_phase must be one of {sorted(VALID_REVIEW_PHASES)}")
@@ -2122,8 +2123,8 @@ def apply_closeout_transition(
                 UPDATE tasks
                    SET review_phase = ?,
                        closeout_evidence = ?,
-                       status = 'done',
-                       completed_at = COALESCE(completed_at, ?),
+                       status = 'blocked',
+                       completed_at = NULL,
                        claim_lock = NULL,
                        claim_expires = NULL,
                        worker_pid = NULL
@@ -2133,7 +2134,6 @@ def apply_closeout_transition(
                 (
                     review_phase,
                     _json_dumps_dict(closeout_evidence, "closeout_evidence"),
-                    now,
                     task_id,
                 ),
             )
@@ -2143,9 +2143,9 @@ def apply_closeout_transition(
                 conn,
                 task_id,
                 outcome="completed",
-                status="done",
+                status="blocked",
                 summary="Kanban worker evidence accepted; waiting for review_ready closeout",
-                metadata={"closeout_phase": "worker_done"},
+                metadata={"closeout_phase": "worker_done", "blocked_reason": "worker_done_waiting_for_review_ready"},
             )
 
         _append_event(
@@ -3208,9 +3208,17 @@ def complete_task(
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status       = 'done',
+                   SET status       = CASE
+                           WHEN closeout_evidence IS NOT NULL
+                                AND (review_phase IS NULL OR review_phase = 'worker_done') THEN 'blocked'
+                           ELSE 'done'
+                       END,
                        result       = ?,
-                       completed_at = ?,
+                       completed_at = CASE
+                           WHEN closeout_evidence IS NOT NULL
+                                AND (review_phase IS NULL OR review_phase = 'worker_done') THEN completed_at
+                           ELSE ?
+                       END,
                        claim_lock   = NULL,
                        claim_expires= NULL,
                        worker_pid   = NULL,
@@ -3229,9 +3237,17 @@ def complete_task(
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status       = 'done',
+                   SET status       = CASE
+                           WHEN closeout_evidence IS NOT NULL
+                                AND (review_phase IS NULL OR review_phase = 'worker_done') THEN 'blocked'
+                           ELSE 'done'
+                       END,
                        result       = ?,
-                       completed_at = ?,
+                       completed_at = CASE
+                           WHEN closeout_evidence IS NOT NULL
+                                AND (review_phase IS NULL OR review_phase = 'worker_done') THEN completed_at
+                           ELSE ?
+                       END,
                        claim_lock   = NULL,
                        claim_expires= NULL,
                        worker_pid   = NULL,

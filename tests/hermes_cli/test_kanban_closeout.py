@@ -91,7 +91,8 @@ def test_worker_done_transition_does_not_final_close(kanban_home):
 
     assert result["status"] == "transitioned"
     assert task.review_phase == "worker_done"
-    assert task.status == "done"
+    assert task.status == "blocked"
+    assert task.completed_at is None
     assert task.review_phase != "closed"
     assert task.closeout_evidence["verification"]["linear_done_mutated"] is False
 
@@ -109,7 +110,7 @@ def test_worker_done_transition_from_triage_repairs_execution_status(kanban_home
 
     assert result["status"] == "transitioned"
     assert task.review_phase == "worker_done"
-    assert task.status == "done"
+    assert task.status == "blocked"
 
 
 def test_complete_task_cannot_bypass_review_ready_to_done(kanban_home, git_repo):
@@ -141,9 +142,43 @@ def test_complete_task_on_governed_task_sets_worker_done_not_closed(kanban_home)
         assert kb.complete_task(conn, task_id, result="worker result")
         task = kb.get_task(conn, task_id)
 
-    assert task.status == "done"
+    assert task.status == "blocked"
     assert task.review_phase == "worker_done"
+    assert task.completed_at is None
     assert task.review_phase != "closed"
+
+
+def test_complete_task_without_closeout_policy_keeps_legacy_done(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy worker task")
+        assert kb.complete_task(conn, task_id, result="legacy done")
+        task = kb.get_task(conn, task_id)
+
+    assert task.status == "done"
+    assert task.review_phase is None
+    assert task.completed_at is not None
+
+
+def test_complete_task_cannot_escalate_worker_done_to_board_done(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="governed retry handoff",
+            closeout_evidence={"evidence_status": "not_started"},
+        )
+        closeout.transition_task_closeout(
+            conn,
+            task_id,
+            "worker_done",
+            {"summary": "first worker handoff"},
+        )
+        assert kb.complete_task(conn, task_id, result="retry handoff")
+        task = kb.get_task(conn, task_id)
+
+    assert task.status == "blocked"
+    assert task.review_phase == "worker_done"
+    assert task.completed_at is None
+
 
 
 def test_review_ready_requires_live_pr_checks_evidence_and_cleanup(kanban_home, git_repo):
