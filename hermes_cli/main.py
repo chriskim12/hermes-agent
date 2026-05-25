@@ -10967,6 +10967,17 @@ Examples:
     debug_parser.set_defaults(func=cmd_debug)
 
     # =========================================================================
+    # secrets command
+    # =========================================================================
+    secrets_parser = subparsers.add_parser(
+        "secrets",
+        help="Manage Hermes runtime secrets (BWS SSOT)",
+        description="Sync and check .env projections against the BWS secrets manifest.",
+    )
+    from hermes_cli.secrets import register_secrets_subparsers
+    register_secrets_subparsers(secrets_parser)
+
+    # =========================================================================
     # backup command
     # =========================================================================
     backup_parser = subparsers.add_parser(
