@@ -702,6 +702,24 @@ def cmd_secrets_retire(args: argparse.Namespace) -> int:
 # Subparser registration
 # ---------------------------------------------------------------------------
 
+def _exit_with(command_func):
+    """Wrap a subcommand so argparse dispatch propagates integer exit codes.
+
+    ``hermes_cli.main`` invokes ``args.func(args)`` but does not currently use
+    integer return values as process exit codes.  Runtime gates such as
+    ``secrets check`` and ``secrets preflight`` must fail closed for shell,
+    systemd ExecStartPre, and CI callers, so secrets subcommands convert their
+    return codes to ``SystemExit`` at the command boundary.
+    """
+
+    def _wrapped(args: argparse.Namespace) -> None:
+        result = command_func(args)
+        if isinstance(result, int):
+            raise SystemExit(result)
+
+    return _wrapped
+
+
 def register_secrets_subparsers(secrets_parser: argparse.ArgumentParser) -> None:
     """Register all subcommands under 'hermes secrets'."""
     sub = secrets_parser.add_subparsers(dest="secrets_command", required=True)
@@ -712,20 +730,20 @@ def register_secrets_subparsers(secrets_parser: argparse.ArgumentParser) -> None
     sync_parser.add_argument("--apply", action="store_true")
     sync_parser.add_argument("--dry-run", action="store_true")
     sync_parser.add_argument("--manifest", help=f"Path to manifest (default: {DEFAULT_MANIFEST_PATH})")
-    sync_parser.set_defaults(func=cmd_secrets_sync)
+    sync_parser.set_defaults(func=_exit_with(cmd_secrets_sync))
 
     # check
     check_parser = sub.add_parser("check", help="Validate fingerprints (sidecar vs live .env)")
     check_parser.add_argument("--target")
     check_parser.add_argument("--manifest", help=f"Path to manifest (default: {DEFAULT_MANIFEST_PATH})")
-    check_parser.set_defaults(func=cmd_secrets_check)
+    check_parser.set_defaults(func=_exit_with(cmd_secrets_check))
 
     # preflight
     preflight_parser = sub.add_parser("preflight", help="Runtime gate before gateway start")
     preflight_parser.add_argument("--profile", default="default")
     preflight_parser.add_argument("--strict", action="store_true")
     preflight_parser.add_argument("--manifest", help=f"Path to manifest (default: {DEFAULT_MANIFEST_PATH})")
-    preflight_parser.set_defaults(func=cmd_secrets_preflight)
+    preflight_parser.set_defaults(func=_exit_with(cmd_secrets_preflight))
 
     # install-systemd
     install_parser = sub.add_parser("install-systemd", help="Install ExecStartPre preflight into systemd")
@@ -733,13 +751,13 @@ def register_secrets_subparsers(secrets_parser: argparse.ArgumentParser) -> None
     install_parser.add_argument("--strict", action="store_true")
     install_parser.add_argument("--dry-run", action="store_true")
     install_parser.add_argument("--manifest", help=f"Path to manifest (default: {DEFAULT_MANIFEST_PATH})")
-    install_parser.set_defaults(func=cmd_secrets_install_systemd)
+    install_parser.set_defaults(func=_exit_with(cmd_secrets_install_systemd))
 
     # provider-check
     prov_parser = sub.add_parser("provider-check", help="Validate provider/base_url/key against live config")
     prov_parser.add_argument("--profile", default="arisu")
     prov_parser.add_argument("--manifest", help=f"Path to manifest (default: {DEFAULT_MANIFEST_PATH})")
-    prov_parser.set_defaults(func=cmd_secrets_provider_check)
+    prov_parser.set_defaults(func=_exit_with(cmd_secrets_provider_check))
 
     # break-glass
     bg_parser = sub.add_parser("break-glass", help="Create/list/revoke break-glass markers")
@@ -750,11 +768,11 @@ def register_secrets_subparsers(secrets_parser: argparse.ArgumentParser) -> None
     bg_parser.add_argument("--list", action="store_true")
     bg_parser.add_argument("--revoke", action="store_true")
     bg_parser.add_argument("--manifest", help=f"Path to manifest (default: {DEFAULT_MANIFEST_PATH})")
-    bg_parser.set_defaults(func=cmd_secrets_break_glass)
+    bg_parser.set_defaults(func=_exit_with(cmd_secrets_break_glass))
 
     # retire
     retire_parser = sub.add_parser("retire", help="Mark a key as retired in manifest")
     retire_parser.add_argument("--target", required=True)
     retire_parser.add_argument("--key", required=True)
     retire_parser.add_argument("--manifest", help=f"Path to manifest (default: {DEFAULT_MANIFEST_PATH})")
-    retire_parser.set_defaults(func=cmd_secrets_retire)
+    retire_parser.set_defaults(func=_exit_with(cmd_secrets_retire))
