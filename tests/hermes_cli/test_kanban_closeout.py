@@ -423,6 +423,7 @@ def test_closed_requires_review_ready_and_explicit_approval(kanban_home, git_rep
         task_id = kb.create_task(conn, title="close me", workspace_kind="dir", workspace_path=str(git_repo))
         closeout.transition_task_closeout(conn, task_id, "worker_done", {"summary": "done"})
 
+        # Blocked: missing review_ready + approval
         blocked = closeout.transition_task_closeout(
             conn,
             task_id,
@@ -434,6 +435,7 @@ def test_closed_requires_review_ready_and_explicit_approval(kanban_home, git_rep
         assert "closed_requires_review_ready" in blocked["blockers"]
         assert "missing_close_approval" in blocked["blockers"]
 
+        # Transition to review_ready
         closeout.transition_task_closeout(
             conn,
             task_id,
@@ -441,7 +443,8 @@ def test_closed_requires_review_ready_and_explicit_approval(kanban_home, git_rep
             _review_ready_evidence(git_repo),
             repo_path=git_repo,
         )
-        approved = _review_ready_evidence(git_repo, approval={"decision": "approved", "approved_by": "reviewer"})
+        # closed now requires MERGED PR — use closed-specific evidence
+        approved = _closed_evidence(git_repo)
         result = closeout.transition_task_closeout(conn, task_id, "closed", approved, repo_path=git_repo)
         task = kb.get_task(conn, task_id)
 
@@ -456,6 +459,9 @@ def test_closed_allows_documented_no_pr_exception_policy(kanban_home, git_repo):
         "summary": "documentation-only cleanup completed",
         "cleanup": {"proof": "no worktree residue", "worktree_clean": True, "artifacts_removed": []},
         "residue": _valid_residue(),
+        "verifier_verdict": {"verdict": "PASS"},
+        "checks": [{"name": "local verifier", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+        "approval": {"decision": "approved", "approved_by": "operator"},
         "no_pr_exception": {
             "policy": "docs-only-no-pr-closeout",
             "reason": "operator documented no repository diff requiring PR",
@@ -593,3 +599,186 @@ def test_review_ready_status_is_blocked_not_done(git_repo):
 
     assert result.allowed is True
     # The verifier doesn't mutate status, but the evidence must be accepted.
+# ── Slice 6 — closed final Done gate ──────────────────────────────
+
+def _closed_evidence(repo: Path, **overrides):
+    """Helper: build closed-phase evidence with MERGED PR."""
+    evidence = {
+        "summary": "final closeout with post-merge cleanup proof",
+        "pr": {
+            "number": 421,
+            "url": "https://github.com/NousResearch/hermes-agent/pull/421",
+            "state": "MERGED",
+            "is_draft": False,
+            "head_sha": _head(repo),
+            "live": True,
+        },
+        "checks": [{"name": "tests", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+        "verifier_verdict": {"verdict": "PASS"},
+        "cleanup": {"proof": "worktree removed, branch deleted, git prune complete", "worktree_clean": True},
+        "residue": _valid_residue(),
+        "approval": {"decision": "approved", "approved_by": "reviewer"},
+        "evidence": {"changed_files": ["hermes_cli/kanban_closeout.py"], "tests_run": ["targeted"]},
+    }
+    evidence.update(overrides)
+    return evidence
+
+
+def test_closed_blocks_open_pr(git_repo):
+    """closed must reject an OPEN pr — only MERGED is accepted for final Done."""
+    evidence = _closed_evidence(
+        git_repo,
+        pr={**_closed_evidence(git_repo)["pr"], "state": "OPEN"},
+    )
+    result = closeout.verify_closeout_transition(
+        "closed",
+        evidence,
+        current_phase="review_ready",
+        repo_path=git_repo,
+    )
+    assert result.allowed is False
+    assert any(b in {"pr_not_merged", "pr_not_open", "stale_pr"} for b in result.blockers), \
+        f"Expected a PR-state blocker, got: {result.blockers}"
+
+
+def test_closed_accepts_merged_pr(git_repo):
+    """closed with MERGED PR, approval, cleanup, and residue passes all gates."""
+    evidence = _closed_evidence(git_repo)
+    result = closeout.verify_closeout_transition(
+        "closed",
+        evidence,
+        current_phase="review_ready",
+        repo_path=git_repo,
+    )
+    assert result.allowed is True, f"Blockers: {result.blockers}"
+    assert result.blockers == []
+
+
+def test_closed_blocks_missing_cleanup_proof(git_repo):
+    """closed with approval but no cleanup proof must block."""
+    evidence = _closed_evidence(git_repo)
+    evidence["cleanup"] = {"worktree_clean": True}  # no "proof" key
+    result = closeout.verify_closeout_transition(
+        "closed",
+        evidence,
+        current_phase="review_ready",
+        repo_path=git_repo,
+    )
+    assert result.allowed is False
+    assert "missing_cleanup_proof" in result.blockers
+
+
+def test_closed_blocks_missing_residue_evidence(git_repo):
+    """closed without any residue evidence must block."""
+    evidence = _closed_evidence(git_repo)
+    evidence.pop("residue")
+    result = closeout.verify_closeout_transition(
+        "closed",
+        evidence,
+        current_phase="review_ready",
+        repo_path=git_repo,
+    )
+    assert result.allowed is False
+    assert "missing_residue_evidence" in result.blockers
+
+
+def test_closed_blocks_stale_residue_none_with_dirty_worktree(git_repo):
+    """closed claiming 'residue: none' while worktree is dirty must block."""
+    (git_repo / "UNTRACKED.md").write_text("unexpected residue")
+    evidence = _closed_evidence(git_repo)
+    evidence["residue"] = _valid_residue(summary="Residue: none", items=[])
+    result = closeout.verify_closeout_transition(
+        "closed",
+        evidence,
+        current_phase="review_ready",
+        repo_path=git_repo,
+    )
+    assert result.allowed is False
+    assert "dirty_worktree" in result.blockers
+
+
+def test_closed_writes_done_status(kanban_home, git_repo):
+    """closed transition writes status=done with all gates satisfied."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="final close me",
+            workspace_kind="dir",
+            workspace_path=str(git_repo),
+        )
+        closeout.transition_task_closeout(conn, task_id, "worker_done", {"summary": "worker done"})
+        closeout.transition_task_closeout(
+            conn,
+            task_id,
+            "review_ready",
+            _review_ready_evidence(git_repo),
+            repo_path=git_repo,
+        )
+        closed_ev = _closed_evidence(git_repo)
+        result = closeout.transition_task_closeout(
+            conn,
+            task_id,
+            "closed",
+            closed_ev,
+            repo_path=git_repo,
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert result["status"] == "transitioned"
+    assert task.review_phase == "closed"
+    assert task.status == "done"
+    assert task.closeout_evidence["approval"]["approved_by"] == "reviewer"
+    assert task.closeout_evidence["pr"]["state"] == "MERGED"
+
+
+def test_closed_requires_approval_or_no_pr_exception(git_repo):
+    """closed without approval and without no-PR exception must block."""
+    evidence = _closed_evidence(git_repo)
+    evidence.pop("approval")
+    result = closeout.verify_closeout_transition(
+        "closed",
+        evidence,
+        current_phase="review_ready",
+        repo_path=git_repo,
+    )
+    assert result.allowed is False
+    assert "missing_close_approval" in result.blockers
+
+
+def test_closed_happy_path_end_to_end(kanban_home, git_repo):
+    """Full lifecycle: worker_done → review_ready → closed with all gates."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="full lifecycle",
+            workspace_kind="dir",
+            workspace_path=str(git_repo),
+        )
+
+        # 1) worker_done
+        r1 = closeout.transition_task_closeout(
+            conn, task_id, "worker_done", {"summary": "work complete"}
+        )
+        assert r1["status"] == "transitioned"
+
+        # 2) review_ready
+        r2 = closeout.transition_task_closeout(
+            conn, task_id, "review_ready",
+            _review_ready_evidence(git_repo),
+            repo_path=git_repo,
+        )
+        assert r2["status"] == "transitioned"
+        t2 = kb.get_task(conn, task_id)
+        assert t2.review_phase == "review_ready"
+        assert t2.status == "blocked"  # waiting for review
+
+        # 3) closed
+        r3 = closeout.transition_task_closeout(
+            conn, task_id, "closed",
+            _closed_evidence(git_repo),
+            repo_path=git_repo,
+        )
+        assert r3["status"] == "transitioned"
+        t3 = kb.get_task(conn, task_id)
+        assert t3.review_phase == "closed"
+        assert t3.status == "done"
