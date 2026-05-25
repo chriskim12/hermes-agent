@@ -181,6 +181,59 @@ def test_review_ready_requires_worker_done_phase(git_repo):
     assert "review_ready_requires_worker_done" in result.blockers
 
 
+def test_review_ready_allows_strict_no_pr_exception_for_no_code_smoke(git_repo):
+    evidence = _review_ready_evidence(
+        git_repo,
+        pr={},
+        checks=[{"name": "local verifier", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+        evidence={
+            "tests_run": ["hermes kanban closeout BO-115 review_ready --check-only --json"],
+            "changed_files": [],
+            "review_package_expectation": "Changed files/commit are not expected for this smoke fixture.",
+        },
+        no_pr_exception={
+            "policy": "no-code-autopilot-smoke-review-ready",
+            "reason": "BO-115 is a no-code Autopilot smoke fixture with worker evidence and verifier PASS.",
+            "review_package_expectation": "Changed files/commit are not expected for this smoke fixture.",
+            "changed_files_expected": False,
+        },
+    )
+
+    result = closeout.verify_closeout_transition(
+        "review_ready",
+        evidence,
+        current_phase="worker_done",
+        repo_path=git_repo,
+    )
+
+    assert result.allowed is True
+    assert result.blockers == []
+    assert result.evidence["verification"]["allowed"] is True
+    assert result.evidence["no_pr_exception"]["policy"] == "no-code-autopilot-smoke-review-ready"
+
+
+def test_review_ready_no_pr_exception_is_fail_closed_without_review_package_expectation(git_repo):
+    evidence = _review_ready_evidence(
+        git_repo,
+        pr={},
+        no_pr_exception={
+            "policy": "vague-no-pr",
+            "reason": "operator says no PR is needed",
+        },
+    )
+
+    result = closeout.verify_closeout_transition(
+        "review_ready",
+        evidence,
+        current_phase="worker_done",
+        repo_path=git_repo,
+    )
+
+    assert result.allowed is False
+    assert "missing_no_pr_review_package_expectation" in result.blockers
+    assert "missing_live_pr" not in result.blockers
+
+
 @pytest.mark.parametrize(
     "mutate,blocker",
     [

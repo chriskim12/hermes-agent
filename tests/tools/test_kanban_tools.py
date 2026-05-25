@@ -310,6 +310,79 @@ def test_complete_metadata_round_trips_through_show(worker_env):
     assert shown["runs"][-1]["metadata"] == handoff
 
 
+def test_complete_autopromotes_review_ready_when_worker_submits_closeout_package(worker_env):
+    """Autopilot workers should be able to finish with a verified review package.
+
+    This keeps the raw completion and closeout governance coupled at the worker
+    handoff boundary: the worker may submit the review_ready evidence package in
+    kanban_complete, and the kernel promotes worker_done -> review_ready only
+    after the existing closeout verifier accepts it.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    evidence = {
+        "summary": "No-code smoke completed with strict review package.",
+        "evidence": {
+            "summary": "Dispatcher smoke reached completion without code changes.",
+            "changed_files": [],
+            "tests_run": [
+                "pytest tests/tools/test_kanban_tools.py::"
+                "test_complete_autopromotes_review_ready_when_worker_submits_"
+                "closeout_package -q"
+            ],
+            "review_package_expectation": (
+                "review the smoke evidence only; no repository diff expected"
+            ),
+        },
+        "verification": "targeted regression passed",
+        "verifier_verdict": {"verdict": "PASS"},
+        "checks": [{"name": "targeted", "conclusion": "success"}],
+        "residue": {"summary": "No residue", "items": []},
+        "cleanup": {
+            "proof": "temporary smoke workspace removed; no branches left behind",
+            "workspace_removed": True,
+            "branches_removed": True,
+        },
+        "no_pr_exception": {
+            "policy": "no-code smoke fixture",
+            "reason": "worker produced no repository diff and no live PR is expected",
+            "review_package_expectation": (
+                "review the smoke evidence only; no repository diff expected"
+            ),
+            "changed_files_expected": False,
+        },
+    }
+
+    complete_out = kt._handle_complete({
+        "summary": "finished and packaged review evidence",
+        "metadata": {"changed_files": []},
+        "closeout_evidence": evidence,
+        "closeout_target_phase": "review_ready",
+    })
+    result = json.loads(complete_out)
+    assert result["ok"] is True
+    assert result["closeout"]["status"] == "transitioned"
+    assert result["closeout"]["review_phase"] == "review_ready"
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.review_phase == "review_ready"
+        assert task.closeout_evidence["verifier_verdict"]["verdict"] == "PASS"
+        events = kb.list_events(conn, worker_env)
+        phases = [
+            event.payload.get("review_phase")
+            for event in events
+            if event.kind == "closeout_transition"
+        ]
+        assert phases == ["worker_done", "review_ready"]
+    finally:
+        conn.close()
+
+
 def test_complete_with_result_only(worker_env):
     """`result` alone (without summary) is accepted for legacy compat."""
     from tools import kanban_tools as kt
