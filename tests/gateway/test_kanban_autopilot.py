@@ -2050,3 +2050,102 @@ def test_e2e_check_only_blocks_unblocked_forbidden_mutation_attempt():
     assert blocked["passed"] is True
     assert unblocked["passed"] is False
     assert "forbidden_attempt_not_blocked" in unblocked["reason_codes"]
+
+
+def _promotable_child(public_id: str = "BO-PROMOTE") -> dict:
+    child = _ready_candidate(public_id)
+    child["id"] = "t_promote"
+    child["status"] = "todo"
+    child["assignee"] = None
+    child["parent_public_id"] = "BO-PARENT"
+    child["relation_type"] = "hierarchy"
+    return child
+
+
+def test_parent_scoped_child_promotion_makes_todo_child_dispatchable_without_second_dispatcher(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import handle_autopilot_command, promote_parent_scoped_children
+
+    handle_autopilot_command("on BO-PARENT", actor="tester")
+    result = promote_parent_scoped_children([_promotable_child()], parent_public_id="BO-PARENT", dry_run=False)
+
+    assert result["promoted"][0]["public_id"] == "BO-PROMOTE"
+    assert result["candidates"][0]["status"] == "ready"
+    assert result["candidates"][0]["assignee"] == "arisu"
+    assert result["handoff_target"] == "existing_kanban_dispatcher"
+    assert result["second_dispatcher_created"] is False
+    assert result["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 1, "dispatched": 0}
+
+
+def test_parent_scoped_child_promotion_blocks_ambiguous_child_instead_of_guessing(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import promote_parent_scoped_children
+
+    child = _promotable_child("BO-AMBIGUOUS")
+    child["body"] = "maybe improve this somehow"
+
+    result = promote_parent_scoped_children([child], parent_public_id="BO-PARENT", dry_run=False)
+
+    assert result["promoted"] == []
+    assert result["blocked"][0]["public_id"] == "BO-AMBIGUOUS"
+    assert "missing_goal" in result["blocked"][0]["reason_codes"]
+    assert result["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0}
+
+
+def test_parent_scoped_child_promotion_ignores_out_of_parent_children(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import promote_parent_scoped_children
+
+    child = _promotable_child("BO-OTHER")
+    child["parent_public_id"] = "BO-OTHER-PARENT"
+
+    result = promote_parent_scoped_children([child], parent_public_id="BO-PARENT", dry_run=False)
+
+    assert result["promoted"] == []
+    assert result["out_of_scope"][0]["reason_codes"] == ["parent_scope_mismatch"]
+    assert result["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0}
+
+
+def test_parent_scoped_child_promotion_keeps_dependency_blocked_child_non_ready(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import promote_parent_scoped_children
+
+    child = _promotable_child("BO-DEP")
+    child["relation_type"] = "dependency"
+
+    result = promote_parent_scoped_children([child], parent_public_id="BO-PARENT", dry_run=False)
+
+    assert result["promoted"] == []
+    assert result["blocked"][0]["reason_codes"] == ["dependency_relation_blocks_ready_promotion"]
+
+
+def test_parent_scoped_child_promotion_dry_run_reports_candidate_without_mutation(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import promote_parent_scoped_children
+
+    result = promote_parent_scoped_children([_promotable_child()], parent_public_id="BO-PARENT", dry_run=True)
+
+    assert result["would_promote"][0]["public_id"] == "BO-PROMOTE"
+    assert result["promoted"] == []
+    assert result["candidates"][0]["status"] == "ready"
+    assert result["dry_run_side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0}
+
+
+def test_parent_on_promotes_child_before_single_flight_selection(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from gateway.kanban_autopilot import handle_autopilot_command
+
+    result = handle_autopilot_command("on BO-PARENT", actor="tester", candidates=[_promotable_child()])
+
+    assert result.ok is True
+    assert result.decision["promotion"]["promoted"][0]["public_id"] == "BO-PROMOTE"
+    assert result.decision["single_flight"]["selected"]["public_id"] == "BO-PROMOTE"
+    assert result.decision["single_flight"]["selected"]["task_id"] == "t_promote"
+    assert result.decision["dispatch_result"] is not None
+    assert result.decision["single_flight"]["handoff"]["target"] == "existing_kanban_dispatcher"

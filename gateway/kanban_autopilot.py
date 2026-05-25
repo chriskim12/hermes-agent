@@ -1186,6 +1186,133 @@ def run_bounded_multi_tick(
     }
 
 
+def _candidate_with_ready_promotion(candidate: dict[str, Any], *, default_assignee: str = "arisu") -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Return a ready-shaped candidate when promotion is safe.
+
+    Promotion is intentionally narrow: it may repair Kanban readiness fields
+    (status/assignee) only when the candidate already carries a complete
+    gate-visible execution contract. It does not guess missing requirements.
+    """
+
+    public_id = candidate.get("public_id") or candidate.get("task_id") or candidate.get("id")
+    if str(candidate.get("relation_type") or "").lower() == "dependency":
+        return None, {
+            "public_id": public_id,
+            "task_id": candidate.get("task_id") or candidate.get("id"),
+            "status": "blocked",
+            "reason_codes": ["dependency_relation_blocks_ready_promotion"],
+            "human_reason": "dependency links gate execution; hierarchy children only may be auto-promoted",
+        }
+    if str(candidate.get("status") or "").lower() in {"archived", "done", "running", "claimed", "in_progress"}:
+        return None, {
+            "public_id": public_id,
+            "task_id": candidate.get("task_id") or candidate.get("id"),
+            "status": "blocked",
+            "reason_codes": ["non_promotable_lifecycle_state"],
+            "human_reason": "only backlog children may be promoted to ready",
+        }
+
+    trial = {**candidate, "status": "ready", "assignee": candidate.get("assignee") or default_assignee}
+    gate = evaluate_autopilot_ready_gate(trial)
+    if not gate.get("autopilot_ready"):
+        return None, {
+            "public_id": public_id,
+            "task_id": candidate.get("task_id") or candidate.get("id"),
+            "status": "blocked",
+            "reason_codes": gate.get("reason_codes") or [],
+            "human_reason": "child contract is not safe to promote: " + ", ".join(gate.get("reason_codes") or []),
+            "ready_gate": gate,
+        }
+    return trial, {
+        "public_id": public_id,
+        "task_id": candidate.get("task_id") or candidate.get("id"),
+        "status": "promoted",
+        "reason_codes": [],
+        "assignee": trial.get("assignee"),
+        "ready_gate": gate,
+        "human_reason": "child promoted to autopilot-ready contract for existing dispatcher handoff",
+    }
+
+
+def _apply_ready_promotion_to_kanban(candidate: dict[str, Any], *, assignee: str) -> dict[str, Any]:
+    task_id = str(candidate.get("task_id") or candidate.get("id") or "").strip()
+    if not task_id:
+        return {"applied": False, "reason": "missing_task_id"}
+    try:
+        from hermes_cli import kanban_db as kb
+    except Exception as exc:
+        return {"applied": False, "reason": "kanban_db_unavailable", "error": str(exc)}
+    try:
+        with kb.connect() as conn:
+            conn.execute("UPDATE tasks SET status = 'ready', assignee = ? WHERE id = ?", (assignee, task_id))
+            conn.commit()
+    except Exception as exc:
+        return {"applied": False, "reason": "kanban_update_failed", "error": str(exc)}
+    return {"applied": True, "task_id": task_id, "status": "ready", "assignee": assignee}
+
+
+def promote_parent_scoped_children(
+    candidates: list[dict[str, Any]],
+    *,
+    parent_public_id: Optional[str] = None,
+    dry_run: bool = True,
+    default_assignee: str = "arisu",
+    apply_to_kanban: bool = False,
+) -> dict[str, Any]:
+    """Prepare in-scope parent children for Autopilot before dispatcher handoff.
+
+    This is the parent-level missing loop: non-ready hierarchy children that
+    already contain a complete executable contract are promoted to
+    ``status=ready`` with a spawnable worker profile. Ambiguous children stay
+    blocked/non-ready with explicit reason codes instead of being guessed into
+    execution. Actual worker execution remains owned by the existing dispatcher.
+    """
+
+    parent = str(parent_public_id or "").strip().upper()
+    prepared: list[dict[str, Any]] = []
+    promoted: list[dict[str, Any]] = []
+    would_promote: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    out_of_scope: list[dict[str, Any]] = []
+    apply_results: list[dict[str, Any]] = []
+
+    for candidate in candidates:
+        cand_parent = str(candidate.get("parent_public_id") or "").strip().upper()
+        public_id = candidate.get("public_id") or candidate.get("task_id") or candidate.get("id")
+        if parent and cand_parent and cand_parent != parent:
+            out_of_scope.append({"public_id": public_id, "task_id": candidate.get("task_id") or candidate.get("id"), "reason_codes": ["parent_scope_mismatch"]})
+            continue
+        if evaluate_autopilot_ready_gate(candidate).get("autopilot_ready"):
+            prepared.append(candidate)
+            continue
+        ready_candidate, disposition = _candidate_with_ready_promotion(candidate, default_assignee=default_assignee)
+        if ready_candidate is None:
+            blocked.append(disposition)
+            prepared.append(candidate)
+            continue
+        prepared.append(ready_candidate)
+        if dry_run:
+            would_promote.append(disposition)
+            continue
+        promoted.append(disposition)
+        if apply_to_kanban:
+            apply_results.append(_apply_ready_promotion_to_kanban(ready_candidate, assignee=str(ready_candidate.get("assignee") or default_assignee)))
+
+    mutated = 0 if dry_run else len(promoted)
+    return {
+        "parent_public_id": parent or None,
+        "candidates": prepared,
+        "promoted": promoted,
+        "would_promote": would_promote,
+        "blocked": blocked,
+        "out_of_scope": out_of_scope,
+        "apply_results": apply_results,
+        "handoff_target": "existing_kanban_dispatcher",
+        "second_dispatcher_created": False,
+        "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": mutated, "dispatched": 0},
+    }
+
+
 def filter_candidates_for_scope(candidates: list[dict[str, Any]], scope: dict[str, Any]) -> dict[str, Any]:
     """Filter candidates to an explicit parent/lane/repo/label scope."""
 
@@ -2230,10 +2357,19 @@ def _format_closed_loop_dry_run_message(decision: dict[str, Any]) -> str:
 
 def _bounded_on_decision(command: AutopilotCommand, *, actor: Optional[str], candidates: Optional[list[dict[str, Any]]]) -> dict[str, Any]:
     """Execute one bounded Autopilot tick through the existing dispatcher."""
-
     state = _write_state(_controller_state_for(command, actor=actor))
     scope = _candidate_scope_for(command)
     candidate_list = candidates or []
+    promotion: dict[str, Any] | None = None
+    if scope.get("parent_public_id"):
+        promotion = promote_parent_scoped_children(
+            candidate_list,
+            parent_public_id=str(scope.get("parent_public_id") or ""),
+            dry_run=False,
+            default_assignee="arisu",
+            apply_to_kanban=False,
+        )
+        candidate_list = promotion["candidates"]
     single_flight = activate_single_flight(candidate_list)
     dispatch_result: dict[str, Any] | None = None
     if single_flight.get("status") == "handoff_check_passed" and single_flight.get("selected"):
@@ -2252,6 +2388,17 @@ def _bounded_on_decision(command: AutopilotCommand, *, actor: Optional[str], can
         "reason": "bounded_dispatch_via_existing_dispatcher",
         "scope": scope,
         "caps": {"max_active_flights": 1, "max_dispatches_per_tick": 1},
+        "promotion": promotion or {
+            "parent_public_id": scope.get("parent_public_id"),
+            "candidates": candidate_list,
+            "promoted": [],
+            "would_promote": [],
+            "blocked": [],
+            "out_of_scope": [],
+            "handoff_target": "existing_kanban_dispatcher",
+            "second_dispatcher_created": False,
+            "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0, "dispatched": 0},
+        },
         "single_flight": single_flight,
         "dispatch_result": dispatch_result,
         "dispatched_count": 1 if dispatched else 0,
