@@ -410,7 +410,11 @@ def _review_ready_blockers(evidence: Mapping[str, Any]) -> list[str]:
         blockers.append("missing_worker_evidence")
     if not _verifier_pass_present(evidence):
         blockers.append("missing_verifier_pass")
-    blockers.extend(_check_pr(evidence))
+    no_pr_exception_blockers = _no_pr_review_ready_exception_blockers(evidence)
+    if no_pr_exception_blockers is None:
+        blockers.extend(_check_pr(evidence))
+    else:
+        blockers.extend(no_pr_exception_blockers)
     blockers.extend(_check_statuses(evidence))
     blockers.extend(_residue_blockers(evidence))
     cleanup_ok, cleanup_blocker = _cleanup_proven(evidence)
@@ -435,6 +439,43 @@ def _approval_present(evidence: Mapping[str, Any]) -> bool:
 def _no_pr_exception_present(evidence: Mapping[str, Any]) -> bool:
     exception = _as_mapping(evidence.get("no_pr_exception"))
     return bool(_text(exception.get("policy")) and _text(exception.get("reason")))
+
+
+def _no_pr_review_ready_exception_blockers(evidence: Mapping[str, Any]) -> list[str] | None:
+    """Return blockers for a review_ready no-PR exception, or None when absent.
+
+    Review-ready normally requires a live open PR.  A no-PR path is intentionally
+    narrower than the final-close exception: it is only for review packages whose
+    own evidence says no repository diff is expected (for example no-code smoke
+    fixtures).  Policy and reason alone are not enough, otherwise any operator
+    note could silently bypass the review surface.
+    """
+
+    exception = _as_mapping(evidence.get("no_pr_exception"))
+    if not exception:
+        return None
+
+    blockers: list[str] = []
+    if not _text(exception.get("policy")):
+        blockers.append("missing_no_pr_exception_policy")
+    if not _text(exception.get("reason")):
+        blockers.append("missing_no_pr_exception_reason")
+
+    work = _as_mapping(evidence.get("evidence"))
+    expectation = _text(exception.get("review_package_expectation")) or _text(
+        work.get("review_package_expectation")
+    )
+    if not expectation:
+        blockers.append("missing_no_pr_review_package_expectation")
+
+    changed_files_expected = exception.get("changed_files_expected")
+    changed_files = _as_list(work.get("changed_files"))
+    if changed_files_expected is not False and changed_files:
+        blockers.append("no_pr_exception_has_changed_files")
+    elif changed_files_expected is not False:
+        blockers.append("missing_no_pr_changed_files_not_expected")
+
+    return blockers
 
 
 def verify_closeout_transition(
