@@ -619,6 +619,12 @@ class Task:
     # ``kanban.failure_limit`` config, and then to ``DEFAULT_FAILURE_LIMIT``.
     # Name matches the ``--max-retries`` CLI flag on ``kanban create``.
     max_retries: Optional[int] = None
+    # JSON object: cleanup contract recorded at claim/start time.
+    # Fields: task_id, workspace_kind, workspace_path, repo_path,
+    # branch_name, created_at, allowed_artifact_names, forbidden_cleanup,
+    # artifact_ttl_hours, blocked_artifact_ttl_hours,
+    # workspace_ttl_days_after_closed. None for legacy tasks.
+    cleanup_contract: Optional[dict] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -689,6 +695,7 @@ class Task:
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
             ),
+            cleanup_contract=_json_loads_maybe(row["cleanup_contract"]) if "cleanup_contract" in keys else None,
         )
 
 
@@ -1319,6 +1326,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # which is the correct default (they keep the global behaviour
         # they were getting before the column existed).
         _add_column_if_missing(conn, "tasks", "max_retries", "max_retries INTEGER")
+
+    if "cleanup_contract" not in cols:
+        # JSON object encoding the cleanup contract recorded at claim/start.
+        # Fields: task_id, workspace_kind, workspace_path, repo_path,
+        # branch_name, created_at, allowed_artifact_names, forbidden_cleanup,
+        # artifact_ttl_hours, blocked_artifact_ttl_hours,
+        # workspace_ttl_days_after_closed. NULL for legacy rows.
+        _add_column_if_missing(
+            conn, "tasks", "cleanup_contract", "cleanup_contract TEXT"
+        )
 
     link_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='task_links'"
@@ -3907,6 +3924,104 @@ def set_workspace_path(
 
 
 # ---------------------------------------------------------------------------
+# Cleanup contract — recorded at claim/start
+# ---------------------------------------------------------------------------
+
+# Allowlisted reproducible artifact names (shared with workspace janitor).
+_CLEANUP_ALLOWED_ARTIFACT_NAMES = [
+    "node_modules", ".next", ".turbo",
+    "dist", "build", "target",
+    ".pytest_cache", ".ruff_cache", ".mypy_cache",
+    "coverage",
+]
+
+# Forbidden cleanup categories — must never be deleted by automated cleanup.
+_CLEANUP_FORBIDDEN = [
+    "source files", ".git", "secrets",
+    "untracked unique evidence", "shared DB backups without retention",
+]
+
+# Default TTLs (hours for artifacts, days for workspace).
+_DEFAULT_ARTIFACT_TTL_HOURS = 48
+_DEFAULT_BLOCKED_ARTIFACT_TTL_HOURS = 72
+_DEFAULT_WORKSPACE_TTL_DAYS_AFTER_CLOSED = 7
+
+
+def build_cleanup_contract(
+    task: Task,
+    workspace_path: str | None,
+    *,
+    repo_path: str | None = None,
+    branch_name: str | None = None,
+) -> dict:
+    """Build a validated cleanup contract for a task at claim/start time.
+
+    Validates:
+    - workspace_path is a non-empty absolute path
+    - workspace_path is not a symlink
+    - resolved path does not escape via ``..`` traversal
+
+    Returns a dict suitable for storage in ``tasks.cleanup_contract``.
+    Raises ``ValueError`` for validation failures.
+    """
+    import time as _time
+
+    if not workspace_path:
+        raise ValueError(
+            f"task {task.id}: workspace_path is required for cleanup contract"
+        )
+
+    wp = Path(workspace_path)
+    if not wp.is_absolute():
+        raise ValueError(
+            f"task {task.id}: workspace_path must be absolute, got {workspace_path!r}"
+        )
+
+    # Reject symlink escape — the path itself must not be a symlink.
+    if wp.is_symlink():
+        raise ValueError(
+            f"task {task.id}: workspace_path is a symlink — "
+            f"symlink workspace paths are rejected"
+        )
+
+    # Reject path traversal — the raw path must not contain .. segments.
+    if ".." in workspace_path:
+        raise ValueError(
+            f"task {task.id}: workspace_path contains '..' traversal — "
+            f"path escape is rejected"
+        )
+
+    return {
+        "task_id": task.id,
+        "workspace_kind": task.workspace_kind or "scratch",
+        "workspace_path": str(wp),
+        "repo_path": repo_path,
+        "branch_name": branch_name,
+        "created_at": int(_time.time()),
+        "allowed_artifact_names": list(_CLEANUP_ALLOWED_ARTIFACT_NAMES),
+        "forbidden_cleanup": list(_CLEANUP_FORBIDDEN),
+        "artifact_ttl_hours": _DEFAULT_ARTIFACT_TTL_HOURS,
+        "blocked_artifact_ttl_hours": _DEFAULT_BLOCKED_ARTIFACT_TTL_HOURS,
+        "workspace_ttl_days_after_closed": _DEFAULT_WORKSPACE_TTL_DAYS_AFTER_CLOSED,
+    }
+
+
+def set_cleanup_contract(
+    conn: sqlite3.Connection,
+    task_id: str,
+    contract: dict,
+) -> None:
+    """Persist a cleanup contract to the task row."""
+    import json as _json
+
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET cleanup_contract = ? WHERE id = ?",
+            (_json.dumps(contract, sort_keys=True), task_id),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher (one-shot pass)
 # ---------------------------------------------------------------------------
 
@@ -4877,6 +4992,15 @@ def dispatch_once(
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
+        # Record the cleanup contract while residue ownership is fresh.
+        try:
+            contract = build_cleanup_contract(claimed, str(workspace))
+            set_cleanup_contract(conn, claimed.id, contract)
+        except Exception:
+            # Contract build failure is non-fatal for dispatch — the task
+            # can still run, but cleanup promotion gates will block later
+            # if path authority is required.
+            pass
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
