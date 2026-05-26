@@ -305,3 +305,188 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
         f"deliveries (texts: {[d['text'] for d in adapter.sent]})"
     )
     assert "crashed" in adapter.sent[1]["text"].lower()
+
+
+# ---------------------------------------------------------------------------
+# MVP fallback routing tests — verifier / review_ready events → Discord
+# MVP channel 1500713192765132912 without a per-task subscription.
+# ---------------------------------------------------------------------------
+
+def _make_runner_with_discord(adapter):
+    """GatewayRunner wired with a Discord adapter for MVP fallback testing."""
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._kanban_sub_fail_counts = {}
+    return runner
+
+
+def test_kanban_notifier_mvp_chat_id_is_correct():
+    """MVP destination is explicitly Discord channel 1500713192765132912."""
+    # This is a pure documentation test — the constant is embedded in the
+    # notifier code, so we assert the *intent* by reading the source.
+    import gateway.run as grun
+    import inspect
+    src = inspect.getsource(grun.GatewayRunner._kanban_notifier_watcher)
+    assert '"1500713192765132912"' in src, (
+        "MVP Discord channel must be hardcoded as `1500713192765132912`"
+    )
+
+
+def test_kanban_notifier_mvp_fallback_delivers_verifier_result(tmp_path, monkeypatch):
+    """Verifier result events route to MVP Discord channel without per-task sub."""
+    db_path = tmp_path / "mvp-verifier.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        # Create a task with NO per-task subscription.
+        tid = kb.create_task(conn, title="orphan task", assignee="worker")
+        kb._append_event(
+            conn, tid,
+            kind="verifier_result",
+            payload={
+                "verdict": "FAIL",
+                "reason_codes": ["missing_criterion_dc_01"],
+                "retry_decision": "retry_worker",
+            },
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner_with_discord(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "1500713192765132912"
+    text = adapter.sent[0]["text"]
+    assert "verifier" in text.lower()
+    assert "FAIL" in text
+    assert tid in text
+
+
+def test_kanban_notifier_mvp_fallback_delivers_closeout_transition(tmp_path, monkeypatch):
+    """Review-ready closeout events route to MVP Discord channel without per-task sub."""
+    db_path = tmp_path / "mvp-closeout.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="review me", assignee="worker")
+        kb._append_event(
+            conn, tid,
+            kind="closeout_transition",
+            payload={
+                "review_phase": "review_ready",
+                "allowed": True,
+                "pr": {"url": "https://github.com/chriskim12/hermes-agent/pull/123"},
+                "verifier_verdict": {"verdict": "PASS"},
+            },
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner_with_discord(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "1500713192765132912"
+    text = adapter.sent[0]["text"]
+    assert "review_ready" in text
+    assert "PASS" in text
+    assert tid in text
+
+
+def test_kanban_notifier_mvp_does_not_duplicate_per_task_sub(tmp_path, monkeypatch):
+    """MVP fallback MUST NOT deliver events that a per-task subscription already covers."""
+    db_path = tmp_path / "mvp-no-dupe.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        # Task WITH its own subscription.
+        tid = kb.create_task(conn, title="has own sub", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="discord", chat_id="specific-chat")
+        kb._append_event(
+            conn, tid,
+            kind="verifier_result",
+            payload={"verdict": "PASS"},
+        )
+
+        # Orphan task WITHOUT subscription.
+        tid2 = kb.create_task(conn, title="orphan", assignee="worker2")
+        kb._append_event(
+            conn, tid2,
+            kind="verifier_result",
+            payload={"verdict": "FAIL", "reason_codes": ["missing_evidence"]},
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner_with_discord(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # tid has per-task sub → delivered to "specific-chat"
+    # tid2 has NO per-task sub → delivered via MVP fallback
+    # Total deliveries: 2 (one per task, not duplicated)
+    assert len(adapter.sent) == 2
+
+    specific = [d for d in adapter.sent if d["chat_id"] == "specific-chat"]
+    mvp = [d for d in adapter.sent if d["chat_id"] == "1500713192765132912"]
+
+    assert len(specific) == 1
+    assert tid in specific[0]["text"]
+    assert len(mvp) == 1
+    assert tid2 in mvp[0]["text"]
+
+
+def test_kanban_notifier_mvp_does_not_activate_without_discord_adapter(tmp_path, monkeypatch):
+    """MVP fallback must stay silent when Discord adapter is not connected."""
+    db_path = tmp_path / "mvp-no-discord.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="orphan", assignee="worker")
+        kb._append_event(
+            conn, tid,
+            kind="verifier_result",
+            payload={"verdict": "PASS"},
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    # Wire as Telegram, NOT Discord — MVP fallback should not fire.
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 0, (
+        "MVP fallback must not deliver when Discord adapter is not connected"
+    )
+
+
+def test_kanban_notifier_mvp_preserves_existing_terminal_pings(tmp_path, monkeypatch):
+    """Existing explicit subscriptions still deliver all normal event kinds."""
+    db_path = tmp_path / "mvp-preserve.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    tid = _create_completed_subscription()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert "Kanban" in adapter.sent[0]["text"]
+    assert tid in adapter.sent[0]["text"]
+    # Original chat_id is preserved for explicit subscriptions.
+    assert adapter.sent[0]["chat_id"] == "chat-1"

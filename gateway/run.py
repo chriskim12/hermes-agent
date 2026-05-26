@@ -4383,6 +4383,46 @@ class GatewayRunner:
                                     "task": task,
                                     "board": slug,
                                 })
+                            # MVP fallback: when no per-task subscription exists
+                            # for verifier / review_ready events, route them
+                            # to the configured MVP Discord channel so operators
+                            # can see closeout results without setting up a
+                            # subscription per card.
+                            _MVP_CHAT_ID = "1500713192765132912"
+                            if "discord" in active_platforms:
+                                try:
+                                    _kb.ensure_mvp_fallback_sub(
+                                        conn,
+                                        platform="discord",
+                                        chat_id=_MVP_CHAT_ID,
+                                        thread_id="",
+                                    )
+                                except Exception:
+                                    pass
+                                mvp_old, mvp_cur, mvp_events = (
+                                    _kb.claim_unseen_mvp_events(
+                                        conn,
+                                        platform="discord",
+                                        chat_id=_MVP_CHAT_ID,
+                                        thread_id="",
+                                        kinds=("verifier_result", "closeout_transition"),
+                                    )
+                                )
+                                if mvp_events:
+                                    mvp_sub = {
+                                        "task_id": _kb.MVP_FALLBACK_TASK_ID,
+                                        "platform": "discord",
+                                        "chat_id": _MVP_CHAT_ID,
+                                        "thread_id": "",
+                                    }
+                                    deliveries.append({
+                                        "sub": mvp_sub,
+                                        "old_cursor": mvp_old,
+                                        "cursor": mvp_cur,
+                                        "events": mvp_events,
+                                        "task": None,
+                                        "board": slug,
+                                    })
                         finally:
                             conn.close()
                     return deliveries
@@ -4424,6 +4464,10 @@ class GatewayRunner:
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
+                        # Use the event's real task_id for display so that
+                        # MVP fallback messages show the actual task, not the
+                        # sentinel `__mvp_fallback__` subscription id.
+                        display_tid = ev.task_id or sub["task_id"]
                         if kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
@@ -4441,25 +4485,25 @@ class GatewayRunner:
                                 r = task.result.strip().splitlines()[0][:160]
                                 handoff = f"\n{r}"
                             msg = (
-                                f"✔ {tag}Kanban {sub['task_id']} done"
+                                f"✔ {tag}Kanban {display_tid} done"
                                 f" — {title}{handoff}"
                             )
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
+                            msg = f"⏸ {tag}Kanban {display_tid} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
                                 err = f"\n{str(ev.payload['error'])[:200]}"
                             msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} gave up "
+                                f"✖ {tag}Kanban {display_tid} gave up "
                                 f"after repeated spawn failures{err}"
                             )
                         elif kind == "crashed":
                             msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} worker crashed "
+                                f"✖ {tag}Kanban {display_tid} worker crashed "
                                 f"(pid gone); dispatcher will retry"
                             )
                         elif kind == "timed_out":
@@ -4467,7 +4511,7 @@ class GatewayRunner:
                             if ev.payload and ev.payload.get("limit_seconds"):
                                 limit = int(ev.payload["limit_seconds"])
                             msg = (
-                                f"⏱ {tag}Kanban {sub['task_id']} timed out "
+                                f"⏱ {tag}Kanban {display_tid} timed out "
                                 f"(max_runtime={limit}s); will retry"
                             )
                         elif kind == "verifier_result":
@@ -4481,7 +4525,7 @@ class GatewayRunner:
                             suffix = f": {reason[:160]}" if reason else ""
                             if retry:
                                 suffix += f" — {str(retry)[:80]}"
-                            msg = f"🔎 {tag}Kanban {sub['task_id']} verifier {verdict}{suffix}"
+                            msg = f"🔎 {tag}Kanban {display_tid} verifier {verdict}{suffix}"
                         elif kind == "closeout_transition":
                             payload = ev.payload or {}
                             phase = str(payload.get("review_phase") or payload.get("target_phase") or "closeout")
@@ -4500,7 +4544,7 @@ class GatewayRunner:
                             if pr_url:
                                 bits.append(f"PR {str(pr_url)[:120]}")
                             detail = (" — " + "; ".join(bits)) if bits else ""
-                            msg = f"📦 {tag}Kanban {sub['task_id']} {phase}{detail}"
+                            msg = f"📦 {tag}Kanban {display_tid} {phase}{detail}"
                         else:
                             continue
                         metadata: dict[str, Any] = {}

@@ -5834,6 +5834,111 @@ def claim_unseen_events_for_sub(
         return old_cursor, new_cursor, events
 
 
+# ---------------------------------------------------------------------------
+# MVP fallback subscription — used when a tenant/board has no explicit
+# Kanban notification subscriptions for verifier / review_ready events.
+# ---------------------------------------------------------------------------
+
+MVP_FALLBACK_TASK_ID = "__mvp_fallback__"
+
+
+def ensure_mvp_fallback_sub(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: str = "",
+) -> bool:
+    """Ensure an MVP fallback notification subscription exists.
+
+    Returns True if the subscription was created, False if it already
+    existed.  The subscription uses a sentinel ``task_id`` so the notifier
+    can claim cross-task events without a per-task subscription.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM kanban_notify_subs "
+        "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+        (MVP_FALLBACK_TASK_ID, platform, chat_id, thread_id),
+    ).fetchone()
+    if row:
+        return False
+    add_notify_sub(
+        conn,
+        task_id=MVP_FALLBACK_TASK_ID,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+    )
+    return True
+
+
+def claim_unseen_mvp_events(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: str = "",
+    kinds: Optional[Iterable[str]] = None,
+) -> tuple[int, int, list[Event]]:
+    """Atomically claim unseen events for the MVP fallback subscription.
+
+    Returns ``(old_cursor, new_cursor, events)`` using the same contract as
+    :func:`claim_unseen_events_for_sub`, but collects events from **all**
+    tasks that do *not* already have their own per-task subscription.  This
+    prevents the MVP fallback from duplicating notifications that a
+    per-task subscription is already delivering.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT last_event_id FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (MVP_FALLBACK_TASK_ID, platform, chat_id, thread_id),
+        ).fetchone()
+        if row is None:
+            return 0, 0, []
+        old_cursor = int(row["last_event_id"])
+        kind_list = list(kinds) if kinds else []
+        if not kind_list:
+            return old_cursor, old_cursor, []
+        q = (
+            "SELECT e.* FROM task_events e "
+            "WHERE e.id > ? "
+            "AND e.kind IN (" + ",".join("?" * len(kind_list)) + ") "
+            "AND e.task_id NOT IN ("
+            "  SELECT DISTINCT s.task_id FROM kanban_notify_subs s "
+            "  WHERE s.task_id != ?"
+            ") "
+            "ORDER BY e.id ASC"
+        )
+        params: list[Any] = [old_cursor] + kind_list + [MVP_FALLBACK_TASK_ID]
+        rows = conn.execute(q, params).fetchall()
+        out: list[Event] = []
+        max_id = old_cursor
+        for r in rows:
+            try:
+                payload = json.loads(r["payload"]) if r["payload"] else None
+            except Exception:
+                payload = None
+            out.append(Event(
+                id=r["id"],
+                task_id=r["task_id"],
+                kind=r["kind"],
+                payload=payload,
+                created_at=r["created_at"],
+                run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
+            ))
+            max_id = max(max_id, int(r["id"]))
+        if not out:
+            return old_cursor, old_cursor, []
+        conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND last_event_id = ?",
+            (max_id, MVP_FALLBACK_TASK_ID, platform, chat_id, thread_id, old_cursor),
+        )
+        return old_cursor, max_id, out
+
+
 def advance_notify_cursor(
     conn: sqlite3.Connection,
     *,
