@@ -5854,21 +5854,39 @@ def ensure_mvp_fallback_sub(
     Returns True if the subscription was created, False if it already
     existed.  The subscription uses a sentinel ``task_id`` so the notifier
     can claim cross-task events without a per-task subscription.
+
+    This fallback is a live-notification lane, not a historical backfill.
+    When it is first enabled on an existing board, start at the current
+    event cursor so Discord only receives verifier/closeout events created
+    after activation.
     """
-    row = conn.execute(
-        "SELECT 1 FROM kanban_notify_subs "
-        "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-        (MVP_FALLBACK_TASK_ID, platform, chat_id, thread_id),
-    ).fetchone()
-    if row:
-        return False
-    add_notify_sub(
-        conn,
-        task_id=MVP_FALLBACK_TASK_ID,
-        platform=platform,
-        chat_id=chat_id,
-        thread_id=thread_id,
-    )
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT 1 FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (MVP_FALLBACK_TASK_ID, platform, chat_id, thread_id),
+        ).fetchone()
+        if row:
+            return False
+        current_cursor = int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0])
+        now = int(time.time())
+        conn.execute(
+            """
+            INSERT INTO kanban_notify_subs
+                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at, last_event_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                MVP_FALLBACK_TASK_ID,
+                platform,
+                chat_id,
+                thread_id or "",
+                None,
+                None,
+                now,
+                current_cursor,
+            ),
+        )
     return True
 
 

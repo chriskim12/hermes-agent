@@ -321,6 +321,13 @@ def _make_runner_with_discord(adapter):
     return runner
 
 
+def _activate_mvp_fallback(monkeypatch, adapter):
+    """Run one empty notifier tick so MVP fallback starts at the current cursor."""
+    runner = _make_runner_with_discord(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    return runner
+
+
 def test_kanban_notifier_mvp_chat_id_is_correct():
     """MVP destination is explicitly Discord channel 1500713192765132912."""
     # This is a pure documentation test — the constant is embedded in the
@@ -333,15 +340,64 @@ def test_kanban_notifier_mvp_chat_id_is_correct():
     )
 
 
+def test_kanban_notifier_mvp_fallback_starts_at_current_cursor(tmp_path, monkeypatch):
+    """Enabling MVP fallback on an existing board must not backfill old events."""
+    db_path = tmp_path / "mvp-no-backfill.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        old_tid = kb.create_task(conn, title="old closeout", assignee="worker")
+        kb._append_event(
+            conn,
+            old_tid,
+            kind="closeout_transition",
+            payload={"review_phase": "worker_done", "allowed": True},
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner_with_discord(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+
+    conn = kb.connect()
+    try:
+        new_tid = kb.create_task(conn, title="new verifier", assignee="worker")
+        kb._append_event(
+            conn,
+            new_tid,
+            kind="verifier_result",
+            payload={"verdict": "PASS"},
+        )
+    finally:
+        conn.close()
+
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert new_tid in adapter.sent[0]["text"]
+    assert old_tid not in adapter.sent[0]["text"]
+
+
+
 def test_kanban_notifier_mvp_fallback_delivers_verifier_result(tmp_path, monkeypatch):
     """Verifier result events route to MVP Discord channel without per-task sub."""
     db_path = tmp_path / "mvp-verifier.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
 
+    adapter = RecordingAdapter()
+    runner = _activate_mvp_fallback(monkeypatch, adapter)
+    assert adapter.sent == []
+
     conn = kb.connect()
     try:
-        # Create a task with NO per-task subscription.
+        # Create a task with NO per-task subscription after fallback activation.
         tid = kb.create_task(conn, title="orphan task", assignee="worker")
         kb._append_event(
             conn, tid,
@@ -355,8 +411,7 @@ def test_kanban_notifier_mvp_fallback_delivers_verifier_result(tmp_path, monkeyp
     finally:
         conn.close()
 
-    adapter = RecordingAdapter()
-    runner = _make_runner_with_discord(adapter)
+    runner._running = True
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert len(adapter.sent) == 1
@@ -372,6 +427,10 @@ def test_kanban_notifier_mvp_fallback_delivers_closeout_transition(tmp_path, mon
     db_path = tmp_path / "mvp-closeout.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
+
+    adapter = RecordingAdapter()
+    runner = _activate_mvp_fallback(monkeypatch, adapter)
+    assert adapter.sent == []
 
     conn = kb.connect()
     try:
@@ -389,8 +448,7 @@ def test_kanban_notifier_mvp_fallback_delivers_closeout_transition(tmp_path, mon
     finally:
         conn.close()
 
-    adapter = RecordingAdapter()
-    runner = _make_runner_with_discord(adapter)
+    runner._running = True
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert len(adapter.sent) == 1
@@ -406,6 +464,10 @@ def test_kanban_notifier_mvp_does_not_duplicate_per_task_sub(tmp_path, monkeypat
     db_path = tmp_path / "mvp-no-dupe.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
+
+    adapter = RecordingAdapter()
+    runner = _activate_mvp_fallback(monkeypatch, adapter)
+    assert adapter.sent == []
 
     conn = kb.connect()
     try:
@@ -428,8 +490,7 @@ def test_kanban_notifier_mvp_does_not_duplicate_per_task_sub(tmp_path, monkeypat
     finally:
         conn.close()
 
-    adapter = RecordingAdapter()
-    runner = _make_runner_with_discord(adapter)
+    runner._running = True
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     # tid has per-task sub → delivered to "specific-chat"
@@ -452,6 +513,10 @@ def test_kanban_notifier_mvp_fallback_delivers_when_only_non_discord_sub_exists(
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
 
+    adapter = RecordingAdapter()
+    runner = _activate_mvp_fallback(monkeypatch, adapter)
+    assert adapter.sent == []
+
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="telegram-only", assignee="worker")
@@ -465,8 +530,7 @@ def test_kanban_notifier_mvp_fallback_delivers_when_only_non_discord_sub_exists(
     finally:
         conn.close()
 
-    adapter = RecordingAdapter()
-    runner = _make_runner_with_discord(adapter)
+    runner._running = True
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert len(adapter.sent) == 1
@@ -480,6 +544,9 @@ def test_kanban_notifier_mvp_drop_does_not_replay_old_event_after_send_failures(
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
 
+    failing = FailingAdapter()
+    runner = _activate_mvp_fallback(monkeypatch, failing)
+
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="orphan", assignee="worker")
@@ -487,8 +554,6 @@ def test_kanban_notifier_mvp_drop_does_not_replay_old_event_after_send_failures(
     finally:
         conn.close()
 
-    failing = FailingAdapter()
-    runner = _make_runner_with_discord(failing)
     for _ in range(3):
         runner._running = True
         asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
