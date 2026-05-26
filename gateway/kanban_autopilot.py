@@ -370,6 +370,172 @@ def _proof_supports_deterministic_verification(proof: dict[str, Any]) -> bool:
     return False
 
 
+def _normalize_verifier_criterion_results(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    normalized: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        iterable = value.items()
+    elif isinstance(value, list):
+        iterable = enumerate(value, start=1)
+    else:
+        return []
+    for key, raw in iterable:
+        if isinstance(raw, dict):
+            result = dict(raw)
+        else:
+            result = {"status": raw}
+        criterion_id = str(
+            result.get("criterion_id")
+            or result.get("criteria_id")
+            or result.get("id")
+            or result.get("done_criteria_id")
+            or key
+        ).strip()
+        if criterion_id:
+            result["criterion_id"] = criterion_id
+        normalized.append(result)
+    return normalized
+
+
+def _verifier_result_passed(result: dict[str, Any]) -> bool:
+    status = str(result.get("status") or result.get("verdict") or result.get("result") or "").strip().lower()
+    return status in {"pass", "passed", "ok", "success", "satisfied"} or result.get("passed") is True
+
+
+def _verifier_result_failed(result: dict[str, Any]) -> bool:
+    status = str(result.get("status") or result.get("verdict") or result.get("result") or "").strip().lower()
+    return status in {"fail", "failed", "error", "rejected", "unsatisfied"} or result.get("passed") is False
+
+
+def evaluate_verifier_verdict(
+    worker_evidence: dict[str, Any],
+    verifier_evidence: dict[str, Any] | None = None,
+    *,
+    task_body: Any = None,
+    task_spec: Any = None,
+) -> dict[str, Any]:
+    """Build an independent verifier verdict over worker_done evidence.
+
+    The verifier is deliberately a separate contract from worker_done and from
+    review_ready.  It is pure/read-only: no Kanban transition, claim, spawn, PR,
+    merge, release, restart, or provider/customer mutation happens here.
+    """
+
+    verifier_evidence = dict(verifier_evidence or {})
+    source_evidence = dict(worker_evidence)
+    if task_body is not None:
+        source_evidence["task_body"] = task_body
+    if task_spec is not None:
+        source_evidence["task_spec"] = task_spec
+    reason_codes: list[str] = []
+    remediation: list[str] = []
+    blocker_reason_codes = [
+        str(code).strip()
+        for code in (verifier_evidence.get("blocker_reason_codes") or verifier_evidence.get("blockers") or [])
+        if str(code).strip()
+    ]
+    if blocker_reason_codes:
+        return {
+            "verdict": "BLOCKED",
+            "status": "blocked",
+            "reason_codes": blocker_reason_codes,
+            "blocker_reason_codes": blocker_reason_codes,
+            "remediation_instructions": verifier_evidence.get("remediation_instructions") or [],
+            "criterion_results": [],
+            "criteria_ids": [],
+            "criteria_hash": _criteria_hash_from_evidence(source_evidence),
+            "worker_done_evidence": None,
+            "worker_done_retained": source_evidence.get("worker_done") is True or source_evidence.get("kanban_worker_done") is True,
+            "review_ready_input_eligible": False,
+            "human_reason": "Verifier blocked by external or authority reason: " + ", ".join(blocker_reason_codes),
+            "side_effects": {"claimed": 0, "spawned": 0, "mutated": 0},
+        }
+
+    worker_validation = validate_worker_done_evidence(source_evidence, task_body=source_evidence.get("task_body"), task_spec=source_evidence.get("task_spec"))
+    ledger_reason_codes = worker_validation.get("reason_codes") or []
+    refinement_codes = {
+        "missing_done_criteria_ledger",
+        "ambiguous_done_criteria_ledger",
+        "stale_criteria_hash",
+    }
+    if any(code in refinement_codes for code in ledger_reason_codes):
+        selected_codes = [code for code in ledger_reason_codes if code in refinement_codes]
+        return {
+            "verdict": "REFINEMENT_REQUIRED",
+            "status": "refinement_required",
+            "reason_codes": selected_codes,
+            "blocker_reason_codes": [],
+            "remediation_instructions": ["Refine the Done Criteria Ledger and rerun worker evidence against the current criteria_hash."],
+            "criterion_results": [],
+            "criteria_ids": worker_validation.get("criteria_ids") or [],
+            "criteria_hash": worker_validation.get("criteria_hash") or _criteria_hash_from_evidence(source_evidence),
+            "worker_done_evidence": worker_validation,
+            "worker_done_retained": source_evidence.get("worker_done") is True or source_evidence.get("kanban_worker_done") is True,
+            "review_ready_input_eligible": False,
+            "human_reason": "Verifier requires task refinement before implementation evidence can be accepted: " + ", ".join(selected_codes),
+            "side_effects": {"claimed": 0, "spawned": 0, "mutated": 0},
+        }
+
+    worker_identity = str(source_evidence.get("worker_identity") or source_evidence.get("worker") or source_evidence.get("assignee") or "").strip()
+    verifier_identity = str(verifier_evidence.get("verifier_identity") or verifier_evidence.get("verifier") or verifier_evidence.get("reviewer") or "").strip()
+    if not verifier_identity:
+        reason_codes.append("missing_verifier_identity")
+        remediation.append("Provide verifier_identity for the independent verifier run.")
+    if worker_identity and verifier_identity and worker_identity == verifier_identity:
+        reason_codes.append("verifier_same_as_worker")
+        remediation.append("Use a verifier identity distinct from the worker identity.")
+    if not worker_validation.get("worker_done_evidence_valid"):
+        reason_codes.extend(worker_validation.get("reason_codes") or ["invalid_worker_done_evidence"])
+        remediation.append("Remediate worker_done evidence until every Done criterion has artifact-backed proof and required checks.")
+
+    criterion_results = _normalize_verifier_criterion_results(
+        verifier_evidence.get("criterion_results")
+        if verifier_evidence.get("criterion_results") is not None
+        else verifier_evidence.get("criteria_results")
+    )
+    result_by_id = {str(result.get("criterion_id") or "").strip(): result for result in criterion_results if str(result.get("criterion_id") or "").strip()}
+    criteria_ids = list(worker_validation.get("criteria_ids") or [])
+    if not criterion_results:
+        reason_codes.append("missing_verifier_criterion_results")
+        remediation.append("Add verifier criterion_results with PASS/FAIL status and evidence for every Done criterion id.")
+    for criterion_id in criteria_ids:
+        result = result_by_id.get(criterion_id)
+        if result is None:
+            reason_codes.append(f"missing_verifier_result_for_{criterion_id}")
+            remediation.append(f"Verify criterion {criterion_id} and record a criterion-level verdict.")
+            continue
+        evidence_text = str(result.get("evidence") or result.get("proof") or result.get("summary") or "").strip()
+        if not evidence_text:
+            reason_codes.append(f"missing_verifier_evidence_for_{criterion_id}")
+            remediation.append(f"Add verifier evidence/proof text for criterion {criterion_id}.")
+        if _verifier_result_failed(result):
+            reason_codes.append(f"verifier_failed_{criterion_id}")
+            instruction = str(result.get("remediation") or result.get("remediation_instruction") or result.get("action") or "").strip()
+            remediation.append(instruction or f"Remediate failed criterion {criterion_id} and rerun verifier.")
+        elif not _verifier_result_passed(result):
+            reason_codes.append(f"verifier_result_not_pass_for_{criterion_id}")
+            remediation.append(f"Set criterion {criterion_id} to PASS only after verifier evidence proves it.")
+    accepted = not reason_codes
+    deduped_reason_codes = list(dict.fromkeys(reason_codes))
+    deduped_remediation = list(dict.fromkeys(item for item in remediation if str(item).strip()))
+    return {
+        "verdict": "PASS" if accepted else "FAIL",
+        "status": "passed" if accepted else "failed",
+        "reason_codes": deduped_reason_codes,
+        "blocker_reason_codes": [],
+        "remediation_instructions": deduped_remediation,
+        "criterion_results": criterion_results,
+        "criteria_ids": criteria_ids,
+        "criteria_hash": worker_validation.get("criteria_hash"),
+        "worker_done_evidence": worker_validation,
+        "worker_done_retained": source_evidence.get("worker_done") is True or source_evidence.get("kanban_worker_done") is True,
+        "review_ready_input_eligible": accepted,
+        "human_reason": "verifier PASS: all done criteria independently satisfied" if accepted else "verifier FAIL: " + ", ".join(deduped_reason_codes),
+        "side_effects": {"claimed": 0, "spawned": 0, "mutated": 0},
+    }
+
+
 def validate_worker_done_evidence(
     evidence: dict[str, Any],
     task_body: Any = None,
@@ -452,6 +618,293 @@ def validate_worker_done_evidence(
         "worker_done_observed": worker_done_observed,
         "authority_boundary_confirmed": authority_boundary_confirmed is True,
         "cleanup_or_residue_proof": not cleanup_blockers,
+    }
+
+
+_VERIFIER_VERDICTS = ("PASS", "FAIL", "BLOCKED", "REFINEMENT_REQUIRED")
+
+
+def _normalize_identity_value(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip().lower()
+        if text:
+            return text
+    return ""
+
+
+def _worker_identity_from_evidence(evidence: dict[str, Any]) -> str:
+    return _normalize_identity_value(
+        evidence.get("worker_identity"),
+        evidence.get("worker_profile"),
+        evidence.get("worker_actor"),
+        evidence.get("completed_by"),
+        evidence.get("completed_by_profile"),
+        evidence.get("profile"),
+        evidence.get("task_assignee"),
+        evidence.get("assignee"),
+        evidence.get("worker"),
+    )
+
+
+def _verifier_identity_from_evidence(evidence: dict[str, Any], verifier_identity: Any = None) -> str:
+    return _normalize_identity_value(
+        verifier_identity,
+        evidence.get("verifier_identity"),
+        evidence.get("verifier_profile"),
+        evidence.get("verifier_actor"),
+        evidence.get("reviewer"),
+        evidence.get("reviewer_profile"),
+        evidence.get("completed_by_reviewer"),
+    ) or "__independent_verifier__"
+
+
+def _verifier_requirement_flags(criterion_text: str) -> dict[str, bool]:
+    lowered = _normalize_done_criteria_text(criterion_text)
+    return {
+        "deterministic": _criterion_requires_deterministic_verification(criterion_text),
+        "repo_policy": any(token in lowered for token in ("repo-policy", "repo policy", "policy", "policy-check")),
+        "tests": any(token in lowered for token in ("test", "pytest", "check", "verification", "diff")),
+        "pr_package": any(token in lowered for token in ("pr", "package", "review package", "artifact")),
+        "cleanup": any(token in lowered for token in ("cleanup", "worktree", "residue", "clean")),
+        "authority": any(token in lowered for token in ("authority", "boundary", "self-approval", "approval")),
+    }
+
+
+def build_verifier_intake_payload(
+    completed_event: dict[str, Any],
+    task_runs: Any = None,
+    done_criteria_ledger: dict[str, Any] | None = None,
+    *,
+    verifier_identity: Any = None,
+) -> dict[str, Any]:
+    """Normalize the verifier intake from completion event, runs, and the ledger."""
+
+    task_run_snapshot: dict[str, Any] = {}
+    if isinstance(task_runs, dict):
+        task_run_snapshot = dict(task_runs)
+    elif isinstance(task_runs, list) and task_runs:
+        last = task_runs[-1]
+        if isinstance(last, dict):
+            task_run_snapshot = dict(last)
+    elif isinstance(completed_event.get("task_run"), dict):
+        task_run_snapshot = dict(completed_event["task_run"])
+
+    source = dict(completed_event)
+    if done_criteria_ledger is not None:
+        source["done_criteria_ledger"] = done_criteria_ledger
+    if task_run_snapshot:
+        source["task_run"] = task_run_snapshot
+    ledger_validation = _done_criteria_validation_for_evidence(source)
+    worker_identity = _worker_identity_from_evidence({**completed_event, **task_run_snapshot})
+    verifier_identity_norm = _verifier_identity_from_evidence({**completed_event, **task_run_snapshot}, verifier_identity=verifier_identity)
+    return {
+        "completed_event": dict(completed_event),
+        "task_run": task_run_snapshot,
+        "task_runs": task_runs if isinstance(task_runs, list) else ([task_runs] if isinstance(task_runs, dict) else ([] if task_runs is None else task_runs)),
+        "done_criteria_ledger": ledger_validation.get("done_criteria_ledger"),
+        "criteria_hash": ledger_validation.get("criteria_hash"),
+        "criteria_version": ledger_validation.get("criteria_version"),
+        "criteria_ids": ledger_validation.get("criteria_ids") or [],
+        "worker_identity": worker_identity,
+        "verifier_identity": verifier_identity_norm,
+        "task_body": completed_event.get("task_body") or completed_event.get("body"),
+        "task_spec": completed_event.get("task_spec") or completed_event.get("spec"),
+    }
+
+
+def evaluate_verifier_result(
+    evidence: dict[str, Any],
+    task_runs: Any = None,
+    done_criteria_ledger: dict[str, Any] | None = None,
+    *,
+    verifier_identity: Any = None,
+    task_body: Any = None,
+    task_spec: Any = None,
+) -> dict[str, Any]:
+    """Evaluate an independent verifier result for worker completion evidence."""
+
+    completed_event = dict(evidence)
+    if task_body is not None:
+        completed_event["task_body"] = task_body
+    if task_spec is not None:
+        completed_event["task_spec"] = task_spec
+    intake = build_verifier_intake_payload(
+        completed_event,
+        task_runs=task_runs if task_runs is not None else evidence.get("task_runs"),
+        done_criteria_ledger=done_criteria_ledger or evidence.get("done_criteria_ledger"),
+        verifier_identity=verifier_identity,
+    )
+    worker_identity = intake["worker_identity"]
+    verifier_identity_norm = intake["verifier_identity"]
+    worker_validation = validate_worker_done_evidence(
+        {**completed_event, "task_body": intake.get("task_body"), "task_spec": intake.get("task_spec")},
+        task_body=intake.get("task_body"),
+        task_spec=intake.get("task_spec"),
+    )
+    ledger_validation = _done_criteria_validation_for_evidence({
+        **completed_event,
+        "task_body": intake.get("task_body"),
+        "task_spec": intake.get("task_spec"),
+        "done_criteria_ledger": intake.get("done_criteria_ledger"),
+        "criteria_hash": intake.get("criteria_hash"),
+    })
+    criteria = list((ledger_validation.get("done_criteria_ledger") or {}).get("criteria") or [])
+    criterion_proofs = _normalize_worker_criterion_proofs(completed_event)
+    proof_by_id: dict[str, dict[str, Any]] = {}
+    for proof in criterion_proofs:
+        proof_id = str(proof.get("criterion_id") or "").strip()
+        if proof_id:
+            proof_by_id[proof_id] = proof
+    same_worker = bool(worker_identity and verifier_identity_norm and worker_identity == verifier_identity_norm)
+    criterion_results: list[dict[str, Any]] = []
+    for criterion in criteria:
+        criterion_id = str(criterion.get("id") or "").strip() or "unknown"
+        criterion_text = str(criterion.get("text") or "").strip()
+        proof = proof_by_id.get(criterion_id)
+        row_reason_codes: list[str] = []
+        remediation: list[str] = []
+        checks: list[dict[str, Any]] = []
+        row_verdict = "PASS"
+        if same_worker:
+            row_verdict = "BLOCKED"
+            row_reason_codes.append("self_approval_prohibited")
+            remediation.append("Use a distinct verifier identity; a worker cannot self-approve review readiness.")
+        else:
+            if proof is None:
+                row_verdict = "FAIL"
+                row_reason_codes.append(f"missing_proof_for_{criterion_id}")
+                remediation.append("Attach criterion-level proof and artifact references.")
+            else:
+                proof_text = str(proof.get("proof") or proof.get("evidence") or proof.get("summary") or proof.get("result") or "").strip()
+                if not proof_text:
+                    row_verdict = "FAIL"
+                    row_reason_codes.append(f"missing_proof_text_for_{criterion_id}")
+                    remediation.append("Write an explicit proof summary for this criterion.")
+                artifact_refs = _normalize_artifact_refs(proof.get("artifact_refs") or proof.get("artifact_ref") or proof.get("artifacts"))
+                if not artifact_refs:
+                    row_verdict = "FAIL"
+                    row_reason_codes.append(f"missing_artifact_refs_for_{criterion_id}")
+                    remediation.append("Attach artifact references that back the proof.")
+                requirements = _verifier_requirement_flags(criterion_text)
+                if requirements["deterministic"]:
+                    supported = _proof_supports_deterministic_verification(proof)
+                    checks.append({"name": "deterministic_verification", "required": True, "passed": supported})
+                    if not supported:
+                        row_verdict = "FAIL"
+                        row_reason_codes.append(f"missing_tests_or_checks_for_{criterion_id}")
+                        remediation.append("Add test or check evidence for this deterministic criterion.")
+                if requirements["repo_policy"]:
+                    repo_policy = completed_event.get("repo_policy")
+                    policy_ok = isinstance(repo_policy, dict) and repo_policy.get("ok") is True
+                    checks.append({"name": "repo_policy", "required": True, "passed": policy_ok})
+                    if not policy_ok:
+                        row_verdict = "FAIL"
+                        row_reason_codes.append("missing_repo_policy_evidence")
+                        remediation.append("Attach the repo-policy check result or policy snapshot.")
+                if requirements["tests"]:
+                    tests_passed = bool(proof.get("tests_passed") is True or proof.get("checks_passed") is True)
+                    checks.append({"name": "tests_or_checks", "required": True, "passed": tests_passed})
+                    if not tests_passed:
+                        row_verdict = "FAIL"
+                        row_reason_codes.append(f"missing_tests_or_checks_for_{criterion_id}")
+                        remediation.append("Record passing tests or deterministic checks for this criterion.")
+                if requirements["pr_package"]:
+                    pr_or_package = any(
+                        str(completed_event.get(field) or "").strip()
+                        for field in ("pr_url", "package_url", "package", "artifact_package")
+                    )
+                    checks.append({"name": "pr_or_package_evidence", "required": True, "passed": pr_or_package})
+                    if not pr_or_package:
+                        row_verdict = "FAIL"
+                        row_reason_codes.append("missing_pr_or_package_evidence")
+                        remediation.append("Provide PR/package evidence for this criterion.")
+                if requirements["cleanup"]:
+                    cleanup_blockers = _worktree_cleanup_blockers(completed_event)
+                    checks.append({"name": "cleanup_proof", "required": True, "passed": not cleanup_blockers})
+                    if cleanup_blockers:
+                        row_verdict = "BLOCKED"
+                        row_reason_codes.extend(cleanup_blockers)
+                        remediation.append("Provide cleanup proof or a retained-residue justification with TTL and reason.")
+                if requirements["authority"]:
+                    authority_ok = completed_event.get("authority_boundary_confirmed") is True or completed_event.get("boundaries_confirmed") is True
+                    checks.append({"name": "authority_boundary", "required": True, "passed": authority_ok})
+                    if not authority_ok:
+                        row_verdict = "BLOCKED"
+                        row_reason_codes.append("missing_authority_boundary_confirmation")
+                        remediation.append("Confirm the authority boundary before review-ready approval.")
+        criterion_results.append({
+            "criterion_id": criterion_id,
+            "criterion_text": criterion_text,
+            "verdict": row_verdict,
+            "reason_codes": list(dict.fromkeys(row_reason_codes)),
+            "remediation": remediation,
+            "checks": checks,
+            "evidence": {
+                "proof_present": proof is not None,
+                "proof_text_present": bool(str((proof or {}).get("proof") or (proof or {}).get("evidence") or (proof or {}).get("summary") or (proof or {}).get("result") or "").strip()),
+                "artifact_refs": _normalize_artifact_refs((proof or {}).get("artifact_refs") or (proof or {}).get("artifact_ref") or (proof or {}).get("artifacts")),
+            },
+        })
+    if same_worker and "self_approval_prohibited" not in worker_validation.get("reason_codes", []):
+        reason_codes = ["self_approval_prohibited"]
+    else:
+        reason_codes = list(dict.fromkeys(worker_validation.get("reason_codes") or []))
+    if not ledger_validation.get("ok"):
+        reason_codes.extend(ledger_validation.get("reason_codes") or ["invalid_done_criteria_ledger"])
+    verdict = "PASS"
+    if same_worker or any(row["verdict"] == "BLOCKED" for row in criterion_results):
+        verdict = "BLOCKED"
+    elif not ledger_validation.get("ok") or any(code in {"missing_done_criteria_ledger", "ambiguous_done_criteria_ledger", "stale_criteria_hash"} for code in reason_codes):
+        verdict = "REFINEMENT_REQUIRED"
+    elif reason_codes or any(row["verdict"] == "FAIL" for row in criterion_results):
+        verdict = "FAIL"
+    if not criteria and ledger_validation.get("ok"):
+        criterion_results.append({
+            "criterion_id": "__done_criteria__",
+            "criterion_text": "done criteria ledger",
+            "verdict": verdict,
+            "reason_codes": reason_codes[:],
+            "remediation": [],
+            "checks": [],
+            "evidence": {"proof_present": False, "proof_text_present": False, "artifact_refs": []},
+        })
+    verdict_reason_codes = list(dict.fromkeys(reason_codes + [code for row in criterion_results for code in row["reason_codes"]]))
+    if verdict == "PASS":
+        human_reason = "verifier result satisfied"
+    elif verdict == "REFINEMENT_REQUIRED":
+        human_reason = "Verifier needs a clearer or fresher done criteria ledger: " + ", ".join(verdict_reason_codes)
+    elif verdict == "BLOCKED":
+        human_reason = "Verifier blocked by authority/self-approval or cleanup issues: " + ", ".join(verdict_reason_codes)
+    else:
+        human_reason = "Verifier found fixable evidence gaps: " + ", ".join(verdict_reason_codes)
+    storage_payload = {
+        "verdict": verdict,
+        "reason_codes": verdict_reason_codes,
+        "worker_identity": worker_identity or None,
+        "verifier_identity": verifier_identity_norm,
+        "criteria_hash": intake.get("criteria_hash"),
+        "criteria_ids": intake.get("criteria_ids") or [],
+        "criterion_results": criterion_results,
+        "review_ready": verdict == "PASS",
+    }
+    return {
+        "verifier_result_valid": verdict == "PASS",
+        "review_ready": verdict == "PASS",
+        "verdict": verdict,
+        "status": verdict.lower(),
+        "reason_codes": verdict_reason_codes,
+        "human_reason": human_reason,
+        "worker_identity": worker_identity or None,
+        "verifier_identity": verifier_identity_norm,
+        "criteria_hash": intake.get("criteria_hash"),
+        "criteria_version": intake.get("criteria_version"),
+        "criteria_ids": intake.get("criteria_ids") or [],
+        "done_criteria_ledger": intake.get("done_criteria_ledger"),
+        "criterion_results": criterion_results,
+        "completed_event": intake.get("completed_event"),
+        "task_run": intake.get("task_run"),
+        "task_runs": intake.get("task_runs") if isinstance(intake.get("task_runs"), list) else [],
+        "kanban_ssot": {"task_runs": {"metadata": {"verifier_result": storage_payload}}},
     }
 
 
@@ -1538,6 +1991,19 @@ def evaluate_review_ready_contract(
             task_spec=evidence.get("task_spec") or evidence.get("spec"),
         )
         reason_codes.extend(worker_done_evidence.get("reason_codes") or [])
+    verifier_result = evidence.get("verifier_result")
+    if not isinstance(verifier_result, dict) or not verifier_result.get("verdict"):
+        verifier_result = evaluate_verifier_result(
+            evidence,
+            task_runs=evidence.get("task_runs"),
+            done_criteria_ledger=done_criteria.get("done_criteria_ledger"),
+            verifier_identity=evidence.get("verifier_identity") or evidence.get("reviewer_profile") or evidence.get("reviewer") or "__independent_verifier__",
+            task_body=evidence.get("task_body"),
+            task_spec=evidence.get("task_spec") or evidence.get("spec"),
+        )
+    if verifier_result.get("verdict") != "PASS":
+        reason_codes.append("verifier_not_pass")
+        reason_codes.extend(verifier_result.get("reason_codes") or [])
     if _evidence_uses_task_worktree(evidence):
         reason_codes.extend(_worktree_cleanup_blockers(evidence))
     commit = str(required["commit"] or "").strip()
@@ -1561,19 +2027,21 @@ def evaluate_review_ready_contract(
     pr_base = str(required["pr_base"] or "").strip().lower()
     if pr_base in _RELEASE_ONLY_BASES:
         reason_codes.append("release_base_requires_separate_approval")
+    review_ready = not reason_codes and verifier_result.get("verdict") == "PASS"
     return {
-        "review_ready": not reason_codes,
-        "status": "review_ready" if not reason_codes else "blocked",
-        "reason_codes": reason_codes,
+        "review_ready": review_ready,
+        "status": "review_ready" if review_ready else "blocked",
+        "reason_codes": list(dict.fromkeys(reason_codes)),
         "done_criteria_ledger": done_criteria.get("done_criteria_ledger"),
         "criteria_hash": done_criteria.get("criteria_hash"),
         "criteria_version": done_criteria.get("criteria_version"),
         "worker_done_evidence": worker_done_evidence,
+        "verifier_result": verifier_result,
         "merge_allowed": False,
         "release_allowed": False,
         "prod_customer_visible_allowed": False,
         "gateway_restart_reload_allowed": False,
-        "human_reason": "review-ready PR contract satisfied; merge/release still forbidden" if not reason_codes else "Review-ready PR contract missing or unsafe: " + ", ".join(reason_codes),
+        "human_reason": "review-ready PR contract satisfied; merge/release still forbidden" if review_ready else "Review-ready PR contract missing or unsafe: " + ", ".join(list(dict.fromkeys(reason_codes))),
     }
 
 
