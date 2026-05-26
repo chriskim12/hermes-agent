@@ -113,6 +113,40 @@ def test_worker_done_transition_from_triage_repairs_execution_status(kanban_home
     assert task.status == "blocked"
 
 
+def test_review_ready_block_records_verifier_result_event(kanban_home):
+    """A failed closeout verifier should leave a first-class auditable event."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="needs verifier",
+            closeout_evidence={"evidence_status": "not_started"},
+        )
+        closeout.transition_task_closeout(
+            conn,
+            task_id,
+            "worker_done",
+            {"summary": "worker submitted evidence"},
+        )
+
+        result = closeout.transition_task_closeout(
+            conn,
+            task_id,
+            "review_ready",
+            {"summary": "missing verifier and review package"},
+        )
+        events = kb.list_events(conn, task_id)
+
+    assert result["status"] == "blocked"
+    verifier_events = [ev for ev in events if ev.kind == "verifier_result"]
+    assert verifier_events, "blocked verifier decisions must be visible in Kanban events"
+    payload = verifier_events[-1].payload
+    assert payload is not None
+    assert payload["target_phase"] == "review_ready"
+    assert payload["verdict"] in {"FAIL", "BLOCKED"}
+    assert "missing_verifier_pass" in payload["reason_codes"]
+    assert payload["review_ready_input_eligible"] is False
+
+
 def test_complete_task_cannot_bypass_review_ready_to_done(kanban_home, git_repo):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="review package", workspace_kind="dir", workspace_path=str(git_repo))

@@ -4250,7 +4250,15 @@ class GatewayRunner:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        TERMINAL_KINDS = (
+            "completed",
+            "blocked",
+            "gave_up",
+            "crashed",
+            "timed_out",
+            "verifier_result",
+            "closeout_transition",
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -4375,6 +4383,46 @@ class GatewayRunner:
                                     "task": task,
                                     "board": slug,
                                 })
+                            # MVP fallback: when no per-task subscription exists
+                            # for verifier / review_ready events, route them
+                            # to the configured MVP Discord channel so operators
+                            # can see closeout results without setting up a
+                            # subscription per card.
+                            _MVP_CHAT_ID = "1500713192765132912"
+                            if "discord" in active_platforms:
+                                try:
+                                    _kb.ensure_mvp_fallback_sub(
+                                        conn,
+                                        platform="discord",
+                                        chat_id=_MVP_CHAT_ID,
+                                        thread_id="",
+                                    )
+                                except Exception:
+                                    pass
+                                mvp_old, mvp_cur, mvp_events = (
+                                    _kb.claim_unseen_mvp_events(
+                                        conn,
+                                        platform="discord",
+                                        chat_id=_MVP_CHAT_ID,
+                                        thread_id="",
+                                        kinds=("verifier_result", "closeout_transition"),
+                                    )
+                                )
+                                if mvp_events:
+                                    mvp_sub = {
+                                        "task_id": _kb.MVP_FALLBACK_TASK_ID,
+                                        "platform": "discord",
+                                        "chat_id": _MVP_CHAT_ID,
+                                        "thread_id": "",
+                                    }
+                                    deliveries.append({
+                                        "sub": mvp_sub,
+                                        "old_cursor": mvp_old,
+                                        "cursor": mvp_cur,
+                                        "events": mvp_events,
+                                        "task": None,
+                                        "board": slug,
+                                    })
                         finally:
                             conn.close()
                     return deliveries
@@ -4416,6 +4464,10 @@ class GatewayRunner:
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
+                        # Use the event's real task_id for display so that
+                        # MVP fallback messages show the actual task, not the
+                        # sentinel `__mvp_fallback__` subscription id.
+                        display_tid = ev.task_id or sub["task_id"]
                         if kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
@@ -4433,25 +4485,25 @@ class GatewayRunner:
                                 r = task.result.strip().splitlines()[0][:160]
                                 handoff = f"\n{r}"
                             msg = (
-                                f"✔ {tag}Kanban {sub['task_id']} done"
+                                f"✔ {tag}Kanban {display_tid} done"
                                 f" — {title}{handoff}"
                             )
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
+                            msg = f"⏸ {tag}Kanban {display_tid} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
                                 err = f"\n{str(ev.payload['error'])[:200]}"
                             msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} gave up "
+                                f"✖ {tag}Kanban {display_tid} gave up "
                                 f"after repeated spawn failures{err}"
                             )
                         elif kind == "crashed":
                             msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} worker crashed "
+                                f"✖ {tag}Kanban {display_tid} worker crashed "
                                 f"(pid gone); dispatcher will retry"
                             )
                         elif kind == "timed_out":
@@ -4459,9 +4511,40 @@ class GatewayRunner:
                             if ev.payload and ev.payload.get("limit_seconds"):
                                 limit = int(ev.payload["limit_seconds"])
                             msg = (
-                                f"⏱ {tag}Kanban {sub['task_id']} timed out "
+                                f"⏱ {tag}Kanban {display_tid} timed out "
                                 f"(max_runtime={limit}s); will retry"
                             )
+                        elif kind == "verifier_result":
+                            payload = ev.payload or {}
+                            verdict = str(payload.get("verdict") or payload.get("status") or "UNKNOWN").upper()
+                            retry = payload.get("retry_decision") or payload.get("next_state") or payload.get("action") or ""
+                            reason_codes = payload.get("reason_codes") or payload.get("blockers") or []
+                            if isinstance(reason_codes, str):
+                                reason_codes = [reason_codes]
+                            reason = ", ".join(str(code) for code in list(reason_codes)[:3])
+                            suffix = f": {reason[:160]}" if reason else ""
+                            if retry:
+                                suffix += f" — {str(retry)[:80]}"
+                            msg = f"🔎 {tag}Kanban {display_tid} verifier {verdict}{suffix}"
+                        elif kind == "closeout_transition":
+                            payload = ev.payload or {}
+                            phase = str(payload.get("review_phase") or payload.get("target_phase") or "closeout")
+                            allowed = payload.get("allowed")
+                            pr = payload.get("pr") if isinstance(payload.get("pr"), dict) else {}
+                            pr_url = pr.get("url") if isinstance(pr, dict) else None
+                            verifier = payload.get("verifier_verdict") if isinstance(payload.get("verifier_verdict"), dict) else {}
+                            verdict = None
+                            if isinstance(verifier, dict):
+                                verdict = verifier.get("verdict") or verifier.get("status")
+                            bits = []
+                            if allowed is not None:
+                                bits.append("allowed" if allowed else "blocked")
+                            if verdict:
+                                bits.append(str(verdict).upper())
+                            if pr_url:
+                                bits.append(f"PR {str(pr_url)[:120]}")
+                            detail = (" — " + "; ".join(bits)) if bits else ""
+                            msg = f"📦 {tag}Kanban {display_tid} {phase}{detail}"
                         else:
                             continue
                         metadata: dict[str, Any] = {}
@@ -4518,10 +4601,23 @@ class GatewayRunner:
                                     "kanban notifier: dropping subscription "
                                     "%s on %s after %d consecutive send failures",
                                     sub["task_id"], platform_str, fails,
+                                    MAX_SEND_FAILURES,
                                 )
-                                await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
-                                sub_fail_counts.pop(sub_key, None)
+                                mvp_task_id = getattr(_kb, "MVP_FALLBACK_TASK_ID", "__mvp_fallback__")
+                                if sub.get("task_id") == mvp_task_id:
+                                    # The MVP fallback row is re-ensured every tick. Deleting it
+                                    # would recreate it with cursor 0 and replay old verifier /
+                                    # closeout events. Keep the already-advanced cursor and drop
+                                    # only the failed batch.
+                                    sub_fail_counts.pop(sub_key, None)
+                                else:
+                                    await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+                                    sub_fail_counts.pop(sub_key, None)
                             else:
+                                # Rewind the pre-send claim on transient failure so a later
+                                # tick can retry. After too many failures, dropping the
+                                # subscription is the terminal action for explicit subs; the
+                                # MVP fallback keeps its cursor to avoid replay-from-zero loops.
                                 await asyncio.to_thread(
                                     self._kanban_rewind,
                                     sub,
@@ -4529,9 +4625,6 @@ class GatewayRunner:
                                     d.get("old_cursor", 0),
                                     board_slug,
                                 )
-                            # Rewind the pre-send claim on transient failure so
-                            # a later tick can retry. After too many failures,
-                            # dropping the subscription is the terminal action.
                             break
                     else:
                         # All events delivered; advance cursor. The cursor

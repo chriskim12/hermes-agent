@@ -650,6 +650,27 @@ def transition_task_closeout(
         live_pr_provider=live_pr_provider,
     )
     if not verification.allowed:
+        try:
+            with kb.write_txn(conn):
+                kb._append_event(
+                    conn,
+                    task_id,
+                    "verifier_result",
+                    {
+                        "target_phase": verification.target_phase,
+                        "verdict": "FAIL" if verification.blockers else "BLOCKED",
+                        "reason": verification.reason,
+                        "reason_codes": list(verification.blockers),
+                        "blockers": list(verification.blockers),
+                        "review_ready_input_eligible": False,
+                        "allowed": False,
+                    },
+                )
+        except Exception:
+            # Closeout verification must remain fail-closed even if the
+            # observability event cannot be written. The caller still receives
+            # the blocked verifier result below.
+            pass
         return {
             "status": "blocked",
             "reason": verification.reason,
