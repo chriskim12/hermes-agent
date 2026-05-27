@@ -79,3 +79,15 @@ class TestStripLeakedTerminalResponses:
     def test_does_not_strip_regular_angle_bracket_text(self):
         text = "render <div class='hero'> literal"
         assert _strip_leaked_terminal_responses(text) == text
+
+    def test_strips_osc11_background_response_esc_form(self):
+        text = "before\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\after"
+        assert _strip_leaked_terminal_responses(text) == "beforeafter"
+
+    def test_strips_osc11_background_response_visible_form(self):
+        text = "]11;rgb:1e1e/1e1e/1e1e"
+        assert _strip_leaked_terminal_responses(text) == ""
+
+    def test_strips_osc11_background_response_visible_form_inside_text(self):
+        text = "typed]11;rgb:ffff/ffff/ffffmore"
+        assert _strip_leaked_terminal_responses(text) == "typedmore"
