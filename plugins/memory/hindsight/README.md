@@ -32,6 +32,24 @@ Hermes spins up a local Hindsight daemon with built-in PostgreSQL. Requires an L
 
 Supports any OpenAI-compatible LLM endpoint (llama.cpp, vLLM, LM Studio, etc.) — pick `openai_compatible` as the provider and enter the base URL.
 
+#### Codex OAuth via local OpenAI-compatible bridge
+
+If you want Hindsight to use Hermes's ChatGPT/Codex OAuth session instead of a provider API key, run the loopback bridge and point Hindsight at it as an OpenAI-compatible endpoint:
+
+```bash
+python -m hermes_cli.hindsight_codex_bridge --host 127.0.0.1 --port 8787
+```
+
+Then configure local embedded mode with:
+
+```bash
+HINDSIGHT_API_LLM_PROVIDER=openai
+HINDSIGHT_API_LLM_BASE_URL=http://127.0.0.1:8787/v1
+HINDSIGHT_API_LLM_API_KEY=<local dummy/shared secret>
+```
+
+The bridge keeps raw OAuth tokens inside Hermes's Codex credential resolver and exposes only non-streaming `/v1/chat/completions` for the Hindsight daemon. Use `HERMES_HINDSIGHT_CODEX_MODEL` if the Hindsight-requested model name should be overridden before sending requests to the Codex backend.
+
 Daemon startup logs: `~/.hermes/logs/hindsight-embed.log`
 Daemon runtime logs: `~/.hindsight/profiles/<profile>.log`
 
