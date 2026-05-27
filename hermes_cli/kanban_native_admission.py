@@ -78,6 +78,15 @@ def native_idempotency_key(public_id: str) -> str:
     return f"{NATIVE_IDEMPOTENCY_PREFIX}{normalize_public_id(public_id)}"
 
 
+def _clean_optional(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _clean_required(value: Any) -> str:
+    return str(value or "").strip()
+
+
 def namespace_admission_blocker(conn: Any, namespace: str) -> Optional[dict[str, str]]:
     """Return a fail-closed blocker when a native namespace is not approved.
 
@@ -331,7 +340,7 @@ def build_native_body(req: NativeAdmissionRequest, public_id: str, idempotency_k
         "source": "kanban_native",
         "public_id": public_id,
         "idempotency_key": idempotency_key,
-        "tenant": req.tenant.strip(),
+        "tenant": _clean_required(req.tenant),
         "legacy_refs": [],
         "admission": {
             "mode": "native_dry_run_or_triage_admission",
@@ -340,24 +349,24 @@ def build_native_body(req: NativeAdmissionRequest, public_id: str, idempotency_k
             "approval_boundary": req.approval_boundary,
         },
         "repo_intent": {
-            "repo_full_name": req.repo_full_name.strip(),
-            "base_branch": (req.base_branch or "").strip() or None,
-            "worktree_branch": (req.worktree_branch or "").strip() or None,
+            "repo_full_name": _clean_optional(req.repo_full_name),
+            "base_branch": _clean_optional(req.base_branch),
+            "worktree_branch": _clean_optional(req.worktree_branch),
             "workspace_kind": req.workspace_kind,
             "workspace_path": req.workspace_path,
         },
         "execution_hints": {
-            "executor": req.executor.strip(),
-            "profile": req.profile.strip(),
+            "executor": _clean_required(req.executor),
+            "profile": _clean_required(req.profile),
             "skills": list(req.skills),
         },
         "routing": {
-            "verdict": req.executor.strip(),
+            "verdict": _clean_required(req.executor),
             "reason": "native admission captures requested executor; dispatch remains forbidden until live preflight",
             "approval_boundary": req.approval_boundary,
         },
         "closeout": {
-            "policy": req.closeout_policy.strip(),
+            "policy": _clean_required(req.closeout_policy),
             "worker_done_review_ready_closed_are_distinct": True,
         },
         "parents": list(req.parents),
@@ -410,9 +419,9 @@ def build_native_admission_payload(
         "task_id": existing_id,
         "created": False,
         "task": {
-            "title": f"{public_id} — {req.title.strip()}",
+            "title": f"{public_id} — {_clean_required(req.title)}",
             "body": body,
-            "tenant": req.tenant.strip() or None,
+            "tenant": _clean_required(req.tenant) or None,
             "public_id": public_id,
             "idempotency_key": idempotency_key,
             "workspace_kind": req.workspace_kind,
@@ -424,19 +433,19 @@ def build_native_admission_payload(
             "skills": list(req.skills),
         },
         "repo_intent": {
-            "repo_full_name": req.repo_full_name.strip() or None,
-            "base_branch": (req.base_branch or "").strip() or None,
-            "worktree_branch": (req.worktree_branch or "").strip() or None,
+            "repo_full_name": _clean_optional(req.repo_full_name) or None,
+            "base_branch": _clean_optional(req.base_branch),
+            "worktree_branch": _clean_optional(req.worktree_branch),
         },
         "execution_hints": {
-            "executor": req.executor.strip() or None,
-            "profile": req.profile.strip() or None,
+            "executor": _clean_required(req.executor) or None,
+            "profile": _clean_required(req.profile) or None,
             "skills": list(req.skills),
         },
         "authority": {
             "review_phase": None,
             "routing_verdict": {
-                "verdict": "Hermes direct" if req.executor.strip() == "hermes-direct" else "blocked",
+                "verdict": "Hermes direct" if _clean_required(req.executor) == "hermes-direct" else "blocked",
                 "reason": "native admission records routing intent only; executor dispatch is forbidden during admission",
                 "boundary": req.approval_boundary,
             },
@@ -445,15 +454,15 @@ def build_native_admission_payload(
                 "linear_required": False,
                 "public_id": public_id,
                 "idempotency_key": idempotency_key,
-                "tenant": req.tenant.strip() or None,
-                "repo_full_name": req.repo_full_name.strip() or None,
-                "profile": req.profile.strip() or None,
-                "executor": req.executor.strip() or None,
-                "closeout_policy": req.closeout_policy.strip() or None,
+                "tenant": _clean_required(req.tenant) or None,
+                "repo_full_name": _clean_optional(req.repo_full_name) or None,
+                "profile": _clean_required(req.profile) or None,
+                "executor": _clean_required(req.executor) or None,
+                "closeout_policy": _clean_required(req.closeout_policy) or None,
                 "executor_dispatch": "forbidden_during_admission",
             },
             "closeout_evidence": {
-                "policy": req.closeout_policy.strip() or None,
+                "policy": _clean_required(req.closeout_policy) or None,
                 "worker_done_review_ready_closed_are_distinct": True,
                 "evidence_status": "not_started",
             },
