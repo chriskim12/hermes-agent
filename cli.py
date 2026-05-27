@@ -2451,6 +2451,8 @@ def _apply_bracketed_paste_timeout_patch() -> None:
 # that appears when the ESC byte was stripped by a prior filter.
 _DSR_CPR_ESC_RE = re.compile(r"\x1b\[\d+;\d+R")
 _DSR_CPR_VISIBLE_RE = re.compile(r"\^\[\[\d+;\d+R")
+_OSC11_ESC_RE = re.compile(r"\x1b\]11;rgb:[0-9a-fA-F]+/[0-9a-fA-F]+/[0-9a-fA-F]+(?:\x1b\\|\x07)?")
+_OSC11_VISIBLE_RE = re.compile(r"\]11;rgb:[0-9a-fA-F]+/[0-9a-fA-F]+/[0-9a-fA-F]+")
 _SGR_MOUSE_ESC_RE = re.compile(r"\x1b\[<\d+;\d+;\d+[Mm]")
 _SGR_MOUSE_VISIBLE_RE = re.compile(r"\^\[\[<\d+;\d+;\d+[Mm]")
 # Some terminals/filters can drop ESC and literal "^[[", leaving only
@@ -2549,8 +2551,8 @@ def _strip_leaked_terminal_responses_with_meta(text: str) -> tuple[str, bool]:
     if not text:
         return text, False
 
-    has_esc = "\x1b[" in text
-    has_visible = "^[" in text
+    has_esc = "\x1b[" in text or "\x1b]" in text
+    has_visible = "^[" in text or "]11;rgb:" in text
     has_bare_mouse = "<" in text and ";" in text and ("M" in text or "m" in text)
     if not (has_esc or has_visible or has_bare_mouse):
         return text, False
@@ -2559,11 +2561,13 @@ def _strip_leaked_terminal_responses_with_meta(text: str) -> tuple[str, bool]:
 
     if has_esc:
         text = _DSR_CPR_ESC_RE.sub("", text)
+        text = _OSC11_ESC_RE.sub("", text)
         text, count = _SGR_MOUSE_ESC_RE.subn("", text)
         had_mouse_reports = had_mouse_reports or count > 0
 
     if has_visible:
         text = _DSR_CPR_VISIBLE_RE.sub("", text)
+        text = _OSC11_VISIBLE_RE.sub("", text)
         text, count = _SGR_MOUSE_VISIBLE_RE.subn("", text)
         had_mouse_reports = had_mouse_reports or count > 0
 
