@@ -149,6 +149,16 @@ class TestSecretsSourceWiring:
         assert args.force is True
         assert callable(args.func)
 
+    def test_bitwarden_refresh_is_canonical_source_fetch_name(self):
+        args = self._parse("source", "bitwarden", "refresh")
+        assert args.secrets_bw_command == "refresh"
+        assert callable(args.func)
+
+    def test_bitwarden_sync_remains_upstream_compat_alias(self):
+        args = self._parse("source", "bitwarden", "sync")
+        assert args.secrets_bw_command == "sync"
+        assert callable(args.func)
+
 
 class TestSecretsCheck:
     def test_check_passes_with_matching_sidecar(self, temp_home, manifest_path, env_path, sidecar_path):
