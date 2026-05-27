@@ -175,14 +175,19 @@ class TestBuildPersistedMessage:
             has_more=True,
             original_size=50_000,
             file_path="/tmp/hermes-results/test123.txt",
+            summary="status=ok; exit_code=0; output=1,234 chars",
+            exit_code=0,
+            snippets=["first 100 chars...", "last 100 chars..."],
         )
         assert msg.startswith(PERSISTED_OUTPUT_TAG)
         assert msg.endswith(PERSISTED_OUTPUT_CLOSING_TAG)
         assert "50,000 characters" in msg
+        assert "Execution summary:" in msg
+        assert "Exit code: 0" in msg
         assert "/tmp/hermes-results/test123.txt" in msg
         assert "read_file" in msg
+        assert "Relevant snippets:" in msg
         assert "first 100 chars..." in msg
-        assert "..." in msg  # has_more indicator
 
     def test_no_ellipsis_when_complete(self):
         msg = _build_persisted_message(
@@ -250,6 +255,9 @@ class TestMaybePersistToolResult:
             threshold=30_000,
         )
         assert PERSISTED_OUTPUT_TAG in result
+        assert "Execution summary:" in result
+        assert "Exit code: 0" in result
+        assert "tc_json.txt" in result
         # Content is delivered through stdin (no longer embedded in the
         # command string — see test_large_content_via_stdin for why).
         assert env.execute.call_args[1]["stdin_data"] == content

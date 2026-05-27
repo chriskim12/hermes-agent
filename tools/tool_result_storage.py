@@ -22,6 +22,7 @@ Defense against context-window overflow operates at three levels:
    where many medium-sized results combine to overflow context.
 """
 
+import json
 import logging
 import os
 import shlex
@@ -94,11 +95,78 @@ def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
     return result.get("returncode", 1) == 0
 
 
+def _extract_text_snippets(text: str, *, max_snippets: int = 3, max_chars: int = 240) -> list[str]:
+    """Return a few short, human-meaningful snippets from text."""
+    if not text:
+        return []
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        trimmed = text.strip()
+        return [trimmed[:max_chars]] if trimmed else []
+
+    snippets: list[str] = []
+    head_count = min(len(lines), max(1, max_snippets - 1))
+    for line in lines[:head_count]:
+        snippet = line[:max_chars]
+        if snippet and snippet not in snippets:
+            snippets.append(snippet)
+        if len(snippets) >= max_snippets:
+            return snippets
+
+    if len(lines) > head_count and len(snippets) < max_snippets:
+        tail = lines[-1][:max_chars]
+        if tail and tail not in snippets:
+            snippets.append(tail)
+    return snippets[:max_snippets]
+
+
+def _parse_execution_payload(content: str) -> dict | None:
+    """Parse structured execution output payloads produced by terminal/process tools.
+
+    We treat JSON objects that look like command execution results as structured
+    payloads and surface their summary fields in the persisted context block.
+    """
+    try:
+        parsed = json.loads(content)
+    except Exception:
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+    if not any(key in parsed for key in ("output", "exit_code", "error", "status")):
+        return None
+
+    output = parsed.get("output", "")
+    if output is None:
+        output = ""
+    if not isinstance(output, str):
+        output = str(output)
+
+    exit_code = parsed.get("exit_code")
+    if isinstance(exit_code, str):
+        try:
+            exit_code = int(exit_code.strip())
+        except Exception:
+            pass
+
+    status = parsed.get("status")
+    error = parsed.get("error")
+    return {
+        "output": output,
+        "exit_code": exit_code,
+        "status": str(status).strip() if status is not None else "",
+        "error": str(error).strip() if error not in (None, "") else "",
+    }
+
+
 def _build_persisted_message(
     preview: str,
     has_more: bool,
     original_size: int,
     file_path: str,
+    summary: str | None = None,
+    exit_code: int | None = None,
+    snippets: list[str] | None = None,
 ) -> str:
     """Build the <persisted-output> replacement block."""
     size_kb = original_size / 1024
@@ -107,16 +175,29 @@ def _build_persisted_message(
     else:
         size_str = f"{size_kb:.1f} KB"
 
-    msg = f"{PERSISTED_OUTPUT_TAG}\n"
-    msg += f"This tool result was too large ({original_size:,} characters, {size_str}).\n"
-    msg += f"Full output saved to: {file_path}\n"
-    msg += "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
-    msg += f"Preview (first {len(preview)} chars):\n"
-    msg += preview
-    if has_more:
-        msg += "\n..."
-    msg += f"\n{PERSISTED_OUTPUT_CLOSING_TAG}"
-    return msg
+    msg_lines = [PERSISTED_OUTPUT_TAG]
+    msg_lines.append(f"This tool result was too large ({original_size:,} characters, {size_str}).")
+    if summary:
+        msg_lines.append(f"Execution summary: {summary}")
+    if exit_code is not None:
+        msg_lines.append(f"Exit code: {exit_code}")
+    msg_lines.append(f"Full output saved to: {file_path}")
+    msg_lines.append("Use the read_file tool with offset and limit to access specific sections of this output.")
+
+    if snippets:
+        msg_lines.append("")
+        msg_lines.append("Relevant snippets:")
+        for idx, snippet in enumerate(snippets[:5], start=1):
+            msg_lines.append(f"  {idx}. {snippet}")
+    else:
+        msg_lines.append("")
+        msg_lines.append(f"Preview (first {len(preview)} chars):")
+        msg_lines.append(preview)
+        if has_more:
+            msg_lines.append("...")
+
+    msg_lines.append(PERSISTED_OUTPUT_CLOSING_TAG)
+    return "\n".join(msg_lines)
 
 
 def maybe_persist_tool_result(
@@ -155,6 +236,31 @@ def maybe_persist_tool_result(
     storage_dir = _resolve_storage_dir(env)
     remote_path = f"{storage_dir}/{tool_use_id}.txt"
     preview, has_more = generate_preview(content, max_chars=config.preview_size)
+    execution_payload = _parse_execution_payload(content)
+    summary = None
+    exit_code = None
+    snippets = _extract_text_snippets(preview)
+
+    if execution_payload is not None:
+        exit_code = execution_payload.get("exit_code")
+        output_text = execution_payload.get("output") or ""
+        payload_snippets = _extract_text_snippets(output_text)
+        snippets = payload_snippets or snippets
+        status = execution_payload.get("status") or ""
+        error = execution_payload.get("error") or ""
+        output_len = len(output_text)
+        if error:
+            summary = error
+        else:
+            parts = []
+            if status:
+                parts.append(f"status={status}")
+            if exit_code is not None:
+                parts.append(f"exit_code={exit_code}")
+            parts.append(f"output={output_len:,} chars")
+            summary = "; ".join(parts)
+    else:
+        summary = f"persisted tool result ({len(content):,} chars)"
 
     if env is not None:
         try:
@@ -163,7 +269,15 @@ def maybe_persist_tool_result(
                     "Persisted large tool result: %s (%s, %d chars -> %s)",
                     tool_name, tool_use_id, len(content), remote_path,
                 )
-                return _build_persisted_message(preview, has_more, len(content), remote_path)
+                return _build_persisted_message(
+                    preview,
+                    has_more,
+                    len(content),
+                    remote_path,
+                    summary=summary,
+                    exit_code=exit_code,
+                    snippets=snippets,
+                )
         except Exception as exc:
             logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
 
