@@ -343,23 +343,49 @@ def _warnings_summary_from_diagnostics(
     }
 
 
-def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
-    """Return {'parents': [...], 'children': [...]} for a task."""
-    parents = [
-        r["parent_id"]
-        for r in conn.execute(
-            "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
-            (task_id,),
-        )
-    ]
-    children = [
-        r["child_id"]
-        for r in conn.execute(
-            "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
-            (task_id,),
-        )
-    ]
-    return {"parents": parents, "children": children}
+def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    """Return task links with relation-type detail and legacy id lists."""
+    parent_rows = conn.execute(
+        """
+        SELECT parent_id, relation_type FROM task_links
+        WHERE child_id = ?
+        ORDER BY relation_type, parent_id
+        """,
+        (task_id,),
+    ).fetchall()
+    child_rows = conn.execute(
+        """
+        SELECT child_id, relation_type FROM task_links
+        WHERE parent_id = ?
+        ORDER BY relation_type, child_id
+        """,
+        (task_id,),
+    ).fetchall()
+    by_type = {
+        relation: {"parents": [], "children": []}
+        for relation in kanban_db.VALID_LINK_TYPES
+    }
+    for row in parent_rows:
+        by_type.setdefault(
+            row["relation_type"], {"parents": [], "children": []}
+        )["parents"].append(row["parent_id"])
+    for row in child_rows:
+        by_type.setdefault(
+            row["relation_type"], {"parents": [], "children": []}
+        )["children"].append(row["child_id"])
+    return {
+        "parents": [row["parent_id"] for row in parent_rows],
+        "children": [row["child_id"] for row in child_rows],
+        "parent_details": [
+            {"id": row["parent_id"], "relation_type": row["relation_type"]}
+            for row in parent_rows
+        ],
+        "child_details": [
+            {"id": row["child_id"], "relation_type": row["relation_type"]}
+            for row in child_rows
+        ],
+        "by_type": by_type,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -959,7 +985,9 @@ def _parents_blocking_ready(
     rows = conn.execute(
         "SELECT t.id, t.title, t.status FROM tasks t "
         "JOIN task_links l ON l.parent_id = t.id "
-        "WHERE l.child_id = ? AND t.status != 'done'",
+        "WHERE l.child_id = ? "
+        "AND l.relation_type = 'dependency' "
+        "AND t.status NOT IN ('done', 'archived')",
         (task_id,),
     ).fetchall()
     return [
@@ -990,18 +1018,17 @@ def _set_status_direct(
         if prev is None:
             return False
 
-        # Guard: don't allow promoting to 'ready' unless all parents are done.
-        # Prevents the dispatcher from spawning a child whose upstream work
-        # hasn't completed (e.g. T4 dispatched while T3 is still blocked).
+        # Guard: don't allow promoting to 'ready' unless all dependency
+        # parents are done/archived. Hierarchy links are display/rollup only.
         if new_status == "ready":
             parent_statuses = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
+                "WHERE l.child_id = ? AND l.relation_type = 'dependency'",
                 (task_id,),
             ).fetchall()
             if parent_statuses and not all(
-                p["status"] == "done" for p in parent_statuses
+                p["status"] in {"done", "archived"} for p in parent_statuses
             ):
                 return False
 
@@ -1039,7 +1066,9 @@ def _set_status_direct(
             # the dependency gate. Demote those children immediately so the
             # dashboard does not keep advertising stale-ready work.
             for row in conn.execute(
-                "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+                "SELECT child_id FROM task_links "
+                "WHERE parent_id = ? AND relation_type = 'dependency' "
+                "ORDER BY child_id",
                 (task_id,),
             ).fetchall():
                 child_id = row["child_id"]
@@ -1103,6 +1132,13 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
 class LinkBody(BaseModel):
     parent_id: str
     child_id: str
+    relation_type: str = Field(
+        "dependency",
+        description=(
+            "dependency gates child readiness; hierarchy records umbrella/epic "
+            "breakdown only and does not gate readiness"
+        ),
+    )
 
 
 @router.post("/links")
@@ -1110,8 +1146,13 @@ def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
-        return {"ok": True}
+        kanban_db.link_tasks(
+            conn,
+            payload.parent_id,
+            payload.child_id,
+            relation_type=payload.relation_type,
+        )
+        return {"ok": True, "relation_type": payload.relation_type}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     finally:
@@ -1122,13 +1163,24 @@ def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
 def delete_link(
     parent_id: str = Query(...),
     child_id: str = Query(...),
+    relation_type: Optional[str] = Query(
+        None,
+        description=(
+            "Remove only this relation type; omit to remove any relation "
+            "between the pair"
+        ),
+    ),
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
-        return {"ok": bool(ok)}
+        ok = kanban_db.unlink_tasks(
+            conn, parent_id, child_id, relation_type=relation_type
+        )
+        return {"ok": bool(ok), "relation_type": relation_type}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     finally:
         conn.close()
 

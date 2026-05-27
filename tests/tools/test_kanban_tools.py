@@ -962,6 +962,40 @@ def test_link_happy_path(worker_env):
     out = kt._handle_link({"parent_id": a, "child_id": b})
     d = json.loads(out)
     assert d["ok"] is True
+    assert d["relation_type"] == "dependency"
+
+
+def test_link_hierarchy_relation_does_not_gate_child(worker_env):
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(
+            conn, title="umbrella", assignee="x", initial_status="blocked"
+        )
+        child = kb.create_task(conn, title="child", assignee="x")
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_link({
+        "parent_id": parent,
+        "child_id": child,
+        "relation_type": "hierarchy",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["relation_type"] == "hierarchy"
+
+    conn = kb.connect()
+    try:
+        row = conn.execute(
+            "SELECT relation_type FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (parent, child),
+        ).fetchone()
+        assert row["relation_type"] == "hierarchy"
+        assert kb.get_task(conn, child).status == "ready"
+    finally:
+        conn.close()
 
 
 def test_link_rejects_self_reference(worker_env):

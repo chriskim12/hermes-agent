@@ -553,6 +553,10 @@ def test_add_link_and_delete_link(client):
 
     r = client.get(f"/api/plugins/kanban/tasks/{b['id']}")
     assert a["id"] in r.json()["links"]["parents"]
+    assert r.json()["links"]["parent_details"] == [
+        {"id": a["id"], "relation_type": "dependency"}
+    ]
+    assert r.json()["links"]["by_type"]["dependency"]["parents"] == [a["id"]]
 
     r = client.delete(
         "/api/plugins/kanban/links",
@@ -560,6 +564,43 @@ def test_add_link_and_delete_link(client):
     )
     assert r.status_code == 200
     assert r.json()["ok"] is True
+
+
+def test_hierarchy_link_is_visible_but_does_not_gate_ready(client):
+    parent = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "umbrella", "status": "blocked"},
+    ).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "child", "status": "todo"},
+    ).json()["task"]
+
+    r = client.post(
+        "/api/plugins/kanban/links",
+        json={
+            "parent_id": parent["id"],
+            "child_id": child["id"],
+            "relation_type": "hierarchy",
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["relation_type"] == "hierarchy"
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{child['id']}",
+        json={"status": "ready"},
+    )
+    assert r.status_code == 200
+
+    r = client.get(f"/api/plugins/kanban/tasks/{child['id']}")
+    links = r.json()["links"]
+    assert links["parents"] == [parent["id"]]
+    assert links["parent_details"] == [
+        {"id": parent["id"], "relation_type": "hierarchy"}
+    ]
+    assert links["by_type"]["hierarchy"]["parents"] == [parent["id"]]
+    assert r.json()["task"]["status"] == "ready"
 
 
 def test_add_link_cycle_rejected(client):
