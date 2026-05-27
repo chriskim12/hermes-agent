@@ -498,6 +498,9 @@ def create_native_work(
         )
         return payload
     task = payload["task"]
+    for parent_id in task["parents"]:
+        if kb.get_task(conn, parent_id) is None:
+            raise ValueError(f"unknown parent task(s): {parent_id}")
     task_id = kb.create_task(
         conn,
         title=task["title"],
@@ -508,7 +511,7 @@ def create_native_work(
         workspace_path=task["workspace_path"],
         tenant=task["tenant"],
         priority=task["priority"],
-        parents=tuple(task["parents"]),
+        parents=(),
         triage=True,
         idempotency_key=task["idempotency_key"],
         skills=task["skills"] or None,
@@ -518,6 +521,8 @@ def create_native_work(
         admission_snapshot=payload["authority"]["admission_snapshot"],
         closeout_evidence=payload["authority"]["closeout_evidence"],
     )
+    for parent_id in task["parents"]:
+        kb.link_tasks(conn, parent_id, task_id, relation_type="hierarchy")
     payload.update(
         {
             "status": "created",

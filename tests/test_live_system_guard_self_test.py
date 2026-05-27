@@ -18,6 +18,7 @@ the guard? Add a test here too.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import signal
 import subprocess
 
@@ -226,6 +227,61 @@ def test_systemctl_show_passes_through():
     assert r is not None
 
 
+def test_gateway_config_import_is_from_this_worktree():
+    """Safety tests must exercise the checkout under test, not live installed code."""
+    import gateway.config as gateway_config
+
+    repo_root = Path(__file__).resolve().parents[1]
+    assert Path(gateway_config.__file__).resolve().is_relative_to(repo_root)
+
+
+def test_live_gateway_pid_cwd_start_time_reads_are_read_only():
+    """PID/cwd/start-time inspection is allowed, but only via read-only probes.
+
+    This intentionally uses ``systemctl show`` and ``/proc`` reads. It must not
+    call restart/reload/signal paths; the live-system guard would block those if
+    someone changed this test into a mutating probe.
+    """
+    r = subprocess.run(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            "hermes-gateway",
+            "--no-pager",
+            "--property",
+            "MainPID,ExecMainStartTimestamp,ActiveEnterTimestamp",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r is not None
+
+    fields = {}
+    for line in r.stdout.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            fields[key] = value
+
+    raw_pid = fields.get("MainPID") or "0"
+    try:
+        pid = int(raw_pid)
+    except ValueError:
+        pid = 0
+    if pid <= 0:
+        pytest.skip("live hermes-gateway MainPID is unavailable in this environment")
+
+    # ``/proc/<pid>/cwd`` and field 22 of ``/proc/<pid>/stat`` are read-only
+    # metadata reads. No signal, restart, reload, or systemd mutation occurs.
+    cwd = Path(f"/proc/{pid}/cwd").readlink()
+    start_time = int(Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()[21])
+
+    assert cwd.is_absolute()
+    assert start_time > 0
+    assert "ExecMainStartTimestamp" in fields
+
+
 def test_systemctl_list_units_passes_through():
     r = subprocess.run(
         ["systemctl", "--user", "list-units", "fake-not-real-unit*", "--no-pager"],
@@ -270,6 +326,13 @@ def test_subprocess_pkill_with_unrelated_pattern_passes_through():
     # Use 'true' so it succeeds quickly.
     r = subprocess.run(["true"], capture_output=True)
     assert r.returncode == 0
+
+
+def test_systemctl_reload_variants_are_blocked():
+    """Read-only status/show are allowed; reload-style mutations are not."""
+    for verb in ("reload", "try-restart", "reload-or-restart"):
+        with pytest.raises(RuntimeError, match="live-system guard"):
+            subprocess.run(["systemctl", "--user", verb, "hermes-gateway"])
 
 
 def test_normal_subprocess_run_passes_through():

@@ -570,6 +570,9 @@ def _live_system_guard(request, monkeypatch):
     except Exception:
         _psutil = None
         _initial_children = set()
+    # When psutil is absent, the guard still needs to recognize subprocesses
+    # spawned by this test process. The guarded Popen wrapper records them here.
+    _spawned_children = set()
 
     def _is_own_subtree(pid: int) -> bool:
         # PID 0 means "our own process group"; -1 means "every process we
@@ -580,7 +583,7 @@ def _live_system_guard(request, monkeypatch):
             return True
         if pid < 0:
             return False
-        if pid == test_pid or pid in _initial_children:
+        if pid == test_pid or pid in _initial_children or pid in _spawned_children:
             return True
         if _psutil is None:
             return False
@@ -747,6 +750,10 @@ def _live_system_guard(request, monkeypatch):
             def __init__(self, cmd, *args, **kwargs):
                 _check_subprocess_cmd("Popen", cmd)
                 super().__init__(cmd, *args, **kwargs)
+                try:
+                    _spawned_children.add(int(self.pid))
+                except Exception:
+                    pass
 
         _GuardedPopen.__name__ = "Popen"
         _GuardedPopen.__qualname__ = "Popen"
