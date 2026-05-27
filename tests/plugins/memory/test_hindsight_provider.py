@@ -520,6 +520,37 @@ class TestToolHandlers:
         ))
         assert result["result"] == "Synthesized answer"
 
+    def test_reflect_requests_and_propagates_evidence_metadata(self, provider):
+        provider._client.areflect.return_value = SimpleNamespace(
+            text="Grounded answer",
+            based_on=[SimpleNamespace(id="obs-1", text="Observation one")],
+            trace=SimpleNamespace(
+                tool_calls=[
+                    SimpleNamespace(tool="search_observations", output={"count": 1}),
+                    {"tool": "recall", "output": {"count": 1}},
+                ]
+            ),
+        )
+
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_reflect", {"query": "summarize"}
+        ))
+
+        assert result["result"] == "Grounded answer"
+        assert result["based_on"] == [{"id": "obs-1", "text": "Observation one"}]
+        assert result["trace"]["tool_calls"] == [
+            {"tool": "search_observations", "output": {"count": 1}},
+            {"tool": "recall", "output": {"count": 1}},
+        ]
+        assert provider._client.areflect.call_args.kwargs["include_facts"] is True
+
+    def test_reflect_omits_absent_evidence_metadata(self, provider):
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_reflect", {"query": "summarize"}
+        ))
+
+        assert result == {"result": "Synthesized answer"}
+
     def test_reflect_missing_query(self, provider):
         result = json.loads(provider.handle_tool_call(
             "hindsight_reflect", {}
@@ -1548,4 +1579,3 @@ class TestShutdown:
         embedded.close.assert_called_once()
         assert embedded._client is None
         assert provider._client is None
-

@@ -83,6 +83,29 @@ def _parse_int_setting(value: Any, default: int) -> int:
         return default
 
 
+def _to_jsonable(value: Any) -> Any:
+    """Convert Hindsight SDK response objects into JSON-serializable data."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return [_to_jsonable(item) for item in value]
+    if isinstance(value, tuple):
+        return [_to_jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _to_jsonable(item) for key, item in value.items()}
+    if hasattr(value, "to_dict"):
+        return _to_jsonable(value.to_dict())
+    if hasattr(value, "model_dump"):
+        return _to_jsonable(value.model_dump())
+    if hasattr(value, "__dict__"):
+        return {
+            key: _to_jsonable(item)
+            for key, item in vars(value).items()
+            if not key.startswith("_") and not callable(item)
+        }
+    return str(value)
+
+
 def _check_local_runtime() -> tuple[bool, str | None]:
     """Return whether local embedded Hindsight imports cleanly.
 
@@ -1552,11 +1575,21 @@ class HindsightMemoryProvider(MemoryProvider):
                              self._bank_id, len(query), self._budget)
                 resp = self._run_hindsight_operation(
                     lambda client: client.areflect(
-                        bank_id=self._bank_id, query=query, budget=self._budget
+                        bank_id=self._bank_id,
+                        query=query,
+                        budget=self._budget,
+                        include_facts=True,
                     )
                 )
                 logger.debug("Tool hindsight_reflect: response_len=%d", len(resp.text or ""))
-                return json.dumps({"result": resp.text or "No relevant memories found."})
+                result: dict[str, Any] = {"result": resp.text or "No relevant memories found."}
+                based_on = _to_jsonable(getattr(resp, "based_on", None))
+                if based_on:
+                    result["based_on"] = based_on
+                trace = _to_jsonable(getattr(resp, "trace", None))
+                if trace:
+                    result["trace"] = trace
+                return json.dumps(result)
             except Exception as e:
                 logger.warning("hindsight_reflect failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to reflect: {e}")
