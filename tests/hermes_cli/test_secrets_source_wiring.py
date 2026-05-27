@@ -38,3 +38,17 @@ def test_top_level_bitwarden_is_not_a_secrets_command(tmp_path):
 
     assert result.returncode != 0
     assert "invalid choice" in result.stderr
+
+
+def test_bitwarden_refresh_is_canonical_source_fetch_name(tmp_path):
+    result = _run_cli(tmp_path, "secrets", "source", "bitwarden", "refresh")
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "Bitwarden source refresh only" in result.stdout
+
+
+def test_bitwarden_sync_remains_upstream_compat_alias(tmp_path):
+    result = _run_cli(tmp_path, "secrets", "source", "bitwarden", "sync")
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "Bitwarden source refresh only" in result.stdout

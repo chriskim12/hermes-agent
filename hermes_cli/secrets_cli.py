@@ -3,7 +3,7 @@
 Subcommands:
     setup    — interactive wizard: install bws, prompt for token + project, test fetch
     status   — show current config + binary version + last fetch outcome
-    sync     — run a fetch right now and show what would be applied (dry-run friendly)
+    refresh  — run a source fetch and show what would be applied (dry-run friendly)
     disable  — flip ``secrets.bitwarden.enabled`` to False
     install  — just download the bws binary (no token / project required)
 """
@@ -70,13 +70,20 @@ def register_cli(parent_parser: argparse.ArgumentParser) -> None:
     status = sub.add_parser("status", help="Show config + binary + last fetch")
     status.set_defaults(func=cmd_status)
 
-    sync = sub.add_parser("sync", help="Fetch secrets now and report what changed")
-    sync.add_argument(
+    refresh = sub.add_parser(
+        "refresh",
+        aliases=["sync"],
+        help=(
+            "Fetch from Bitwarden and report what would enter the process "
+            "(source refresh; not the BWS manifest projection sync)"
+        ),
+    )
+    refresh.add_argument(
         "--apply",
         action="store_true",
         help="Actually export the secrets into the current shell's env (default: dry-run)",
     )
-    sync.set_defaults(func=cmd_sync)
+    refresh.set_defaults(func=cmd_sync)
 
     disable = sub.add_parser("disable", help="Turn off the Bitwarden integration")
     disable.set_defaults(func=cmd_disable)
@@ -258,7 +265,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     )
     console.print(
         "  Status:  [cyan]hermes secrets source bitwarden status[/cyan]\n"
-        "  Refresh: [cyan]hermes secrets source bitwarden sync[/cyan]\n"
+        "  Refresh: [cyan]hermes secrets source bitwarden refresh[/cyan]\n"
         "  Disable: [cyan]hermes secrets source bitwarden disable[/cyan]"
     )
     return 0
@@ -315,6 +322,11 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_sync(args: argparse.Namespace) -> int:
     console = Console()
+    console.print(
+        "[dim]Bitwarden source refresh only. Use `hermes secrets sync` for "
+        "BWS manifest -> .env projection, and `hermes secrets check/preflight` "
+        "for the policy gate.[/dim]"
+    )
     cfg = load_config()
     bw_cfg = (cfg.get("secrets") or {}).get("bitwarden") or {}
     if not bw_cfg.get("enabled"):
@@ -380,7 +392,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
         console.print(
             "\n  This was a dry-run — secrets are picked up automatically on the "
             "next [cyan]hermes[/cyan] invocation.  Re-run with [cyan]--apply[/cyan] "
-            "to export into the current shell instead."
+            "to export into the current shell instead.  This does not update "
+            "the BWS manifest projection; use [cyan]hermes secrets sync[/cyan] "
+            "for that."
         )
     else:
         console.print(f"\n  [green]Exported {applied} secret(s) into current process.[/green]")
