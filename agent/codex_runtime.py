@@ -184,14 +184,27 @@ def _responses_null_output_iterable_error(exc: BaseException) -> bool:
     return isinstance(exc, TypeError) and "NoneType" in text and "not iterable" in text
 
 
-def _codex_backfilled_response(output_items: list, text_parts: list, *, has_tool_calls: bool, model: str = None):
+def _codex_backfilled_response(
+    output_items: list,
+    text_parts: list,
+    *,
+    has_tool_calls: bool,
+    model: str = None,
+    reasoning_parts: list | None = None,
+    status: str = "completed",
+    incomplete_reason: str | None = None,
+):
     """Build a minimal Responses-like object from events already streamed."""
     if output_items:
         return SimpleNamespace(
             output=list(output_items),
             usage=None,
-            status="completed",
+            status=status,
             model=model,
+            incomplete_details=(
+                SimpleNamespace(reason=incomplete_reason)
+                if incomplete_reason else None
+            ),
         )
     if text_parts and not has_tool_calls:
         assembled = "".join(text_parts)
@@ -203,8 +216,27 @@ def _codex_backfilled_response(output_items: list, text_parts: list, *, has_tool
                 content=[SimpleNamespace(type="output_text", text=assembled)],
             )],
             usage=None,
-            status="completed",
+            status=status,
             model=model,
+            incomplete_details=(
+                SimpleNamespace(reason=incomplete_reason)
+                if incomplete_reason else None
+            ),
+        )
+    reasoning_text = "".join(reasoning_parts or []).strip()
+    if reasoning_text:
+        return SimpleNamespace(
+            output=[SimpleNamespace(
+                type="reasoning",
+                status="completed",
+                summary=[SimpleNamespace(type="summary_text", text=reasoning_text)],
+            )],
+            usage=None,
+            status="incomplete",
+            model=model,
+            incomplete_details=SimpleNamespace(
+                reason=incomplete_reason or "stream_recovered_reasoning_only"
+            ),
         )
     return None
 
@@ -225,6 +257,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
         collected_output_items: list = []
+        collected_reasoning_deltas: list = []
         try:
             with active_client.responses.stream(**api_kwargs) as stream:
                 for event in stream:
@@ -258,6 +291,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     elif "reasoning" in event_type and "delta" in event_type:
                         reasoning_text = getattr(event, "delta", "")
                         if reasoning_text:
+                            collected_reasoning_deltas.append(reasoning_text)
                             agent._fire_reasoning_delta(reasoning_text)
                     # Collect completed output items — some backends
                     # (chatgpt.com/backend-api/codex) stream valid items
@@ -290,6 +324,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         agent._codex_streamed_text_parts,
                         has_tool_calls=has_tool_calls,
                         model=api_kwargs.get("model"),
+                        reasoning_parts=collected_reasoning_deltas,
                     )
                     if recovered is not None:
                         final_response.output = recovered.output
@@ -338,7 +373,26 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     "recoverable events; falling back to create(stream=True). %s",
                     agent._client_log_context(),
                 )
-                return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+                try:
+                    return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+                except Exception:
+                    recovered = _codex_backfilled_response(
+                        collected_output_items,
+                        agent._codex_streamed_text_parts,
+                        has_tool_calls=has_tool_calls,
+                        model=api_kwargs.get("model"),
+                        reasoning_parts=collected_reasoning_deltas,
+                        status="incomplete",
+                        incomplete_reason="stream_parser_recovered_none_output",
+                    )
+                    if recovered is not None:
+                        logger.warning(
+                            "Codex Responses stream parser failed and fallback failed; "
+                            "returning synthesized incomplete response. %s",
+                            agent._client_log_context(),
+                        )
+                        return recovered
+                    raise
             raise
         except RuntimeError as exc:
             err_text = str(exc)
@@ -408,6 +462,7 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
     terminal_response = None
     collected_output_items: list = []
     collected_text_deltas: list = []
+    collected_reasoning_deltas: list = []
     has_tool_calls = False
     try:
         for event in stream_or_response:
@@ -460,6 +515,12 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
                     collected_text_deltas.append(delta)
             elif event_type and "function_call" in event_type:
                 has_tool_calls = True
+            elif event_type and "reasoning" in event_type and "delta" in event_type:
+                delta = getattr(event, "delta", "")
+                if not delta and isinstance(event, dict):
+                    delta = event.get("delta", "")
+                if delta:
+                    collected_reasoning_deltas.append(delta)
 
             if event_type not in {"response.completed", "response.incomplete", "response.failed"}:
                 continue
@@ -476,6 +537,7 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
                         collected_text_deltas,
                         has_tool_calls=has_tool_calls,
                         model=fallback_kwargs.get("model"),
+                        reasoning_parts=collected_reasoning_deltas,
                     )
                     if recovered is not None:
                         terminal_response.output = recovered.output
@@ -496,6 +558,17 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
 
     if terminal_response is not None:
         return terminal_response
+    recovered = _codex_backfilled_response(
+        collected_output_items,
+        collected_text_deltas,
+        has_tool_calls=has_tool_calls,
+        model=fallback_kwargs.get("model"),
+        reasoning_parts=collected_reasoning_deltas,
+        status="incomplete",
+        incomplete_reason="stream_ended_without_terminal_response",
+    )
+    if recovered is not None:
+        return recovered
     raise RuntimeError("Responses create(stream=True) fallback did not emit a terminal response.")
 
 

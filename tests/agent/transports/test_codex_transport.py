@@ -453,6 +453,34 @@ class TestCodexNormalizeResponse:
         assert tc.name == "terminal"
         assert '"command"' in tc.arguments
 
+    def test_reasoning_only_response_with_broken_output_text_is_incomplete(self, transport):
+        """SDK output_text access can fail when output contains no final message."""
+
+        class BrokenOutputTextResponse(SimpleNamespace):
+            @property
+            def output_text(self):
+                raise TypeError("'NoneType' object is not iterable")
+
+        r = BrokenOutputTextResponse(
+            output=[
+                SimpleNamespace(
+                    type="reasoning",
+                    summary=[SimpleNamespace(type="summary_text", text="Still thinking")],
+                    status="completed",
+                ),
+            ],
+            status="completed",
+            incomplete_details=None,
+            usage=SimpleNamespace(input_tokens=10, output_tokens=5,
+                                  input_tokens_details=None, output_tokens_details=None),
+        )
+
+        nr = transport.normalize_response(r)
+
+        assert nr.content == ""
+        assert nr.reasoning == "Still thinking"
+        assert nr.finish_reason == "incomplete"
+
 
 
 class TestCodexTransportTimeout:

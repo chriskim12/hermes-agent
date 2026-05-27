@@ -872,6 +872,16 @@ def _extract_responses_reasoning_text(item: Any) -> str:
     return ""
 
 
+def _safe_response_output_text(response: Any) -> str:
+    """Read ``response.output_text`` without letting SDK accessors crash."""
+    try:
+        out_text = getattr(response, "output_text", None)
+    except Exception as exc:
+        logger.debug("Codex response.output_text access failed: %s", exc)
+        return ""
+    return out_text.strip() if isinstance(out_text, str) else ""
+
+
 # ---------------------------------------------------------------------------
 # Full response normalization
 # ---------------------------------------------------------------------------
@@ -883,15 +893,15 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
         # The Codex backend can return empty output when the answer was
         # delivered entirely via stream events. Check output_text as a
         # last-resort fallback before raising.
-        out_text = getattr(response, "output_text", None)
-        if isinstance(out_text, str) and out_text.strip():
+        out_text = _safe_response_output_text(response)
+        if out_text:
             logger.debug(
                 "Codex response has empty output but output_text is present (%d chars); "
-                "synthesizing output item.", len(out_text.strip()),
+                "synthesizing output item.", len(out_text),
             )
             output = [SimpleNamespace(
                 type="message", role="assistant", status="completed",
-                content=[SimpleNamespace(type="output_text", text=out_text.strip())],
+                content=[SimpleNamespace(type="output_text", text=out_text)],
             )]
             response.output = output
         else:
@@ -1024,10 +1034,8 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
             ))
 
     final_text = "\n".join([p for p in content_parts if p]).strip()
-    if not final_text and hasattr(response, "output_text"):
-        out_text = getattr(response, "output_text", "")
-        if isinstance(out_text, str):
-            final_text = out_text.strip()
+    if not final_text:
+        final_text = _safe_response_output_text(response)
 
     # ── Tool-call leak recovery ──────────────────────────────────
     # gpt-5.x on the Codex Responses API sometimes degenerates and emits
@@ -1076,7 +1084,7 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
         finish_reason = "incomplete"
     elif has_incomplete_items or (saw_commentary_phase and not saw_final_answer_phase):
         finish_reason = "incomplete"
-    elif reasoning_items_raw and not final_text:
+    elif (reasoning_items_raw or reasoning_parts) and not final_text:
         # Response contains only reasoning (encrypted thinking state) with
         # no visible content or tool calls.  The model is still thinking and
         # needs another turn to produce the actual answer.  Marking this as

@@ -505,6 +505,58 @@ def test_run_codex_stream_fallback_parses_create_stream_events(monkeypatch):
     assert response.output[0].content[0].text == "streamed create ok"
 
 
+def test_run_codex_stream_parser_none_output_falls_back_to_create_stream(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+
+    class _BrokenParseStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            yield SimpleNamespace(type="response.reasoning.delta", delta="Primary reasoning")
+            raise TypeError("'NoneType' object is not iterable")
+
+        def get_final_response(self):
+            raise AssertionError("stream parser failure should happen during iteration")
+
+    create_stream = _FakeCreateStream(
+        [
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(type="response.reasoning.delta", delta="Fallback reasoning"),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(output=None, status="completed"),
+            ),
+        ]
+    )
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _BrokenParseStream()
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        assert kwargs.get("stream") is True
+        return create_stream
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls == {"stream": 1, "create": 1}
+    assert response.output[0].type == "reasoning"
+    assert response.output[0].summary[0].text == "Fallback reasoning"
+
+
 def test_run_codex_stream_falls_back_when_stream_iteration_parses_null_output(monkeypatch):
     """Regression for #11179: the SDK can raise while iterating response.completed.
 
