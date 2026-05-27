@@ -22,7 +22,9 @@ import contextlib
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
+
+from agent.model_metadata import estimate_messages_tokens_rough, estimate_tokens_rough
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +236,408 @@ _COMBINED_REVIEW_PROMPT = (
 
 
 
+_REVIEW_SECTION_ORDER = (
+    "recent_delta",
+    "final_response",
+    "tool_summary",
+    "artifact_changes",
+    "history",
+)
+
+_REVIEW_ACKNOWLEDGEMENTS = {
+    "ok",
+    "okay",
+    "thanks",
+    "thank you",
+    "got it",
+    "sounds good",
+    "yep",
+    "yup",
+    "done",
+}
+
+
+def _truncate_text(text: str, limit: Optional[int]) -> str:
+    if not text or limit is None or limit < 0 or len(text) <= limit:
+        return text
+    if limit <= 1:
+        return text[:limit]
+    return text[: max(0, limit - 1)] + "…"
+
+
+def _stringify_review_content(content: Any, *, limit: int = 1200) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return _truncate_text(content, limit)
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                ptype = part.get("type")
+                if ptype in {"text", "output_text", "input_text"}:
+                    text = part.get("text") or part.get("content") or part.get("value") or ""
+                    if text:
+                        parts.append(str(text))
+                    continue
+                if ptype in {"image", "image_url", "input_image"}:
+                    parts.append(f"[{ptype}]")
+                    continue
+            parts.append(str(part))
+        return _truncate_text("\n".join(parts), limit)
+    if isinstance(content, dict):
+        return _truncate_text(json.dumps(content, ensure_ascii=False), limit)
+    return _truncate_text(str(content), limit)
+
+
+def _compact_message(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(msg, dict):
+        return None
+    role = msg.get("role")
+    if role not in {"user", "assistant", "tool"}:
+        return None
+    compact: Dict[str, Any] = {"role": role}
+    for key in ("name", "tool_call_id"):
+        value = msg.get(key)
+        if value not in (None, ""):
+            compact[key] = value
+    content = msg.get("content")
+    if content not in (None, ""):
+        compact["content"] = _stringify_review_content(content)
+    tool_calls = msg.get("tool_calls")
+    if isinstance(tool_calls, list) and tool_calls:
+        compact["tool_calls"] = []
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            function_name = function.get("name") if isinstance(function, dict) else None
+            compact["tool_calls"].append(
+                {
+                    "id": tool_call.get("id"),
+                    "name": function_name or tool_call.get("name"),
+                }
+            )
+    function_call = msg.get("function_call")
+    if isinstance(function_call, dict) and function_call:
+        compact["function_call"] = {
+            "name": function_call.get("name"),
+            "arguments": _truncate_text(str(function_call.get("arguments") or ""), 300),
+        }
+    return compact
+
+
+def _compact_summary_item(item: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(item, dict):
+        compact: Dict[str, Any] = {}
+        for key in ("tool", "name", "status", "summary", "message", "error", "tool_call_id", "target", "path", "kind", "source", "excerpt"):
+            value = item.get(key)
+            if value not in (None, ""):
+                trunc_keys = {"summary", "message", "error", "excerpt"}
+                compact[key] = _truncate_text(str(value), 600) if key in trunc_keys else value
+        if "summary" not in compact:
+            fallback = item.get("message") or item.get("error") or item.get("content") or item.get("result")
+            if fallback not in (None, ""):
+                compact["summary"] = _truncate_text(str(fallback), 600)
+        return compact or None
+    if item in (None, ""):
+        return None
+    return {"summary": _truncate_text(str(item), 600)}
+
+
+def _tool_result_summary(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(msg, dict) or msg.get("role") != "tool":
+        return None
+    raw_content = msg.get("content")
+    parsed: Dict[str, Any] = {}
+    if isinstance(raw_content, str):
+        try:
+            candidate = json.loads(raw_content)
+            if isinstance(candidate, dict):
+                parsed = candidate
+        except (TypeError, json.JSONDecodeError):
+            parsed = {}
+    elif isinstance(raw_content, dict):
+        parsed = raw_content
+    tool_name = msg.get("name") or parsed.get("tool") or parsed.get("name") or "tool"
+    success = parsed.get("success")
+    status = "ok" if success is True else "error" if success is False else "unknown"
+    summary = parsed.get("message") or parsed.get("summary") or parsed.get("result")
+    if not summary:
+        if parsed.get("error"):
+            summary = parsed.get("error")
+        elif parsed.get("content"):
+            summary = parsed.get("content")
+        else:
+            summary = _stringify_review_content(raw_content, limit=500)
+    summary_text = _truncate_text(str(summary), 700)
+    if not summary_text:
+        return None
+    return {
+        "tool": tool_name,
+        "status": status,
+        "summary": summary_text,
+        **({"tool_call_id": msg["tool_call_id"]} if msg.get("tool_call_id") else {}),
+    }
+
+
+def _artifact_changes_from_tool(msg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not isinstance(msg, dict) or msg.get("role") != "tool":
+        return []
+    raw_content = msg.get("content")
+    if isinstance(raw_content, str):
+        try:
+            parsed = json.loads(raw_content)
+        except (TypeError, json.JSONDecodeError):
+            parsed = {}
+    elif isinstance(raw_content, dict):
+        parsed = raw_content
+    else:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+    items: List[Dict[str, Any]] = []
+    source = msg.get("name") or parsed.get("tool") or parsed.get("name") or "tool"
+
+    def _append_paths(paths: Any, kind: str) -> None:
+        if isinstance(paths, str):
+            path_items = [paths]
+        elif isinstance(paths, list):
+            path_items = [p for p in paths if isinstance(p, str) and p]
+        else:
+            path_items = []
+        for path in path_items:
+            items.append({"kind": kind, "path": path, "source": source})
+
+    _append_paths(parsed.get("files_modified") or parsed.get("changed_files") or parsed.get("files"), "modified")
+    _append_paths(parsed.get("files_created") or parsed.get("created_files") or parsed.get("artifacts"), "created")
+    _append_paths(parsed.get("files_deleted") or parsed.get("deleted_files"), "deleted")
+
+    diff = parsed.get("diff") or parsed.get("patch") or parsed.get("combined_diff")
+    if isinstance(diff, str) and diff.strip():
+        excerpt = "\n".join(diff.splitlines()[:12])
+        items.append({
+            "kind": "diff",
+            "source": source,
+            "excerpt": _truncate_text(excerpt, 900),
+        })
+    return items
+
+
+def _snapshot_stats(snapshot: Dict[str, Any]) -> Dict[str, int]:
+    recent_and_history: List[Dict[str, Any]] = []
+    for section in ("recent_delta", "history"):
+        for msg in snapshot.get(section) or []:
+            if isinstance(msg, dict):
+                recent_and_history.append(msg)
+    if snapshot.get("final_response"):
+        final_msg = snapshot["final_response"]
+        if isinstance(final_msg, dict):
+            recent_and_history.append(final_msg)
+    messages = estimate_messages_tokens_rough(recent_and_history)
+    payload = json.dumps(
+        {
+            "tool_summary": snapshot.get("tool_summary") or [],
+            "artifact_changes": snapshot.get("artifact_changes") or [],
+            "truncation": snapshot.get("truncation") or {},
+        },
+        ensure_ascii=False,
+    )
+    chars = len(json.dumps(snapshot, ensure_ascii=False))
+    tokens = messages + estimate_tokens_rough(payload)
+    return {"messages": len(recent_and_history) + len(snapshot.get("tool_summary") or []) + len(snapshot.get("artifact_changes") or []), "chars": chars, "tokens": tokens}
+
+
+def _mark_truncation(truncation: Dict[str, Any], section: str, limit_name: str, *, dropped: int = 0, truncated: bool = False) -> None:
+    truncation["truncated"] = True
+    if limit_name not in truncation["hit_limits"]:
+        truncation["hit_limits"].append(limit_name)
+    section_state = truncation["sections"].setdefault(section, {"truncated": False, "dropped": 0})
+    section_state["truncated"] = section_state.get("truncated", False) or truncated
+    if dropped:
+        section_state["dropped"] = section_state.get("dropped", 0) + dropped
+
+
+def build_review_snapshot(
+    messages: Optional[Sequence[Dict[str, Any]]],
+    *,
+    final_response: Any = None,
+    tool_summary: Optional[Sequence[Any]] = None,
+    artifact_changes: Optional[Sequence[Any]] = None,
+    max_messages: int = 32,
+    max_chars: int = 12000,
+    max_tokens: int = 3000,
+) -> Dict[str, Any]:
+    """Build a compact structured snapshot for background review."""
+    source_messages = [m for m in (messages or []) if isinstance(m, dict)]
+
+    last_user_idx = None
+    last_assistant_idx = None
+    for idx, msg in enumerate(source_messages):
+        if msg.get("role") == "user":
+            last_user_idx = idx
+        if msg.get("role") == "assistant" and msg.get("content"):
+            last_assistant_idx = idx
+
+    if final_response in (None, ""):
+        if last_assistant_idx is not None:
+            final_response_entry = _compact_message(source_messages[last_assistant_idx])
+        else:
+            final_response_entry = None
+    elif isinstance(final_response, dict):
+        final_response_entry = _compact_message(final_response) or {"role": "assistant", "content": _stringify_review_content(final_response)}
+    else:
+        final_response_entry = {"role": "assistant", "content": _stringify_review_content(final_response, limit=4000)}
+
+    recent_end = last_assistant_idx if last_assistant_idx is not None else len(source_messages)
+    recent_start = last_user_idx if last_user_idx is not None else max(0, recent_end - 4)
+    recent_delta = [m for m in (_compact_message(m) for m in source_messages[recent_start:recent_end]) if m and m.get("role") in ("user", "assistant")]
+    if not recent_delta and final_response_entry:
+        recent_delta = [m for m in (_compact_message(m) for m in source_messages[max(0, recent_end - 2):recent_end]) if m and m.get("role") in ("user", "assistant")]
+
+    derived_tool_summary: List[Dict[str, Any]] = []
+    seen_tool_ids = set()
+    for msg in source_messages:
+        if msg.get("role") != "tool":
+            continue
+        tool_id = msg.get("tool_call_id")
+        if tool_id and tool_id in seen_tool_ids:
+            continue
+        summary = _tool_result_summary(msg)
+        if summary:
+            derived_tool_summary.append(summary)
+            if tool_id:
+                seen_tool_ids.add(tool_id)
+
+    derived_artifact_changes: List[Dict[str, Any]] = []
+    seen_artifact_keys = set()
+    for msg in source_messages:
+        for change in _artifact_changes_from_tool(msg):
+            key = (change.get("kind"), change.get("path"), change.get("excerpt"), change.get("source"))
+            if key in seen_artifact_keys:
+                continue
+            seen_artifact_keys.add(key)
+            derived_artifact_changes.append(change)
+
+    tool_summary_items = [item for item in (_compact_summary_item(x) for x in (tool_summary or derived_tool_summary)) if item]
+    artifact_items = [item for item in (_compact_summary_item(x) for x in (artifact_changes or derived_artifact_changes)) if item]
+
+    history: List[Dict[str, Any]] = []
+    for msg in [m for m in (_compact_message(m) for m in source_messages[:recent_start]) if m]:
+        if msg.get("role") == "tool":
+            continue
+        content = (msg.get("content") or "").strip().lower()
+        if msg.get("role") == "assistant" and content in _REVIEW_ACKNOWLEDGEMENTS:
+            continue
+        history.append(msg)
+
+    snapshot: Dict[str, Any] = {
+        "recent_delta": recent_delta,
+        "final_response": final_response_entry,
+        "tool_summary": tool_summary_items,
+        "artifact_changes": artifact_items,
+        "history": history,
+        "truncation": {
+            "truncated": False,
+            "reason": None,
+            "hit_limits": [],
+            "limits": {
+                "max_messages": max_messages,
+                "max_chars": max_chars,
+                "max_tokens": max_tokens,
+            },
+            "used": {},
+            "remaining": {},
+            "sections": {},
+        },
+    }
+
+    if not any(snapshot[section] for section in _REVIEW_SECTION_ORDER):
+        snapshot["truncation"]["reason"] = "no_review_context"
+        return snapshot
+
+    # Preserve the highest-priority sections first, pruning the lowest-priority
+    # material until all limits are satisfied.
+    for _ in range(1000):
+        stats = _snapshot_stats(snapshot)
+        snapshot["truncation"]["used"] = stats
+        snapshot["truncation"]["remaining"] = {
+            "max_messages": max_messages - stats["messages"],
+            "max_chars": max_chars - stats["chars"],
+            "max_tokens": max_tokens - stats["tokens"],
+        }
+        if (
+            stats["messages"] <= max_messages
+            and stats["chars"] <= max_chars
+            and stats["tokens"] <= max_tokens
+        ):
+            break
+
+        if snapshot["history"]:
+            snapshot["history"].pop()
+            _mark_truncation(snapshot["truncation"], "history", "max_messages", dropped=1)
+            continue
+        if snapshot["artifact_changes"]:
+            snapshot["artifact_changes"].pop()
+            _mark_truncation(snapshot["truncation"], "artifact_changes", "max_messages", dropped=1)
+            continue
+        if snapshot["tool_summary"]:
+            snapshot["tool_summary"].pop()
+            _mark_truncation(snapshot["truncation"], "tool_summary", "max_messages", dropped=1)
+            continue
+        if snapshot["final_response"] and isinstance(snapshot["final_response"], dict):
+            content = snapshot["final_response"].get("content") or ""
+            if len(content) > 64:
+                new_len = max(64, len(content) // 2)
+                snapshot["final_response"]["content"] = _truncate_text(content, new_len)
+                _mark_truncation(snapshot["truncation"], "final_response", "max_chars", truncated=True)
+                continue
+            if len(content) > 0:
+                # Final response content is small (< 64 chars); dropping it
+                # saves negligible space. Skip to recent_delta truncation
+                # instead of uselessly discarding the last remaining section.
+                pass
+            else:
+                snapshot["final_response"] = None
+                _mark_truncation(snapshot["truncation"], "final_response", "max_messages", dropped=1)
+                continue
+        if snapshot["recent_delta"]:
+            last = snapshot["recent_delta"][-1]
+            content = last.get("content") or ""
+            if len(content) > 64:
+                new_len = max(64, len(content) // 2)
+                last["content"] = _truncate_text(content, new_len)
+                _mark_truncation(snapshot["truncation"], "recent_delta", "max_chars", truncated=True)
+                continue
+            if len(snapshot["recent_delta"]) > 1:
+                snapshot["recent_delta"].pop(0)
+                _mark_truncation(snapshot["truncation"], "recent_delta", "max_messages", dropped=1)
+                continue
+            break
+        break
+
+    stats = _snapshot_stats(snapshot)
+    snapshot["truncation"]["used"] = stats
+    snapshot["truncation"]["remaining"] = {
+        "max_messages": max_messages - stats["messages"],
+        "max_chars": max_chars - stats["chars"],
+        "max_tokens": max_tokens - stats["tokens"],
+    }
+    if (
+        stats["messages"] > max_messages
+        or stats["chars"] > max_chars
+        or stats["tokens"] > max_tokens
+    ):
+        _mark_truncation(snapshot["truncation"], "recent_delta", "max_tokens", truncated=True)
+        snapshot["truncation"]["reason"] = snapshot["truncation"].get("reason") or "snapshot_too_large"
+
+    return snapshot
+
+
+def serialize_review_snapshot(snapshot: Dict[str, Any]) -> str:
+    return json.dumps(snapshot, ensure_ascii=False, indent=2)
+
+
 def summarize_background_review_actions(
     review_messages: List[Dict],
     prior_snapshot: List[Dict],
@@ -326,7 +730,7 @@ def build_memory_write_metadata(
 
 def _run_review_in_thread(
     agent: Any,
-    messages_snapshot: List[Dict],
+    review_snapshot: Dict[str, Any],
     prompt: str,
 ) -> None:
     """Worker function executed in the background-review daemon thread.
@@ -476,9 +880,11 @@ def _run_review_in_thread(
                         prompt
                         + "\n\nYou can only call memory and skill "
                         "management tools. Other tools will be denied "
-                        "at runtime — do not attempt them."
+                        "at runtime — do not attempt them.\n\n"
+                        + "Structured review snapshot:\n"
+                        + serialize_review_snapshot(review_snapshot)
                     ),
-                    conversation_history=messages_snapshot,
+                    conversation_history=[],
                 )
             finally:
                 clear_thread_tool_whitelist()
@@ -506,7 +912,7 @@ def _run_review_in_thread(
         # conversation as if they just happened (issue #14944).
         actions = summarize_background_review_actions(
             review_messages,
-            messages_snapshot,
+            [],
         )
 
         if actions:
@@ -557,9 +963,10 @@ def _run_review_in_thread(
 
 def spawn_background_review_thread(
     agent: Any,
-    messages_snapshot: List[Dict],
+    messages_snapshot: Optional[Sequence[Dict[str, Any]]] = None,
     review_memory: bool = False,
     review_skills: bool = False,
+    review_snapshot: Optional[Dict[str, Any]] = None,
 ):
     """Build the review thread target and prompt for a background review.
 
@@ -577,8 +984,17 @@ def spawn_background_review_thread(
     else:
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
 
+    snapshot_payload: Dict[str, Any]
+    if review_snapshot is None:
+        if isinstance(messages_snapshot, dict):
+            snapshot_payload = messages_snapshot
+        else:
+            snapshot_payload = build_review_snapshot(messages_snapshot or [])
+    else:
+        snapshot_payload = review_snapshot
+
     def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+        _run_review_in_thread(agent, snapshot_payload, prompt)
 
     return _target, prompt
 
@@ -587,6 +1003,8 @@ __all__ = [
     "_MEMORY_REVIEW_PROMPT",
     "_SKILL_REVIEW_PROMPT",
     "_COMBINED_REVIEW_PROMPT",
+    "build_review_snapshot",
+    "serialize_review_snapshot",
     "spawn_background_review_thread",
     "summarize_background_review_actions",
     "build_memory_write_metadata",

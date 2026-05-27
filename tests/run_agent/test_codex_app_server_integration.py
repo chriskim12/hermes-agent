@@ -182,12 +182,18 @@ class TestRunConversationCodexPath:
             agent.run_conversation("do tool work")
 
         assert spawn.called, "skill threshold tripped but review didn't fire"
-        # Verify the call signature matches what _spawn_background_review
-        # actually expects — this is the regression guard for the original
-        # bug where the codex path called it with no args at all.
+        # Verify the call signature matches the new bounded snapshot contract.
         call = spawn.call_args
-        assert "messages_snapshot" in call.kwargs
-        assert isinstance(call.kwargs["messages_snapshot"], list)
+        assert "review_snapshot" in call.kwargs
+        snapshot = call.kwargs["review_snapshot"]
+        assert isinstance(snapshot, dict)
+        assert list(snapshot.keys())[:5] == [
+            "recent_delta",
+            "final_response",
+            "tool_summary",
+            "artifact_changes",
+            "history",
+        ]
         assert call.kwargs["review_skills"] is True
         # Counter should be reset after the review fires
         assert agent._iters_since_skill == 0
@@ -218,7 +224,11 @@ class TestRunConversationCodexPath:
             f"expected no positional args, got {call.args!r} — "
             "would crash _spawn_background_review at runtime"
         )
-        assert "messages_snapshot" in call.kwargs
+        assert "review_snapshot" in call.kwargs
+        snapshot = call.kwargs["review_snapshot"]
+        assert isinstance(snapshot, dict)
+        assert snapshot["final_response"]["content"] == "echo: first"
+        assert snapshot["recent_delta"]
 
     def test_chat_completions_loop_is_not_entered(self, fake_session):
         """The early-return must bypass the regular API call loop entirely.

@@ -156,8 +156,12 @@ def run_codex_app_server_turn(
         and (should_review_memory or should_review_skills)
     ):
         try:
+            from agent.background_review import build_review_snapshot
             agent._spawn_background_review(
-                messages_snapshot=list(messages),
+                review_snapshot=build_review_snapshot(
+                    list(messages),
+                    final_response=turn.final_text,
+                ),
                 review_memory=should_review_memory,
                 review_skills=should_review_skills,
             )

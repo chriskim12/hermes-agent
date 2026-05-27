@@ -51,7 +51,7 @@ import threading
 from types import SimpleNamespace
 import urllib.request
 import uuid
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Sequence
 from urllib.parse import urlparse, parse_qs, urlunparse
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
@@ -1174,9 +1174,10 @@ class AIAgent:
 
     def _spawn_background_review(
         self,
-        messages_snapshot: List[Dict],
+        messages_snapshot: Optional[Sequence[Dict[str, Any]]] = None,
         review_memory: bool = False,
         review_skills: bool = False,
+        review_snapshot: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Spawn the background memory/skill review thread.
 
@@ -1186,12 +1187,19 @@ class AIAgent:
         here so existing tests that patch ``run_agent.threading.Thread``
         keep working.
         """
-        from agent.background_review import spawn_background_review_thread
+        from agent.background_review import build_review_snapshot, spawn_background_review_thread
+        if review_snapshot is None:
+            if isinstance(messages_snapshot, dict):
+                review_snapshot = messages_snapshot
+            else:
+                review_snapshot = build_review_snapshot(messages_snapshot or [])
+        snapshot_messages = None if isinstance(messages_snapshot, dict) else messages_snapshot
         target, _prompt = spawn_background_review_thread(
             self,
-            messages_snapshot,
+            snapshot_messages,
             review_memory=review_memory,
             review_skills=review_skills,
+            review_snapshot=review_snapshot,
         )
         t = threading.Thread(target=target, daemon=True, name="bg-review")
         t.start()
