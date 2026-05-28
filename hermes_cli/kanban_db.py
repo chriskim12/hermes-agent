@@ -863,6 +863,94 @@ def _json_dumps_dict(value: Optional[dict], field: str) -> Optional[str]:
     return json.dumps(value, sort_keys=True, ensure_ascii=False)
 
 
+def _strtobool(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _kanban_config_bool(key: str, *, default: bool = False) -> bool:
+    env_key = f"HERMES_KANBAN_{key.upper()}"
+    if env_key in os.environ:
+        return _strtobool(os.environ.get(env_key), default=default)
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        section = cfg.get("kanban") if isinstance(cfg, dict) else None
+        if isinstance(section, dict) and key in section:
+            return _strtobool(section.get(key), default=default)
+    except Exception:
+        pass
+    return default
+
+
+def _strict_ready_gate_enabled() -> bool:
+    return _kanban_config_bool("strict_ready_gate", default=False)
+
+
+def _task_row_to_ready_gate_candidate(row: sqlite3.Row) -> dict[str, Any]:
+    candidate = dict(row)
+    for field in ("routing_verdict", "admission_snapshot", "closeout_evidence"):
+        if field in candidate and isinstance(candidate.get(field), str):
+            parsed = _json_loads_maybe(candidate.get(field))
+            if parsed is not None:
+                candidate[field] = parsed
+    if isinstance(candidate.get("skills"), str):
+        try:
+            skills = json.loads(candidate["skills"])
+            if isinstance(skills, list):
+                candidate["skills"] = skills
+        except Exception:
+            pass
+    return candidate
+
+
+def _evaluate_autopilot_ready_gate_for_row(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        from gateway.kanban_autopilot import evaluate_autopilot_ready_gate
+
+        return evaluate_autopilot_ready_gate(_task_row_to_ready_gate_candidate(row))
+    except Exception as exc:
+        return {
+            "task_id": row["id"],
+            "autopilot_ready": False,
+            "status": "rejected",
+            "reason_codes": ["ready_gate_evaluator_error"],
+            "human_reason": f"ready gate evaluator failed: {exc}",
+        }
+
+
+def _block_for_ready_gate_failure(conn: sqlite3.Connection, row: sqlite3.Row, gate: dict[str, Any], *, source: str) -> None:
+    task_id = row["id"]
+    reason_codes = gate.get("reason_codes") or []
+    reason = "raw ready blocked by Chrisland strict ready gate"
+    if reason_codes:
+        reason += ": " + ", ".join(str(code) for code in reason_codes)
+    payload = {
+        "source": source,
+        "from_status": row["status"],
+        "to_status": "blocked",
+        "reason": reason,
+        "ready_gate": gate,
+    }
+    conn.execute(
+        "UPDATE tasks SET status = 'blocked', assignee = NULL, claim_lock = NULL, "
+        "claim_expires = NULL, worker_pid = NULL, consecutive_failures = 0, "
+        "last_failure_error = NULL WHERE id = ?",
+        (task_id,),
+    )
+    _append_event(conn, task_id, "ready_gate_blocked", payload)
+    _append_event(conn, task_id, "blocked", payload)
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -2968,8 +3056,7 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, review_phase, closeout_evidence "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "SELECT * FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -2995,6 +3082,15 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
+                if _strict_ready_gate_enabled():
+                    trial = dict(row)
+                    trial["status"] = "ready"
+                    gate = _evaluate_autopilot_ready_gate_for_row(trial)  # type: ignore[arg-type]
+                    if not gate.get("autopilot_ready"):
+                        _block_for_ready_gate_failure(
+                            conn, row, gate, source="recompute_ready",
+                        )
+                        continue
                 # Blocked tasks also get their failure counters reset —
                 # this is effectively an auto-unblock (circuit-breaker
                 # recovery; worker-initiated blocks are skipped above).
@@ -6066,7 +6162,7 @@ def dispatch_once(
             ready_rows = []
         else:
             ready_rows = conn.execute(
-                "SELECT id, assignee FROM tasks "
+                "SELECT * FROM tasks "
                 "WHERE status = 'ready' AND claim_lock IS NULL "
                 f"AND id IN ({placeholders}) "
                 "ORDER BY priority DESC, created_at ASC",
@@ -6074,7 +6170,7 @@ def dispatch_once(
             ).fetchall()
     else:
         ready_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
+            "SELECT * FROM tasks "
             "WHERE status = 'ready' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
@@ -6097,6 +6193,16 @@ def dispatch_once(
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+        if _strict_ready_gate_enabled():
+            gate = _evaluate_autopilot_ready_gate_for_row(row)
+            if not gate.get("autopilot_ready"):
+                result.auto_blocked.append(row["id"])
+                if not dry_run:
+                    with write_txn(conn):
+                        _block_for_ready_gate_failure(
+                            conn, row, gate, source="dispatch_once",
+                        )
+                continue
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue

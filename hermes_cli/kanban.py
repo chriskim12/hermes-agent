@@ -1614,9 +1614,9 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if args.mine and not assignee:
         assignee = _profile_author()
     with kb.connect() as conn:
-        # Cheap "mini-dispatch": recompute ready so list output reflects
-        # dependencies that may have cleared since the last dispatcher tick.
-        kb.recompute_ready(conn)
+        # List is intentionally read-only.  Dependency wake-ups / ready
+        # recomputation are lifecycle mutations and must not happen from an
+        # operator status check.
         tasks = kb.list_tasks(
             conn,
             assignee=assignee,
