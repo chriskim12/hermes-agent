@@ -66,6 +66,7 @@ def _review_ready_evidence(repo: Path, **overrides):
         },
         "checks": [{"name": "tests", "status": "COMPLETED", "conclusion": "SUCCESS"}],
         "verifier_verdict": {"verdict": "PASS"},
+        "boundaries_confirmed": True,
         "cleanup": {"proof": "worktree cleanup verified", "worktree_clean": True, "artifacts_removed": []},
         "residue": _valid_residue(),
         "evidence": {"changed_files": ["hermes_cli/kanban_closeout.py"], "tests_run": ["targeted"]},
@@ -250,7 +251,7 @@ def test_review_ready_requires_worker_done_phase(git_repo):
     assert "review_ready_requires_worker_done" in result.blockers
 
 
-def test_review_ready_allows_strict_no_pr_exception_for_no_code_smoke(git_repo):
+def test_review_ready_allows_no_pr_review_package_when_changed_files_empty(git_repo):
     evidence = _review_ready_evidence(
         git_repo,
         pr={},
@@ -258,14 +259,10 @@ def test_review_ready_allows_strict_no_pr_exception_for_no_code_smoke(git_repo):
         evidence={
             "tests_run": ["hermes kanban closeout BO-115 review_ready --check-only --json"],
             "changed_files": [],
-            "review_package_expectation": "Changed files/commit are not expected for this smoke fixture.",
+            "artifact_refs": ["kanban://BO-115/events/verifier_result"],
+            "proof": "Read-only smoke fixture verified; no repository diff was produced.",
         },
-        no_pr_exception={
-            "policy": "no-code-autopilot-smoke-review-ready",
-            "reason": "BO-115 is a no-code Autopilot smoke fixture with worker evidence and verifier PASS.",
-            "review_package_expectation": "Changed files/commit are not expected for this smoke fixture.",
-            "changed_files_expected": False,
-        },
+        no_pr_reason="No-code smoke fixture: changed_files is empty and proof/artifact evidence is attached.",
     )
 
     result = closeout.verify_closeout_transition(
@@ -278,17 +275,14 @@ def test_review_ready_allows_strict_no_pr_exception_for_no_code_smoke(git_repo):
     assert result.allowed is True
     assert result.blockers == []
     assert result.evidence["verification"]["allowed"] is True
-    assert result.evidence["no_pr_exception"]["policy"] == "no-code-autopilot-smoke-review-ready"
+    assert result.evidence["review_package"]["kind"] == "no_pr_evidence"
 
 
-def test_review_ready_no_pr_exception_is_fail_closed_without_review_package_expectation(git_repo):
+def test_review_ready_requires_no_pr_reason_and_artifact_when_changed_files_empty(git_repo):
     evidence = _review_ready_evidence(
         git_repo,
         pr={},
-        no_pr_exception={
-            "policy": "vague-no-pr",
-            "reason": "operator says no PR is needed",
-        },
+        evidence={"changed_files": []},
     )
 
     result = closeout.verify_closeout_transition(
@@ -299,8 +293,49 @@ def test_review_ready_no_pr_exception_is_fail_closed_without_review_package_expe
     )
 
     assert result.allowed is False
-    assert "missing_no_pr_review_package_expectation" in result.blockers
+    assert "missing_no_pr_reason" in result.blockers
+    assert "missing_no_pr_artifact_or_proof" in result.blockers
     assert "missing_live_pr" not in result.blockers
+
+
+def test_review_ready_requires_pr_when_changed_files_non_empty_even_with_no_pr_reason(git_repo):
+    evidence = _review_ready_evidence(
+        git_repo,
+        pr={},
+        evidence={
+            "changed_files": ["hermes_cli/kanban_closeout.py"],
+            "artifact_refs": ["diff://local"],
+            "proof": "code changed locally",
+        },
+        no_pr_reason="operator says no PR is needed",
+    )
+
+    result = closeout.verify_closeout_transition(
+        "review_ready",
+        evidence,
+        current_phase="worker_done",
+        repo_path=git_repo,
+    )
+
+    assert result.allowed is False
+    assert "missing_live_pr" in result.blockers
+    assert "missing_no_pr_reason" not in result.blockers
+    assert result.evidence["review_package"]["kind"] == "pr_required"
+
+
+def test_review_ready_requires_authority_boundaries_for_every_review_package(git_repo):
+    evidence = _review_ready_evidence(git_repo)
+    evidence.pop("boundaries_confirmed")
+
+    result = closeout.verify_closeout_transition(
+        "review_ready",
+        evidence,
+        current_phase="worker_done",
+        repo_path=git_repo,
+    )
+
+    assert result.allowed is False
+    assert "missing_authority_boundary_confirmation" in result.blockers
 
 
 @pytest.mark.parametrize(
@@ -526,7 +561,9 @@ def test_closeout_cli_check_only_blocks_without_writing(kanban_home, git_repo):
     payload = json.loads(out)
 
     assert payload["status"] == "blocked"
-    assert "missing_live_pr" in payload["blockers"]
+    assert "missing_no_pr_reason" in payload["blockers"]
+    assert "missing_no_pr_artifact_or_proof" in payload["blockers"]
+    assert "missing_live_pr" not in payload["blockers"]
     with kb.connect() as conn:
         assert kb.get_task(conn, task_id).review_phase == "worker_done"
 

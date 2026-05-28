@@ -16,7 +16,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, MutableMapping, Optional, cast
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_drift_audit
@@ -447,17 +447,95 @@ def _verifier_pass_present(evidence: Mapping[str, Any]) -> bool:
     return _lower(verdict) == "pass"
 
 
+def _review_package_work(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    work = _as_mapping(evidence.get("evidence"))
+    metadata = _as_mapping(evidence.get("metadata"))
+    merged: dict[str, Any] = {}
+    merged.update(metadata)
+    merged.update(work)
+    for key in ("changed_files", "artifact_refs", "proof", "verification"):
+        if key in evidence and key not in merged:
+            merged[key] = evidence[key]
+    return merged
+
+
+def _review_package_changed_files(evidence: Mapping[str, Any]) -> list[Any]:
+    work = _review_package_work(evidence)
+    if "changed_files" not in work:
+        return []
+    return _as_list(work.get("changed_files"))
+
+
+def _no_pr_reason(evidence: Mapping[str, Any]) -> str:
+    exception = _as_mapping(evidence.get("no_pr_exception"))
+    return (
+        _text(evidence.get("no_pr_reason"))
+        or _text(evidence.get("no_pr_review_reason"))
+        or _text(exception.get("reason"))
+    )
+
+
+def _has_no_pr_artifact_or_proof(evidence: Mapping[str, Any]) -> bool:
+    work = _review_package_work(evidence)
+    return bool(
+        _text(work.get("proof"))
+        or _text(work.get("summary"))
+        or _text(work.get("verification"))
+        or _as_list(work.get("artifact_refs"))
+        or _as_list(work.get("artifacts"))
+        or _as_list(evidence.get("artifact_refs"))
+        or _as_list(evidence.get("artifacts"))
+    )
+
+
+def _authority_boundary_confirmed(evidence: Mapping[str, Any]) -> bool:
+    value = evidence.get("authority_boundary_confirmed")
+    if value is None:
+        value = evidence.get("boundaries_confirmed")
+    return value is True
+
+
+def _review_package_blockers(evidence: Mapping[str, Any]) -> list[str]:
+    """Enforce the v1 two-way review package rule.
+
+    Diff changed files -> a live PR is required.  No changed files -> no-PR
+    evidence is a normal path, not an exception, but it still needs an explicit
+    reason plus some artifact/proof so the review surface cannot become prose.
+    """
+
+    blockers: list[str] = []
+    changed_files = _review_package_changed_files(evidence)
+    if changed_files:
+        blockers.extend(_check_pr(evidence))
+        if isinstance(evidence, dict):
+            mutable_evidence = cast(MutableMapping[str, Any], evidence)
+            mutable_evidence.setdefault(
+                "review_package",
+                {"schema": "kanban_review_package.v1", "kind": "pr_required", "changed_files": changed_files},
+            )
+    else:
+        if not _no_pr_reason(evidence):
+            blockers.append("missing_no_pr_reason")
+        if not _has_no_pr_artifact_or_proof(evidence):
+            blockers.append("missing_no_pr_artifact_or_proof")
+        if isinstance(evidence, dict):
+            mutable_evidence = cast(MutableMapping[str, Any], evidence)
+            mutable_evidence.setdefault(
+                "review_package",
+                {"schema": "kanban_review_package.v1", "kind": "no_pr_evidence", "changed_files": []},
+            )
+    if not _authority_boundary_confirmed(evidence):
+        blockers.append("missing_authority_boundary_confirmation")
+    return blockers
+
+
 def _review_ready_blockers(evidence: Mapping[str, Any]) -> list[str]:
     blockers: list[str] = []
     if not _has_worker_evidence(evidence):
         blockers.append("missing_worker_evidence")
     if not _verifier_pass_present(evidence):
         blockers.append("missing_verifier_pass")
-    no_pr_exception_blockers = _no_pr_review_ready_exception_blockers(evidence)
-    if no_pr_exception_blockers is None:
-        blockers.extend(_check_pr(evidence))
-    else:
-        blockers.extend(no_pr_exception_blockers)
+    blockers.extend(_review_package_blockers(evidence))
     blockers.extend(_check_statuses(evidence))
     blockers.extend(_residue_blockers(evidence))
     cleanup_ok, cleanup_blocker = _cleanup_proven(evidence)

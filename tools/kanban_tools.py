@@ -933,8 +933,10 @@ KANBAN_COMPLETE_SCHEMA = {
         "tests_run, decisions, findings, etc). At least one of "
         "``summary`` or ``result`` is required. If the task is ready "
         "for review, include ``closeout_evidence`` with verifier PASS, "
-        "PR/check/residue/cleanup evidence (or a strict no-PR exception) "
-        "and the kernel will attempt worker_done -> review_ready using "
+        "boundaries_confirmed=true, checks, residue, cleanup proof, and "
+        "the simple review package: changed_files non-empty requires a "
+        "live PR; changed_files empty requires no_pr_reason plus proof "
+        "or artifact refs. The kernel will attempt worker_done -> review_ready using "
         "the same fail-closed closeout verifier. If you created new "
         "tasks via ``kanban_create`` during this run, list their ids "
         "in ``created_cards`` — the kernel verifies them so phantom "
@@ -976,8 +978,11 @@ KANBAN_COMPLETE_SCHEMA = {
                     "Optional Kanban closeout evidence package. When provided, "
                     "kanban_complete first records worker_done, then attempts "
                     "review_ready by running the existing fail-closed closeout "
-                    "verifier. Include verifier PASS, live PR/check evidence "
-                    "or a strict no_pr_exception, residue, and cleanup proof."
+                    "verifier. Include verifier PASS, boundaries_confirmed=true, "
+                    "checks, residue, cleanup proof, and the simple review "
+                    "package: changed_files non-empty requires a live PR; "
+                    "changed_files empty requires no_pr_reason plus proof or "
+                    "artifact refs."
                 ),
             },
             "closeout_target_phase": {

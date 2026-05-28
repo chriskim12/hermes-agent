@@ -369,6 +369,7 @@ def test_complete_autopromotes_review_ready_when_worker_submits_closeout_package
         },
         "verification": "targeted regression passed",
         "verifier_verdict": {"verdict": "PASS"},
+        "boundaries_confirmed": True,
         "checks": [{"name": "targeted", "conclusion": "success"}],
         "residue": {"summary": "No residue", "items": []},
         "cleanup": {
