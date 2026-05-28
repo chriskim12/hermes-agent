@@ -3682,6 +3682,110 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+_REVIEWER_LOOP_SCHEMA = "kanban_reviewer_loop.v1"
+_REVIEWER_RESULT_SCHEMA = "kanban_reviewer_result.v1"
+_REVIEWER_LOOP_FLAGS = (
+    "require_reviewer_loop",
+    "autopilot_reviewer_loop",
+    "reviewer_loop_required",
+)
+
+
+def _mapping_from_jsonish(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _reviewer_loop_enabled(closeout_evidence: Any, metadata: Optional[dict]) -> bool:
+    evidence = _mapping_from_jsonish(closeout_evidence)
+    loop_cfg = evidence.get("reviewer_loop") if isinstance(evidence.get("reviewer_loop"), dict) else {}
+    # Reviewer-loop policy is task evidence, not worker-supplied completion
+    # metadata. A worker may submit result metadata, but it must not be able to
+    # opt an arbitrary task into review routing or select the reviewer profile.
+    for source in (evidence, loop_cfg):
+        if source.get("enabled") is True or any(source.get(flag) is True for flag in _REVIEWER_LOOP_FLAGS):
+            return True
+    return False
+
+
+def _reviewer_loop_profile(closeout_evidence: Any, metadata: Optional[dict]) -> str:
+    evidence = _mapping_from_jsonish(closeout_evidence)
+    loop_cfg = evidence.get("reviewer_loop") if isinstance(evidence.get("reviewer_loop"), dict) else {}
+    for source in (evidence, loop_cfg):
+        for key in ("reviewer_profile", "reviewer_identity", "autopilot_reviewer_profile"):
+            text = str(source.get(key) or "").strip()
+            if text:
+                return _canonical_assignee(text)
+    env_profile = os.environ.get("HERMES_KANBAN_REVIEWER_PROFILE")
+    return _canonical_assignee(env_profile) if env_profile else "reviewer"
+
+
+def _reviewer_loop_max_attempts(closeout_evidence: Any, metadata: Optional[dict]) -> int:
+    evidence = _mapping_from_jsonish(closeout_evidence)
+    loop_cfg = evidence.get("reviewer_loop") if isinstance(evidence.get("reviewer_loop"), dict) else {}
+    for source in (evidence, loop_cfg):
+        raw = source.get("max_verification_attempts") or source.get("max_reviewer_attempts")
+        if raw is None:
+            continue
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            continue
+    return 3
+
+
+def _is_reviewer_result_payload(metadata: Optional[dict]) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    schema = str(metadata.get("schema") or "").strip()
+    return schema == _REVIEWER_RESULT_SCHEMA
+
+
+def _normalize_reviewer_result_payload(
+    raw: Optional[dict],
+    *,
+    verdict_fallback: Optional[str] = None,
+    reviewer_run_id: Optional[int] = None,
+    reviewer_identity: Optional[str] = None,
+    candidate: Optional[dict] = None,
+) -> dict[str, Any]:
+    payload = dict(raw or {})
+    verdict = str(payload.get("verdict") or payload.get("status") or verdict_fallback or "").strip().upper()
+    if verdict not in {"PASS", "FAIL", "BLOCKED", "REFINEMENT_REQUIRED"}:
+        verdict = "BLOCKED"
+        payload.setdefault("reason_codes", ["missing_reviewer_verdict"])
+    payload["schema"] = _REVIEWER_RESULT_SCHEMA
+    payload["verdict"] = verdict
+    if reviewer_run_id is not None:
+        payload["reviewer_run_id"] = reviewer_run_id
+    if reviewer_identity:
+        payload["reviewer_identity"] = reviewer_identity
+    if isinstance(candidate, dict):
+        for key in ("worker_run_id", "worker_identity", "criteria_hash", "head_sha"):
+            if candidate.get(key) is not None:
+                payload[key] = candidate.get(key)
+    return payload
+
+
+def _insert_comment_in_txn(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> None:
+    text = (body or "").strip()
+    if not text:
+        return
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+        (task_id, author.strip() or "kanban-system", text, now),
+    )
+    _append_event(conn, task_id, "commented", {"author": author, "len": len(text)})
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3749,6 +3853,226 @@ def complete_task(
         verified_cards = []
 
     with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT id, status, assignee, review_phase, closeout_evidence, current_run_id "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task_row is None:
+            return False
+        closeout_state = _mapping_from_jsonish(task_row["closeout_evidence"])
+
+        # Autopilot/native reviewer loop: a worker completion is a candidate,
+        # not a human-reviewable closeout. Keep the existing Kanban dispatcher
+        # as lifecycle SSOT by routing the task through the native review column.
+        if (
+            _reviewer_loop_enabled(closeout_state, metadata)
+            and not _is_reviewer_result_payload(metadata)
+            and task_row["review_phase"] in (None, "worker_done")
+            and task_row["status"] in {"running", "ready", "blocked"}
+            and not (task_row["status"] == "running" and task_row["review_phase"] == "worker_done")
+            and not (task_row["status"] == "blocked" and task_row["review_phase"] == "review_ready")
+        ):
+            current_run_id = int(task_row["current_run_id"]) if task_row["current_run_id"] else None
+            if expected_run_id is not None and current_run_id != int(expected_run_id):
+                return False
+            reviewer_profile = _reviewer_loop_profile(closeout_state, metadata)
+            worker_profile = task_row["assignee"]
+            loop_state = closeout_state.get("reviewer_loop") if isinstance(closeout_state.get("reviewer_loop"), dict) else {}
+            attempt = int(loop_state.get("attempt") or 0) + 1
+            max_attempts = _reviewer_loop_max_attempts(closeout_state, metadata)
+            meta = metadata if isinstance(metadata, dict) else {}
+            worker_candidate = {
+                "schema": "kanban_worker_done_candidate.v1",
+                "status": "pending_review",
+                "attempt": attempt,
+                "worker_run_id": current_run_id,
+                "worker_identity": worker_profile,
+                "summary": summary if summary is not None else result,
+                "result": result,
+                "metadata": meta,
+                "criteria_hash": meta.get("criteria_hash"),
+                "head_sha": meta.get("head_sha"),
+                "submitted_at": now,
+            }
+            closeout_state["reviewer_loop"] = {
+                **loop_state,
+                "schema": _REVIEWER_LOOP_SCHEMA,
+                "enabled": True,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "worker_profile": worker_profile,
+                "reviewer_profile": reviewer_profile,
+            }
+            closeout_state["worker_done_candidate"] = worker_candidate
+            closeout_state.pop("last_reviewer_result", None)
+            closeout_state.pop("reviewer_result", None)
+            closeout_state.pop("verifier_result", None)
+            closeout_state.pop("verifier_verdict", None)
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'review',
+                       result = ?,
+                       completed_at = NULL,
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL,
+                       review_phase = 'worker_done',
+                       closeout_evidence = ?,
+                       assignee = ?
+                 WHERE id = ?
+                   AND status IN ('running', 'ready', 'blocked')
+                   AND NOT (status = 'blocked' AND review_phase = 'review_ready')
+                """,
+                (result, _json_dumps_dict(closeout_state, "closeout_evidence"), reviewer_profile, task_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            candidate_metadata = {**meta, "worker_done_candidate": True}
+            run_id = _end_run(
+                conn, task_id,
+                outcome="completed", status="worker_done",
+                summary=summary if summary is not None else result,
+                metadata=candidate_metadata,
+            )
+            if run_id is None and (summary or metadata or result):
+                run_id = _synthesize_ended_run(
+                    conn, task_id,
+                    outcome="completed",
+                    summary=summary if summary is not None else result,
+                    metadata=candidate_metadata,
+                )
+            _append_event(
+                conn, task_id, "worker_done_candidate",
+                {
+                    "attempt": attempt,
+                    "worker_run_id": current_run_id,
+                    "worker_identity": worker_profile,
+                    "reviewer_profile": reviewer_profile,
+                },
+                run_id=run_id,
+            )
+            _append_event(
+                conn, task_id, "completed",
+                {
+                    "result_len": len(result) if result else 0,
+                    "summary": ((summary if summary is not None else result) or "").strip().splitlines()[0][:400] or None,
+                    "worker_done_candidate": True,
+                },
+                run_id=run_id,
+            )
+            return True
+
+        if (
+            task_row["status"] == "running"
+            and task_row["review_phase"] == "worker_done"
+            and _reviewer_loop_enabled(closeout_state, metadata)
+        ):
+            if not _is_reviewer_result_payload(metadata):
+                _append_event(conn, task_id, "reviewer_result_rejected", {"reason": "missing_structured_reviewer_result"})
+                return False
+            current_run_id = int(task_row["current_run_id"]) if task_row["current_run_id"] else None
+            if expected_run_id is not None and current_run_id != int(expected_run_id):
+                return False
+            loop_state = closeout_state.get("reviewer_loop") if isinstance(closeout_state.get("reviewer_loop"), dict) else {}
+            candidate = closeout_state.get("worker_done_candidate") if isinstance(closeout_state.get("worker_done_candidate"), dict) else {}
+            reviewer_result = _normalize_reviewer_result_payload(
+                metadata,
+                verdict_fallback=result,
+                reviewer_run_id=current_run_id,
+                reviewer_identity=task_row["assignee"],
+                candidate=candidate,
+            )
+            worker_identity = str(reviewer_result.get("worker_identity") or loop_state.get("worker_profile") or "").strip()
+            reviewer_identity = str(reviewer_result.get("reviewer_identity") or task_row["assignee"] or "").strip()
+            if worker_identity and reviewer_identity and worker_identity == reviewer_identity:
+                reviewer_result["verdict"] = "BLOCKED"
+                reason_codes = list(reviewer_result.get("reason_codes") or [])
+                if "self_approval_prohibited" not in reason_codes:
+                    reason_codes.append("self_approval_prohibited")
+                reviewer_result["reason_codes"] = reason_codes
+            verdict = reviewer_result["verdict"]
+            attempt = int(loop_state.get("attempt") or candidate.get("attempt") or 1)
+            max_attempts = int(loop_state.get("max_attempts") or 3)
+            closeout_state["last_reviewer_result"] = reviewer_result
+            closeout_state["reviewer_result"] = reviewer_result
+            closeout_state["verifier_result"] = reviewer_result
+            if verdict == "PASS":
+                closeout_state["verifier_verdict"] = {
+                    "verdict": "PASS",
+                    "reviewer_run_id": current_run_id,
+                    "worker_run_id": candidate.get("worker_run_id"),
+                }
+                if candidate:
+                    candidate["status"] = "reviewer_passed"
+                    closeout_state["worker_done_candidate"] = candidate
+                next_status = "blocked"
+                next_assignee = task_row["assignee"]
+                next_review_phase = "worker_done"
+                reviewer_summary = "Reviewer PASS; waiting for review_ready closeout"
+                event_payload = {"verdict": verdict, "review_ready_input_eligible": True, "attempt": attempt}
+            elif verdict == "FAIL" and attempt < max_attempts:
+                if candidate:
+                    candidate["status"] = "rejected"
+                    candidate["superseded_by_attempt"] = attempt + 1
+                    closeout_state["worker_done_candidate"] = candidate
+                next_status = "ready"
+                next_assignee = worker_identity or loop_state.get("worker_profile") or task_row["assignee"]
+                next_review_phase = None
+                reviewer_summary = "Reviewer FAIL; re-queued worker for remediation"
+                event_payload = {"verdict": verdict, "review_ready_input_eligible": False, "attempt": attempt, "requeued": True}
+            else:
+                next_status = "blocked"
+                next_assignee = worker_identity or loop_state.get("worker_profile") or task_row["assignee"]
+                next_review_phase = "worker_done"
+                if verdict == "FAIL":
+                    reasons = list(reviewer_result.get("reason_codes") or [])
+                    if "max_verification_attempts_exhausted" not in reasons:
+                        reasons.append("max_verification_attempts_exhausted")
+                    reviewer_result["reason_codes"] = reasons
+                reviewer_summary = f"Reviewer {verdict}; task blocked"
+                event_payload = {"verdict": verdict, "review_ready_input_eligible": False, "attempt": attempt, "blocked": True}
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = ?,
+                       assignee = ?,
+                       review_phase = ?,
+                       closeout_evidence = ?,
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL
+                 WHERE id = ?
+                   AND status = 'running'
+                   AND review_phase = 'worker_done'
+                """,
+                (next_status, next_assignee, next_review_phase, _json_dumps_dict(closeout_state, "closeout_evidence"), task_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="completed" if verdict == "PASS" else "blocked",
+                status="reviewer_pass" if verdict == "PASS" else "reviewer_failed",
+                summary=summary if summary is not None else reviewer_summary,
+                metadata=reviewer_result,
+            )
+            _append_event(conn, task_id, "reviewer_result", {**event_payload, "reviewer_run_id": current_run_id}, run_id=run_id)
+            remediation = reviewer_result.get("remediation_instructions") or reviewer_result.get("remediation") or []
+            if isinstance(remediation, str):
+                remediation = [remediation]
+            if verdict != "PASS":
+                _insert_comment_in_txn(
+                    conn,
+                    task_id,
+                    "kanban-reviewer",
+                    "Reviewer did not approve the worker_done candidate.\n"
+                    + "\n".join(f"- {item}" for item in remediation if str(item).strip()),
+                )
+            return True
+
         if expected_run_id is None:
             cur = conn.execute(
                 """

@@ -61,6 +61,14 @@ Initial caps are intentionally conservative:
 - `require_clean_closeout_per_task`: true
 - `require_review_ready_contract_before_next_task`: true
 
+## Native reviewer loop
+
+Autopilot must reuse the native Kanban dispatcher rather than creating a second worker lifecycle. For tasks that opt into `require_reviewer_loop`, a worker `kanban_complete` call records a `worker_done_candidate` and moves the same task to native `status=review` with `review_phase=worker_done`. The existing review-column dispatcher then spawns the configured reviewer profile with the `sdlc-review` skill.
+
+Reviewer results are structured as `kanban_reviewer_result.v1` and are bound back to the latest worker candidate. `PASS` leaves the task blocked at `review_phase=worker_done` until the normal `review_ready` closeout gate succeeds. Fixable `FAIL` requeues the original worker with remediation comments. `BLOCKED`, `REFINEMENT_REQUIRED`, self-approval, or exhausted verification attempts keep the task blocked for human/operator intervention.
+
+This preserves Kanban as the SSOT for task status, run records, comments, evidence, retry history, and verifier results.
+
 ## Scope model
 
 Autopilot may operate only inside explicit selectors: parent public id, lane/tenant, repo/project, labels, and assignee/profile. Scope cannot silently widen. Scope escape, ambiguous hierarchy/dependency semantics, or material task drift must produce `needs_human` or `activation_rejected`.

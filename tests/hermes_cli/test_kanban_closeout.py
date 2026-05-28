@@ -183,6 +183,193 @@ def test_complete_task_on_governed_task_sets_worker_done_not_closed(kanban_home)
     assert task.review_phase != "closed"
 
 
+def test_autopilot_reviewer_loop_routes_worker_done_candidate_to_native_review(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="autopilot reviewer loop",
+            assignee="arisu",
+            closeout_evidence={
+                "require_reviewer_loop": True,
+                "reviewer_profile": "yuuka",
+                "max_verification_attempts": 2,
+            },
+        )
+        assert kb.complete_task(
+            conn,
+            task_id,
+            result="worker thinks done",
+            metadata={"criteria_hash": "abc123", "head_sha": "def456"},
+        )
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert task.status == "review"
+    assert task.assignee == "yuuka"
+    assert task.review_phase == "worker_done"
+    assert task.completed_at is None
+    assert task.closeout_evidence["worker_done_candidate"]["status"] == "pending_review"
+    assert task.closeout_evidence["worker_done_candidate"]["worker_identity"] == "arisu"
+    assert task.closeout_evidence["reviewer_loop"]["reviewer_profile"] == "yuuka"
+    assert any(ev.kind == "worker_done_candidate" for ev in events)
+
+
+def test_autopilot_reviewer_fail_requeues_original_worker(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="autopilot reviewer fail",
+            assignee="arisu",
+            closeout_evidence={
+                "require_reviewer_loop": True,
+                "reviewer_profile": "yuuka",
+                "max_verification_attempts": 2,
+            },
+        )
+        assert kb.complete_task(conn, task_id, result="worker candidate")
+        claimed = kb.claim_review_task(conn, task_id, claimer="reviewer-test")
+        assert claimed is not None
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="review failed",
+            metadata={
+                "schema": "kanban_reviewer_result.v1",
+                "verdict": "FAIL",
+                "criterion_results": [{"criterion_id": "c1", "verdict": "FAIL"}],
+                "remediation_instructions": ["Add cleanup proof."],
+            },
+        )
+        task = kb.get_task(conn, task_id)
+        comments = kb.list_comments(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert task.status == "ready"
+    assert task.assignee == "arisu"
+    assert task.review_phase is None
+    assert task.closeout_evidence["worker_done_candidate"]["status"] == "rejected"
+    assert task.closeout_evidence["last_reviewer_result"]["verdict"] == "FAIL"
+    assert any("Add cleanup proof" in c.body for c in comments)
+    reviewer_events = [ev for ev in events if ev.kind == "reviewer_result"]
+    assert reviewer_events[-1].payload["requeued"] is True
+
+
+def test_autopilot_reviewer_pass_blocks_until_review_ready_closeout(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="autopilot reviewer pass",
+            assignee="arisu",
+            closeout_evidence={
+                "require_reviewer_loop": True,
+                "reviewer_profile": "yuuka",
+            },
+        )
+        assert kb.complete_task(conn, task_id, result="worker candidate")
+        claimed = kb.claim_review_task(conn, task_id, claimer="reviewer-test")
+        assert claimed is not None
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="review passed",
+            metadata={
+                "schema": "kanban_reviewer_result.v1",
+                "verdict": "PASS",
+                "criterion_results": [{"criterion_id": "c1", "verdict": "PASS", "evidence": "verified"}],
+            },
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert task.status == "blocked"
+    assert task.review_phase == "worker_done"
+    assert task.closeout_evidence["worker_done_candidate"]["status"] == "reviewer_passed"
+    assert task.closeout_evidence["verifier_result"]["verdict"] == "PASS"
+    assert task.closeout_evidence["verifier_verdict"]["verdict"] == "PASS"
+
+
+def test_autopilot_reviewer_result_requires_schema(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="autopilot reviewer schema required",
+            assignee="arisu",
+            closeout_evidence={
+                "require_reviewer_loop": True,
+                "reviewer_profile": "yuuka",
+            },
+        )
+        assert kb.complete_task(conn, task_id, result="worker candidate")
+        claimed = kb.claim_review_task(conn, task_id, claimer="reviewer-test")
+        assert claimed is not None
+        assert not kb.complete_task(
+            conn,
+            task_id,
+            summary="schema-less pass must be rejected",
+            metadata={"verdict": "PASS"},
+        )
+        assert not kb.complete_task(
+            conn,
+            task_id,
+            summary="type-only pass must be rejected",
+            metadata={"type": "kanban_reviewer_result.v1", "verdict": "PASS"},
+        )
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert task.status == "running"
+    assert task.review_phase == "worker_done"
+    assert task.closeout_evidence["worker_done_candidate"]["status"] == "pending_review"
+    assert any(ev.kind == "reviewer_result_rejected" for ev in events)
+
+
+def test_autopilot_reviewer_loop_ignores_worker_metadata_enable_flag(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="ordinary worker task", assignee="arisu")
+        assert kb.complete_task(conn, task_id, result="legacy done", metadata={"enabled": True, "reviewer_profile": "yuuka"})
+        task = kb.get_task(conn, task_id)
+
+    assert task.status == "done"
+    assert task.review_phase is None
+    assert task.completed_at is not None
+    assert "worker_done_candidate" not in (task.closeout_evidence or {})
+
+
+def test_autopilot_reviewer_self_approval_uses_candidate_identity(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="autopilot reviewer self approval",
+            assignee="arisu",
+            closeout_evidence={
+                "require_reviewer_loop": True,
+                "reviewer_profile": "arisu",
+            },
+        )
+        assert kb.complete_task(conn, task_id, result="worker candidate")
+        claimed = kb.claim_review_task(conn, task_id, claimer="arisu")
+        assert claimed is not None
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="forged pass",
+            metadata={
+                "schema": "kanban_reviewer_result.v1",
+                "verdict": "PASS",
+                "worker_identity": "not-arisu",
+                "reviewer_identity": "not-arisu-either",
+                "criterion_results": [{"criterion_id": "c1", "verdict": "PASS"}],
+            },
+        )
+        task = kb.get_task(conn, task_id)
+
+    result = task.closeout_evidence["last_reviewer_result"]
+    assert task.status == "blocked"
+    assert result["verdict"] == "BLOCKED"
+    assert result["worker_identity"] == "arisu"
+    assert result["reviewer_identity"] == "arisu"
+    assert "self_approval_prohibited" in result["reason_codes"]
+
+
 def test_complete_task_without_closeout_policy_keeps_legacy_done(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="legacy worker task")
