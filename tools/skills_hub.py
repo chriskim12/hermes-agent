@@ -3531,6 +3531,7 @@ def parallel_search_sources(
 def unified_search(query: str, sources: List[SkillSource],
                    source_filter: str = "all", limit: int = 10) -> List[SkillMeta]:
     """Search all sources (in parallel) and merge results."""
+    source_order = {src.source_id(): idx for idx, src in enumerate(sources)}
     all_results, _, _ = parallel_search_sources(
         sources,
         query=query,
@@ -3547,7 +3548,20 @@ def unified_search(query: str, sources: List[SkillSource],
     for r in all_results:
         if r.identifier not in seen:
             seen[r.identifier] = r
-        elif _TRUST_RANK.get(r.trust_level, 0) > _TRUST_RANK.get(seen[r.identifier].trust_level, 0):
+            continue
+
+        existing = seen[r.identifier]
+        current_rank = _TRUST_RANK.get(r.trust_level, 0)
+        existing_rank = _TRUST_RANK.get(existing.trust_level, 0)
+        if current_rank > existing_rank:
+            seen[r.identifier] = r
+        elif (
+            current_rank == existing_rank
+            and source_order.get(r.source, len(sources))
+            < source_order.get(existing.source, len(sources))
+        ):
+            # parallel_search_sources returns as futures complete, so equal-trust
+            # duplicates must tie-break by caller source order to stay stable.
             seen[r.identifier] = r
     deduped = list(seen.values())
 

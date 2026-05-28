@@ -3891,6 +3891,7 @@ def complete_task(
                 "summary": summary if summary is not None else result,
                 "result": result,
                 "metadata": meta,
+                "claimed_outcome": str(meta.get("worker_claimed_outcome") or "ready_candidate"),
                 "criteria_hash": meta.get("criteria_hash"),
                 "head_sha": meta.get("head_sha"),
                 "submitted_at": now,
@@ -4526,8 +4527,115 @@ def block_task(
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running -> blocked``."""
+    """Transition ``running -> blocked``.
+
+    For reviewer-loop governed tasks, a worker's block call is not a final
+    board blocker. It is a ``blocked_candidate`` handoff that must be
+    adjudicated by the configured reviewer through the native review column.
+    """
+    now = int(time.time())
     with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT id, status, assignee, review_phase, closeout_evidence, current_run_id "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task_row is None:
+            return False
+        closeout_state = _mapping_from_jsonish(task_row["closeout_evidence"])
+        if (
+            _reviewer_loop_enabled(closeout_state, None)
+            and task_row["review_phase"] in (None, "worker_done")
+            and task_row["status"] in {"running", "ready"}
+        ):
+            current_run_id = int(task_row["current_run_id"]) if task_row["current_run_id"] else None
+            if expected_run_id is not None and current_run_id != int(expected_run_id):
+                return False
+            reviewer_profile = _reviewer_loop_profile(closeout_state, None)
+            worker_profile = task_row["assignee"]
+            loop_state = closeout_state.get("reviewer_loop") if isinstance(closeout_state.get("reviewer_loop"), dict) else {}
+            attempt = int(loop_state.get("attempt") or 0) + 1
+            max_attempts = _reviewer_loop_max_attempts(closeout_state, None)
+            worker_candidate = {
+                "schema": "kanban_worker_done_candidate.v1",
+                "status": "pending_review",
+                "claimed_outcome": "blocked_candidate",
+                "attempt": attempt,
+                "worker_run_id": current_run_id,
+                "worker_identity": worker_profile,
+                "summary": reason,
+                "result": reason,
+                "metadata": {"blocker_reason": reason} if reason else {},
+                "blocker_reason": reason,
+                "submitted_at": now,
+            }
+            closeout_state["reviewer_loop"] = {
+                **loop_state,
+                "schema": _REVIEWER_LOOP_SCHEMA,
+                "enabled": True,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "worker_profile": worker_profile,
+                "reviewer_profile": reviewer_profile,
+            }
+            closeout_state["worker_done_candidate"] = worker_candidate
+            closeout_state.pop("last_reviewer_result", None)
+            closeout_state.pop("reviewer_result", None)
+            closeout_state.pop("verifier_result", None)
+            closeout_state.pop("verifier_verdict", None)
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'review',
+                       result = ?,
+                       completed_at = NULL,
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL,
+                       review_phase = 'worker_done',
+                       closeout_evidence = ?,
+                       assignee = ?
+                 WHERE id = ?
+                   AND status IN ('running', 'ready')
+                """,
+                (reason, _json_dumps_dict(closeout_state, "closeout_evidence"), reviewer_profile, task_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            run_metadata = {"worker_done_candidate": True, "claimed_outcome": "blocked_candidate"}
+            if reason:
+                run_metadata["blocker_reason"] = reason
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="completed",
+                status="worker_done",
+                summary=reason,
+                metadata=run_metadata,
+            )
+            if run_id is None and reason:
+                run_id = _synthesize_ended_run(
+                    conn,
+                    task_id,
+                    outcome="completed",
+                    summary=reason,
+                    metadata=run_metadata,
+                )
+            _append_event(
+                conn,
+                task_id,
+                "worker_done_candidate",
+                {
+                    "attempt": attempt,
+                    "worker_run_id": current_run_id,
+                    "worker_identity": worker_profile,
+                    "reviewer_profile": reviewer_profile,
+                    "claimed_outcome": "blocked_candidate",
+                },
+                run_id=run_id,
+            )
+            return True
+
         if expected_run_id is None:
             cur = conn.execute(
                 """

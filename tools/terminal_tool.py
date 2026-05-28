@@ -1083,7 +1083,14 @@ def _get_env_config(requested_workdir: Optional[str] = None) -> Dict[str, Any]:
     host_cwd = None
     host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
     if env_type == "docker" and mount_docker_cwd:
-        docker_cwd_source = _valid_dir(os.getenv("TERMINAL_CWD")) or _resolve_start_cwd(requested_workdir)
+        raw_docker_cwd = os.getenv("TERMINAL_CWD")
+        if raw_docker_cwd:
+            expanded_raw = os.path.expanduser(raw_docker_cwd)
+            raw_is_host_path = any(expanded_raw.startswith(p) for p in host_prefixes)
+        else:
+            expanded_raw = None
+            raw_is_host_path = False
+        docker_cwd_source = expanded_raw if raw_is_host_path else (_valid_dir(raw_docker_cwd) or _resolve_start_cwd(requested_workdir))
         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
         if (
             any(candidate.startswith(p) for p in host_prefixes)

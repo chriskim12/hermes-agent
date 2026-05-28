@@ -210,8 +210,94 @@ def test_autopilot_reviewer_loop_routes_worker_done_candidate_to_native_review(k
     assert task.completed_at is None
     assert task.closeout_evidence["worker_done_candidate"]["status"] == "pending_review"
     assert task.closeout_evidence["worker_done_candidate"]["worker_identity"] == "arisu"
+    assert task.closeout_evidence["worker_done_candidate"]["claimed_outcome"] == "ready_candidate"
     assert task.closeout_evidence["reviewer_loop"]["reviewer_profile"] == "yuuka"
     assert any(ev.kind == "worker_done_candidate" for ev in events)
+
+
+def test_autopilot_reviewer_loop_routes_worker_block_claim_to_native_review(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="autopilot blocked claim",
+            assignee="arisu",
+            closeout_evidence={
+                "require_reviewer_loop": True,
+                "reviewer_profile": "yuuka",
+                "max_verification_attempts": 2,
+            },
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="arisu")
+        assert claimed is not None
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="review-required: worker says external approval is needed",
+            expected_run_id=claimed.current_run_id,
+        )
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+
+    assert task.status == "review"
+    assert task.assignee == "yuuka"
+    assert task.review_phase == "worker_done"
+    assert task.completed_at is None
+    candidate = task.closeout_evidence["worker_done_candidate"]
+    assert candidate["status"] == "pending_review"
+    assert candidate["claimed_outcome"] == "blocked_candidate"
+    assert candidate["blocker_reason"] == "review-required: worker says external approval is needed"
+    assert candidate["worker_identity"] == "arisu"
+    assert task.closeout_evidence["reviewer_loop"]["reviewer_profile"] == "yuuka"
+    assert any(ev.kind == "worker_done_candidate" for ev in events)
+    assert not any(ev.kind == "blocked" for ev in events)
+    assert runs[-1].outcome == "completed"
+    assert runs[-1].status == "worker_done"
+
+
+def test_autopilot_reviewer_can_confirm_worker_block_claim(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="autopilot blocked claim adjudication",
+            assignee="arisu",
+            closeout_evidence={
+                "require_reviewer_loop": True,
+                "reviewer_profile": "yuuka",
+                "max_verification_attempts": 2,
+            },
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="arisu")
+        assert claimed is not None
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="approval boundary reached",
+            expected_run_id=claimed.current_run_id,
+        )
+        reviewer_claim = kb.claim_review_task(conn, task_id, claimer="yuuka")
+        assert reviewer_claim is not None
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="reviewer confirms blocker",
+            metadata={
+                "schema": "kanban_reviewer_result.v1",
+                "verdict": "BLOCKED",
+                "reason_codes": ["approval_boundary_confirmed"],
+                "evidence_checked": ["worker blocker evidence"],
+            },
+        )
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert task.status == "blocked"
+    assert task.review_phase == "worker_done"
+    assert task.closeout_evidence["worker_done_candidate"]["claimed_outcome"] == "blocked_candidate"
+    assert task.closeout_evidence["last_reviewer_result"]["verdict"] == "BLOCKED"
+    assert task.closeout_evidence["last_reviewer_result"]["reason_codes"] == ["approval_boundary_confirmed"]
+    reviewer_events = [ev for ev in events if ev.kind == "reviewer_result"]
+    assert reviewer_events[-1].payload["blocked"] is True
 
 
 def test_autopilot_reviewer_fail_requeues_original_worker(kanban_home):

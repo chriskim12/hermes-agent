@@ -63,7 +63,7 @@ Initial caps are intentionally conservative:
 
 ## Native reviewer loop
 
-Autopilot must reuse the native Kanban dispatcher rather than creating a second worker lifecycle. For tasks that opt into `require_reviewer_loop`, a worker `kanban_complete` call records a `worker_done_candidate` and moves the same task to native `status=review` with `review_phase=worker_done`. The existing review-column dispatcher then spawns the configured reviewer profile with the `sdlc-review` skill.
+Autopilot must reuse the native Kanban dispatcher rather than creating a second worker lifecycle. For tasks that opt into `require_reviewer_loop`, a worker `kanban_complete` call records a `worker_done_candidate` with `claimed_outcome=ready_candidate` and moves the same task to native `status=review` with `review_phase=worker_done`. A worker `kanban_block` call on the same governed task is also not a final board blocker: it records `claimed_outcome=blocked_candidate` and moves the task to `status=review` for adjudication. The existing review-column dispatcher then spawns the configured reviewer profile with the `sdlc-review` skill.
 
 Reviewer results are structured as `kanban_reviewer_result.v1` and are bound back to the latest worker candidate. `PASS` leaves the task blocked at `review_phase=worker_done` until the normal `review_ready` closeout gate succeeds. Fixable `FAIL` requeues the original worker with remediation comments. `BLOCKED`, `REFINEMENT_REQUIRED`, self-approval, or exhausted verification attempts keep the task blocked for human/operator intervention.
 
