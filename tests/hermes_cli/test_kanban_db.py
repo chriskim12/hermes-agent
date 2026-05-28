@@ -213,6 +213,23 @@ def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
         assert kb.get_task(conn, c).status == "ready"
 
 
+def test_recompute_ready_strict_gate_blocks_incomplete_dependency_wakeup(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_STRICT_READY_GATE", "true")
+    with kb.connect() as conn:
+        p = kb.create_task(conn, title="parent")
+        c = kb.create_task(conn, title="child", body="implement something", assignee="alice", parents=[p])
+        assert kb.get_task(conn, c).status == "todo"
+
+        kb.complete_task(conn, p, result="ok")
+
+        child = kb.get_task(conn, c)
+        events = kb.list_events(conn, c)
+
+    assert child.status == "blocked"
+    assert child.assignee is None
+    assert "ready_gate_blocked" in [event.kind for event in events]
+
+
 def test_create_task_unknown_parent_errors(kanban_home):
     with kb.connect() as conn, pytest.raises(ValueError, match="unknown parent"):
         kb.create_task(conn, title="orphan", parents=["t_ghost"])
@@ -1276,6 +1293,40 @@ def test_dispatch_skips_unassigned(kanban_home):
     assert t in res.skipped_unassigned
     assert t not in res.skipped_nonspawnable
     assert not res.spawned
+
+
+def test_dispatch_strict_ready_gate_blocks_raw_ready_before_spawn(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_STRICT_READY_GATE", "true")
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="raw ready", body="do a vague thing", assignee="alice")
+        res = kb.dispatch_once(conn, dry_run=False)
+        task = kb.get_task(conn, t)
+        events = kb.list_events(conn, t)
+
+    assert t in res.auto_blocked
+    assert not res.spawned
+    assert task.status == "blocked"
+    assert task.assignee is None
+    assert "ready_gate_blocked" in [event.kind for event in events]
+
+
+def test_dispatch_strict_ready_gate_dry_run_does_not_mutate(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_STRICT_READY_GATE", "true")
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="raw ready", body="do a vague thing", assignee="alice")
+        res = kb.dispatch_once(conn, dry_run=True)
+        task = kb.get_task(conn, t)
+
+    assert t in res.auto_blocked
+    assert not res.spawned
+    assert task.status == "ready"
+    assert task.assignee == "alice"
 
 
 def test_dispatch_skips_nonspawnable_into_separate_bucket(kanban_home, monkeypatch):

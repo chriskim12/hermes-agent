@@ -909,6 +909,104 @@ class Event:
     run_id: Optional[int] = None
 
 
+def _json_loads_maybe(value: Any) -> Optional[dict]:
+    if not value:
+        return None
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _strtobool(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _kanban_config_bool(key: str, *, default: bool = False) -> bool:
+    env_key = f"HERMES_KANBAN_{key.upper()}"
+    if env_key in os.environ:
+        return _strtobool(os.environ.get(env_key), default=default)
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        section = cfg.get("kanban") if isinstance(cfg, dict) else None
+        if isinstance(section, dict) and key in section:
+            return _strtobool(section.get(key), default=default)
+    except Exception:
+        pass
+    return default
+
+
+def _strict_ready_gate_enabled() -> bool:
+    return _kanban_config_bool("strict_ready_gate", default=False)
+
+
+def _task_row_to_ready_gate_candidate(row: sqlite3.Row) -> dict[str, Any]:
+    candidate = dict(row)
+    for field in ("routing_verdict", "admission_snapshot", "closeout_evidence"):
+        if field in candidate and isinstance(candidate.get(field), str):
+            parsed = _json_loads_maybe(candidate.get(field))
+            if parsed is not None:
+                candidate[field] = parsed
+    if isinstance(candidate.get("skills"), str):
+        try:
+            skills = json.loads(candidate["skills"])
+            if isinstance(skills, list):
+                candidate["skills"] = skills
+        except Exception:
+            pass
+    return candidate
+
+
+def _evaluate_autopilot_ready_gate_for_row(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        from gateway.kanban_autopilot import evaluate_autopilot_ready_gate
+
+        return evaluate_autopilot_ready_gate(_task_row_to_ready_gate_candidate(row))
+    except Exception as exc:
+        return {
+            "task_id": row["id"],
+            "autopilot_ready": False,
+            "status": "rejected",
+            "reason_codes": ["ready_gate_evaluator_error"],
+            "human_reason": f"ready gate evaluator failed: {exc}",
+        }
+
+
+def _block_for_ready_gate_failure(conn: sqlite3.Connection, row: sqlite3.Row, gate: dict[str, Any], *, source: str) -> None:
+    task_id = row["id"]
+    reason_codes = gate.get("reason_codes") or []
+    reason = "raw ready blocked by Chrisland strict ready gate"
+    if reason_codes:
+        reason += ": " + ", ".join(str(code) for code in reason_codes)
+    payload = {
+        "source": source,
+        "from_status": row["status"],
+        "to_status": "blocked",
+        "reason": reason,
+        "ready_gate": gate,
+    }
+    conn.execute(
+        "UPDATE tasks SET status = 'blocked', assignee = NULL, claim_lock = NULL, "
+        "claim_expires = NULL, worker_pid = NULL, consecutive_failures = 0, "
+        "last_failure_error = NULL WHERE id = ?",
+        (task_id,),
+    )
+    _append_event(conn, task_id, "ready_gate_blocked", payload)
+    _append_event(conn, task_id, "blocked", payload)
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -2857,8 +2955,7 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "SELECT * FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -2876,6 +2973,15 @@ def recompute_ready(
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
+                if _strict_ready_gate_enabled():
+                    trial = dict(row)
+                    trial["status"] = "ready"
+                    gate = _evaluate_autopilot_ready_gate_for_row(trial)  # type: ignore[arg-type]
+                    if not gate.get("autopilot_ready"):
+                        _block_for_ready_gate_failure(
+                            conn, row, gate, source="recompute_ready",
+                        )
+                        continue
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -5837,10 +5943,11 @@ def dispatch_once(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT * FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+
     # Honour kanban.max_in_progress: if the board already has enough running
     # tasks, skip spawning this tick so slow workers (local LLMs,
     # resource-constrained hosts) can finish what they have before more tasks
@@ -5895,6 +6002,16 @@ def dispatch_once(
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+        if _strict_ready_gate_enabled():
+            gate = _evaluate_autopilot_ready_gate_for_row(row)
+            if not gate.get("autopilot_ready"):
+                result.auto_blocked.append(row["id"])
+                if not dry_run:
+                    with write_txn(conn):
+                        _block_for_ready_gate_failure(
+                            conn, row, gate, source="dispatch_once",
+                        )
+                continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an

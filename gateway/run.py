@@ -5747,11 +5747,11 @@ class GatewayRunner:
 
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
-        # ``kanban.auto_decompose`` (default True). Capped by
+        # ``kanban.auto_decompose`` (default False; explicit opt-in). Capped by
         # ``kanban.auto_decompose_per_tick`` (default 3) so a bulk-load
         # of triage tasks doesn't burst-spend the aux LLM in one tick;
         # remainder defers to subsequent ticks.
-        auto_decompose_enabled = bool(kanban_cfg.get("auto_decompose", True))
+        auto_decompose_enabled = bool(kanban_cfg.get("auto_decompose", False))
         try:
             auto_decompose_per_tick = int(
                 kanban_cfg.get("auto_decompose_per_tick", 3) or 3
