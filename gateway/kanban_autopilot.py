@@ -2540,6 +2540,31 @@ def evaluate_autopilot_ready_gate(candidate: dict[str, Any]) -> dict[str, Any]:
     if not done_criteria.get("ok"):
         reason_codes.extend(done_criteria.get("reason_codes") or ["invalid_done_criteria_ledger"])
         missing_labels.append("explicit done criteria ledger")
+    closeout_evidence = candidate.get("closeout_evidence") or {}
+    if isinstance(closeout_evidence, str):
+        try:
+            closeout_evidence = json.loads(closeout_evidence)
+        except json.JSONDecodeError:
+            closeout_evidence = {"raw": closeout_evidence}
+    if not isinstance(closeout_evidence, dict):
+        closeout_evidence = {}
+    reviewer_loop = closeout_evidence.get("reviewer_loop") or {}
+    if isinstance(reviewer_loop, str):
+        try:
+            reviewer_loop = json.loads(reviewer_loop)
+        except json.JSONDecodeError:
+            reviewer_loop = {"raw": reviewer_loop}
+    if not isinstance(reviewer_loop, dict):
+        reviewer_loop = {}
+    require_reviewer_loop = (
+        closeout_evidence.get("require_reviewer_loop") is True
+        or reviewer_loop.get("required") is True
+        or reviewer_loop.get("enabled") is True
+    )
+    reviewer_profile = str(closeout_evidence.get("reviewer_profile") or reviewer_loop.get("reviewer_profile") or "").strip()
+    if not require_reviewer_loop or not reviewer_profile:
+        reason_codes.append("missing_reviewer_loop_contract")
+        missing_labels.append("reviewer-loop contract")
     routing = candidate.get("routing_verdict") or {}
     if isinstance(routing, str):
         try:
