@@ -348,6 +348,90 @@ def test_verifier_verdict_pass_requires_distinct_identity_and_all_criteria_evide
     assert result["side_effects"] == {"claimed": 0, "spawned": 0, "mutated": 0}
 
 
+def test_verifier_verdict_builds_structured_human_review_context_for_handoff():
+    from gateway.kanban_autopilot import evaluate_verifier_verdict
+
+    worker_evidence = {
+        **_worker_done_evidence(),
+        "worker_identity": "arisu",
+        "work_id": "DC-003",
+        "goal": "Reconcile duplicate-trial incident closeout evidence.",
+        "changed_files": [],
+        "tests_run": ["gh pr view 158 --repo chriskim12/dailychingu"],
+        "review_package": {"kind": "no_pr_evidence", "changed_files": []},
+        "remaining_gate": "none",
+        "non_actions": ["no merge", "no deploy", "no Paddle mutation"],
+    }
+    result = evaluate_verifier_verdict(
+        worker_evidence,
+        {"verifier_identity": "yuuka", "criterion_results": _verifier_results()},
+    )
+
+    context = result["human_review_context"]
+    assert context["schema"] == "kanban_human_review_context.v1"
+    assert context["work_id"] == "DC-003"
+    assert context["goal"] == "Reconcile duplicate-trial incident closeout evidence."
+    assert context["changed_files"] == []
+    assert context["verification_summary"]["tests_run"] == ["gh pr view 158 --repo chriskim12/dailychingu"]
+    assert context["review_package"]["kind"] == "no_pr_evidence"
+    assert context["remaining_gate"] == "none"
+    assert context["non_actions"] == ["no merge", "no deploy", "no Paddle mutation"]
+    assert context["criteria_ids"] == result["criteria_ids"]
+    assert context["verifier"]["verdict"] == "PASS"
+    assert context["review_question"] == "Should a human accept this worker_done package for review_ready/closeout?"
+
+
+def test_human_review_context_includes_easy_human_friendly_summary_not_only_machine_fields():
+    from gateway.kanban_autopilot import evaluate_verifier_verdict
+
+    result = evaluate_verifier_verdict(
+        {
+            **_worker_done_evidence(),
+            "worker_identity": "arisu",
+            "work_id": "DC-003",
+            "goal": "Reconcile duplicate-trial incident closeout evidence.",
+            "changed_files": [],
+            "tests_run": ["gh pr view 158 --repo chriskim12/dailychingu"],
+            "remaining_gate": "none",
+            "non_actions": ["no merge", "no deploy", "no Paddle mutation"],
+        },
+        {"verifier_identity": "yuuka", "criterion_results": _verifier_results()},
+    )
+
+    summary = result["human_review_context"]["human_friendly_summary"]
+    assert summary["schema"] == "kanban_human_friendly_review_summary.v1"
+    assert summary["plain_goal"].startswith("이 작업은")
+    assert summary["what_changed"] == "코드 변경은 없습니다. 증거와 상태를 사람이 확인하기 쉽게 정리한 작업입니다."
+    assert "무엇을 확인했는지" not in summary["decision_needed"]
+    assert "이 증거만으로 받아들일지" in summary["decision_needed"]
+    assert summary["not_done"] == "merge, deploy, Paddle mutation은 하지 않았습니다."
+    joined = " ".join(summary.values())
+    assert "worker_done" not in joined
+    assert "review_ready" not in joined
+    assert "criteria_hash" not in joined
+
+
+def test_retry_controller_persists_human_review_context_in_kanban_evidence_patch():
+    from gateway.kanban_autopilot import plan_verifier_retry_controller
+
+    result = plan_verifier_retry_controller(
+        {
+            **_worker_done_evidence(),
+            "worker_identity": "arisu",
+            "work_id": "DC-003",
+            "goal": "Reconcile duplicate-trial incident closeout evidence.",
+            "remaining_gate": "none",
+        },
+        {"verifier_identity": "yuuka", "criterion_results": _verifier_results()},
+    )
+
+    assert result["next_state"] == "verifier_pass"
+    patch = result["kanban_evidence_patch"]
+    assert patch["human_review_context"]["schema"] == "kanban_human_review_context.v1"
+    assert patch["human_review_context"]["work_id"] == "DC-003"
+    assert patch["human_review_context"]["verifier"]["verdict"] == "PASS"
+
+
 def test_verifier_verdict_rejects_worker_self_approval():
     from gateway.kanban_autopilot import evaluate_verifier_verdict
 

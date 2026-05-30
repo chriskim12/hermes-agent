@@ -408,6 +408,138 @@ def _verifier_result_failed(result: dict[str, Any]) -> bool:
     return status in {"fail", "failed", "error", "rejected", "unsatisfied"} or result.get("passed") is False
 
 
+def _listify_review_context_value(value: Any) -> list[Any]:
+    if value in (None, "", {}, ()):
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, (tuple, set)):
+        return list(value)
+    return [value]
+
+
+def _join_human_friendly_items(items: list[Any]) -> str:
+    cleaned = []
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        text = re.sub(r"^no\s+", "", text, flags=re.IGNORECASE)
+        cleaned.append(text)
+    return ", ".join(cleaned)
+
+
+def build_human_friendly_review_summary(
+    *,
+    work_id: str,
+    goal: str,
+    changed_files: list[Any],
+    tests_run: list[Any],
+    checks_run: list[Any],
+    non_actions: list[Any],
+    remaining_gate: str,
+) -> dict[str, str]:
+    """Build a plain-language review summary for fast human context switching."""
+
+    display_id = work_id or "이 카드"
+    plain_goal = f"이 작업은 {display_id}을 사람이 리뷰해도 되는 상태인지 쉽게 확인하도록 정리한 것입니다."
+    if goal:
+        plain_goal += f" 목표는 {goal}"
+    what_changed = (
+        f"바뀐 파일은 {_join_human_friendly_items(changed_files)}입니다."
+        if changed_files
+        else "코드 변경은 없습니다. 증거와 상태를 사람이 확인하기 쉽게 정리한 작업입니다."
+    )
+    checked_parts: list[str] = []
+    if tests_run:
+        checked_parts.append(f"테스트/확인 명령: {_join_human_friendly_items(tests_run)}")
+    if checks_run:
+        checked_parts.append(f"추가 체크: {_join_human_friendly_items(checks_run)}")
+    what_was_checked = " / ".join(checked_parts) if checked_parts else "완료 기준과 증거가 서로 맞는지 확인했습니다."
+    decision_needed = "사람은 이 증거만으로 받아들일지 판단하면 됩니다."
+    if remaining_gate and remaining_gate.lower() not in {"none", "no", "n/a", "na"}:
+        decision_needed += f" 남은 판단은 {remaining_gate}입니다."
+    not_done = (
+        f"{_join_human_friendly_items(non_actions)}은 하지 않았습니다."
+        if non_actions
+        else "추가 배포, 병합, 외부 변경은 하지 않았습니다."
+    )
+    return {
+        "schema": "kanban_human_friendly_review_summary.v1",
+        "plain_goal": plain_goal,
+        "what_changed": what_changed,
+        "what_was_checked": what_was_checked,
+        "decision_needed": decision_needed,
+        "not_done": not_done,
+    }
+
+
+def build_human_review_context(
+    source_evidence: dict[str, Any],
+    worker_validation: dict[str, Any] | None,
+    verifier_verdict: dict[str, Any],
+    verifier_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the structured context a human reviewer needs for handoff.
+
+    This is an evidence payload, not a presentation-only comment. It keeps the
+    review question, criteria, verification, non-actions, and remaining gate in
+    a machine-readable shape that can be persisted into Kanban closeout evidence.
+    """
+
+    verifier_evidence = dict(verifier_evidence or {})
+    worker_validation = dict(worker_validation or {})
+    changed_files = _listify_review_context_value(source_evidence.get("changed_files"))
+    tests_run = _listify_review_context_value(source_evidence.get("tests_run") or source_evidence.get("tests"))
+    checks_run = _listify_review_context_value(source_evidence.get("checks_run") or source_evidence.get("checks"))
+    remaining_gate = str(source_evidence.get("remaining_gate") or source_evidence.get("remaining_risk") or "").strip()
+    non_actions = _listify_review_context_value(source_evidence.get("non_actions") or source_evidence.get("forbidden_actions") or source_evidence.get("reviewer_non_actions"))
+    work_id = str(source_evidence.get("work_id") or source_evidence.get("public_id") or source_evidence.get("task_id") or "").strip()
+    goal = str(source_evidence.get("goal") or source_evidence.get("objective") or source_evidence.get("summary") or "").strip()
+    review_package = source_evidence.get("review_package") if isinstance(source_evidence.get("review_package"), dict) else {}
+    if not review_package:
+        review_package = {
+            "changed_files": changed_files,
+            "no_pr_reason": source_evidence.get("no_pr_reason"),
+            "pr_url": source_evidence.get("pr_url"),
+        }
+    return {
+        "schema": "kanban_human_review_context.v1",
+        "work_id": work_id,
+        "goal": goal,
+        "changed_files": changed_files,
+        "criteria_ids": list(worker_validation.get("criteria_ids") or verifier_verdict.get("criteria_ids") or []),
+        "criteria_hash": worker_validation.get("criteria_hash") or verifier_verdict.get("criteria_hash") or _criteria_hash_from_evidence(source_evidence),
+        "verification_summary": {
+            "tests_run": tests_run,
+            "checks_run": checks_run,
+            "criterion_results": _normalize_verifier_criterion_results(verifier_evidence.get("criterion_results") or verifier_evidence.get("criteria_results")),
+        },
+        "review_package": review_package,
+        "remaining_gate": remaining_gate,
+        "non_actions": non_actions,
+        "human_friendly_summary": build_human_friendly_review_summary(
+            work_id=work_id,
+            goal=goal,
+            changed_files=changed_files,
+            tests_run=tests_run,
+            checks_run=checks_run,
+            non_actions=non_actions,
+            remaining_gate=remaining_gate,
+        ),
+        "worker": {
+            "identity": str(source_evidence.get("worker_identity") or source_evidence.get("worker") or source_evidence.get("assignee") or "").strip(),
+            "worker_done_valid": worker_validation.get("worker_done_evidence_valid"),
+        },
+        "verifier": {
+            "identity": str(verifier_evidence.get("verifier_identity") or verifier_evidence.get("verifier") or verifier_evidence.get("reviewer") or "").strip(),
+            "verdict": verifier_verdict.get("verdict"),
+            "reason_codes": list(verifier_verdict.get("reason_codes") or []),
+        },
+        "review_question": "Should a human accept this worker_done package for review_ready/closeout?",
+    }
+
+
 def evaluate_verifier_verdict(
     worker_evidence: dict[str, Any],
     verifier_evidence: dict[str, Any] | None = None,
@@ -519,7 +651,7 @@ def evaluate_verifier_verdict(
     accepted = not reason_codes
     deduped_reason_codes = list(dict.fromkeys(reason_codes))
     deduped_remediation = list(dict.fromkeys(item for item in remediation if str(item).strip()))
-    return {
+    result = {
         "verdict": "PASS" if accepted else "FAIL",
         "status": "passed" if accepted else "failed",
         "reason_codes": deduped_reason_codes,
@@ -534,6 +666,8 @@ def evaluate_verifier_verdict(
         "human_reason": "verifier PASS: all done criteria independently satisfied" if accepted else "verifier FAIL: " + ", ".join(deduped_reason_codes),
         "side_effects": {"claimed": 0, "spawned": 0, "mutated": 0},
     }
+    result["human_review_context"] = build_human_review_context(source_evidence, worker_validation, result, verifier_evidence)
+    return result
 
 
 def plan_verifier_retry_controller(
@@ -623,6 +757,7 @@ def plan_verifier_retry_controller(
             "last_verifier_verdict": verdict,
             "last_verifier_reason_codes": verifier.get("reason_codes") or [],
             "next_controller_state": next_state,
+            "human_review_context": verifier.get("human_review_context"),
         },
         "side_effects": {"claimed": 0, "spawned": 0, "mutated": 0},
         "human_reason": (
