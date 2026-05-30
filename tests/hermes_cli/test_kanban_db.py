@@ -1854,6 +1854,60 @@ def test_dispatch_respawn_guard_skips_active_pr(
         assert kb.get_task(conn, t).status == "ready"
 
 
+def test_dispatch_allows_reviewer_fail_remediation_with_existing_pr(
+    kanban_home, all_assignees_spawnable
+):
+    """Reviewer FAIL requeues the worker to update the existing PR, not create a duplicate."""
+    spawned_ids = []
+    contexts = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+        with kb.connect() as verify_conn:
+            contexts.append(kb.build_worker_context(verify_conn, task.id))
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="reviewer remediation with active PR",
+            assignee="alice",
+            closeout_evidence={
+                "require_reviewer_loop": True,
+                "reviewer_profile": "reviewer-test",
+                "max_verification_attempts": 2,
+            },
+        )
+        assert kb.complete_task(conn, t, result="worker candidate")
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
+        )
+        claimed = kb.claim_review_task(conn, t, claimer="reviewer-test")
+        assert claimed is not None
+        assert kb.complete_task(
+            conn,
+            t,
+            summary="review failed",
+            metadata={
+                "schema": "kanban_reviewer_result.v1",
+                "verdict": "FAIL",
+                "criterion_results": [{"criterion_id": "c1", "verdict": "FAIL"}],
+                "remediation_instructions": ["Fix the failing criterion in the existing PR."],
+            },
+        )
+        assert kb.check_respawn_guard(conn, t) is None
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert t in spawned_ids
+    assert (t, "active_pr") not in res.respawn_guarded
+    assert contexts
+    assert "Reviewer remediation mode" in contexts[0]
+    assert "https://github.com/totemx-AI/subsidysmart/pull/99" in contexts[0]
+    assert "Do not open a new PR" in contexts[0]
+
+
 def test_dispatch_respawn_guard_dry_run_no_auto_block(
     kanban_home, all_assignees_spawnable
 ):

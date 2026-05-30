@@ -607,10 +607,27 @@ def test_ready_gate_rejects_missing_or_ambiguous_done_criteria_and_accepts_expli
     assert ambiguous_result["autopilot_ready"] is False
     assert "ambiguous_done_criteria_ledger" in ambiguous_result["reason_codes"]
 
-    explicit = evaluate_autopilot_ready_gate(_ready_candidate("BO-148"))
+    missing_reviewer_loop_candidate = _ready_candidate("BO-148")
+    missing_reviewer_loop_candidate.pop("closeout_evidence")
+    missing_reviewer_loop = evaluate_autopilot_ready_gate(missing_reviewer_loop_candidate)
+    assert missing_reviewer_loop["autopilot_ready"] is False
+    assert "missing_reviewer_loop_contract" in missing_reviewer_loop["reason_codes"]
+
+    explicit = evaluate_autopilot_ready_gate(_ready_candidate("BO-149"))
     assert explicit["autopilot_ready"] is True
     assert explicit["criteria_hash"]
     assert explicit["criteria_ids"]
+
+    nested_enabled_candidate = _ready_candidate("BO-150")
+    nested_enabled_candidate["closeout_evidence"] = {
+        "reviewer_loop": {
+            "enabled": True,
+            "reviewer_profile": "default",
+            "max_attempts": 2,
+        }
+    }
+    nested_enabled = evaluate_autopilot_ready_gate(nested_enabled_candidate)
+    assert nested_enabled["autopilot_ready"] is True
 
 
 def test_review_ready_contract_rejects_stale_criteria_hash_and_requires_worktree_cleanup_proof():
@@ -751,6 +768,11 @@ Done criteria:
 - Boundaries remain confirmed.
 """,
         "routing_verdict": {"verdict": "Hermes direct"},
+        "closeout_evidence": {
+            "require_reviewer_loop": True,
+            "reviewer_profile": "default",
+            "max_verification_attempts": 2,
+        },
         "admission_snapshot": {"repo_full_name": "chriskim12/hermes-agent"},
     }
 
@@ -803,6 +825,11 @@ Done criteria:
 - Boundaries remain confirmed.
 """,
         "routing_verdict": {"verdict": "Hermes direct"},
+        "closeout_evidence": {
+            "require_reviewer_loop": True,
+            "reviewer_profile": "default",
+            "max_verification_attempts": 2,
+        },
         "admission_snapshot": {"repo_full_name": "chriskim12/hermes-agent"},
     }
 
@@ -1073,7 +1100,7 @@ def test_parent_focused_dry_run_loads_only_hierarchy_children_without_dispatch(t
             assignee="worker",
             public_id="BO-CHILD-READY",
             routing_verdict={"verdict": "Hermes direct", "reason": "test"},
-            closeout_evidence=_worker_done_evidence(),
+            closeout_evidence=_ready_candidate("BO-CHILD-READY")["closeout_evidence"],
         )
         raw_child_id = kb.create_task(
             conn,
@@ -1098,7 +1125,7 @@ def test_parent_focused_dry_run_loads_only_hierarchy_children_without_dispatch(t
             assignee="worker",
             public_id="BO-OTHER-READY",
             routing_verdict={"verdict": "Hermes direct", "reason": "test"},
-            closeout_evidence=_worker_done_evidence(),
+            closeout_evidence=_ready_candidate("BO-OTHER-READY")["closeout_evidence"],
         )
         kb.link_tasks(conn, other_parent_id, other_child_id, relation_type="hierarchy")
 
