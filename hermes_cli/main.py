@@ -11640,7 +11640,16 @@ def main():
     )
     secrets_subparsers = secrets_parser.add_subparsers(dest="secrets_command")
 
-    secrets_bw = secrets_subparsers.add_parser(
+    secrets_source = secrets_subparsers.add_parser(
+        "source",
+        aliases=["provider"],
+        help="Configure external secret sources such as Bitwarden",
+    )
+    secrets_source_subparsers = secrets_source.add_subparsers(
+        dest="secrets_source",
+        required=True,
+    )
+    secrets_bw = secrets_source_subparsers.add_parser(
         "bitwarden",
         aliases=["bw"],
         help="Bitwarden Secrets Manager integration",
@@ -11653,8 +11662,9 @@ def main():
 
     def _dispatch_secrets(args):  # noqa: ANN001
         sub = getattr(args, "secrets_command", None)
+        source = getattr(args, "secrets_source", None)
         bw_sub = getattr(args, "secrets_bw_command", None)
-        if sub in ("bitwarden", "bw") and bw_sub is not None:
+        if sub in ("source", "provider") and source in ("bitwarden", "bw") and bw_sub is not None:
             return args.func(args)
         secrets_parser.print_help()
         return 0
