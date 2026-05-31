@@ -568,3 +568,87 @@ Recommended approval wording if Chris accepts this plan:
 If Chris wants to continue without PR first, alternate approval wording:
 
 > “Approve this RALPLAN. Continue Slice 2 carry reconciliation locally only; no push/PR/merge/materialization/restart/live apply.”
+
+
+## 16. Execution progress record — 2026-06-01 local-only Slice 2 advance
+
+Recorded at: `2026-05-31T17:42:49+00:00`
+
+### Scope actually advanced
+
+Chris approved continuing as far as possible while preserving the RALPLAN safety boundary. I treated this as approval for **local-only execution and verification**, not as merge/live/restart/env/cron authority.
+
+New local-only cumulative proof worktree:
+
+- Worktree: `/home/ubuntu/.hermes/hermes-agent/.worktrees/hermes-upstream-20260601-slice2-local`
+- Branch: `yuuka/hermes-upstream-20260601-slice2-local`
+- Base: current `upstream/main` `1044d9f25 fix(gateway): /stop can interrupt a sibling participant's run in a per-user thread (#35959)`
+- Status: clean; `ahead 7` of upstream/main
+- Side effects: no push, no PR update, no merge, no root materialization, no gateway restart/reload, no live runtime apply, no env/secret/config mutation, no cron mutation.
+
+### Commits in local Slice 2 branch
+
+1. `f26961b25` — test isolation for `HERMES_CRON_SESSION`.
+2. `c5ee7d1f4` — Kanban strict-ready/list-read-only carry, rebased onto latest upstream.
+3. `242967846` — Bitwarden source/provider nesting carry.
+4. `ba666179a` — gateway scoped intake state carry.
+5. `bf058f931` — GWS read-only credential resolution through BWS, adapted by restoring the Google Workspace read-only toolset and explicit `google_workspace` toolset wiring on latest upstream.
+6. `26b6e9f63` — BWS runtime secret SSOT governance CLI, adapted into the existing `hermes secrets source/provider bitwarden` parser instead of creating a duplicate top-level `secrets` parser.
+7. `3b32da02c` — secrets source refresh wording/alias carry; `refresh` is canonical and `sync` remains an upstream-compatible alias for source refresh.
+
+### Slice 2 classification outcome
+
+| Carry | Verdict | Decision |
+|---|---|---|
+| `641123f730` GWS read-only credentials through BWS | B / adapter | Preserved as local read-only GWS toolset because upstream lacks equivalent `tools/google_workspace_tool.py`; no raw credentials in tests. |
+| `45aeb1ed9a` runtime secret SSOT governance CLI | B / adapter | Preserved as governance commands under the existing `hermes secrets` tree; avoided duplicate parser and kept BWS as SSOT. |
+| `2aa8384262` source refresh clarification | B / adapter | Preserved with `hermes secrets source bitwarden refresh` canonical and `sync` as compatibility alias. |
+
+### Slice 3 classification outcome
+
+- Relation metadata: B / adapter — preserve API/tool/dashboard relation metadata, not legacy controller state.
+- Worker-through-review / review-package gating / reviewer-loop block claims / handoff context / remediation-vs-duplicate guard: B / adapter — preserve policy against current Kanban DB/session primitives.
+- `gateway/kanban_autopilot.py` and old continuous controller substrate: F / do not resurrect.
+- Next Slice 3 must split relation metadata, reviewer remediation, human handoff context, and legacy autopilot cleanup; do not make it one mega-merge.
+
+### Slice 4/5 classification outcome
+
+- Upstream `codex_app_server` runtime/session is native and should be adopted as substrate.
+- Old local `codex_session` value is not fully upstream-native: preserve only as a narrow evidence-only shim or migration bridge, not default runtime.
+- OMX stays frozen/legacy/special; do not promote as default execution lane.
+- Hindsight reflect metadata and Codex OAuth bridge are local-only: preserve only as opt-in, loopback/secret-gated, non-default behavior until separate proof.
+
+### Verification run on local Slice 2 branch
+
+Commands/results:
+
+```bash
+python -m py_compile hermes_cli/main.py hermes_cli/secrets.py hermes_cli/secrets_cli.py toolsets.py tools/google_workspace_tool.py gateway/session.py hermes_cli/kanban.py hermes_cli/kanban_db.py
+./scripts/run_tests.sh tests/hermes_cli/test_secrets_source_wiring.py tests/hermes_cli/test_secrets_cli.py tests/tools/test_google_workspace_tool.py
+# 3 files / 44 tests passed / 0 failed
+
+git diff --check
+./scripts/run_tests.sh tests/tools/test_terminal_task_cwd.py tests/tools/test_code_execution_modes.py tests/tools/test_terminal_tool.py tests/agent/test_skill_commands.py tests/hermes_cli/test_config_env_refs.py tests/gateway/test_config_env_bridge_authority.py tests/hermes_cli/test_secrets_source_wiring.py tests/hermes_cli/test_secrets_cli.py tests/tools/test_google_workspace_tool.py tests/gateway/test_intake_state.py tests/hermes_cli/test_kanban_db.py tests/hermes_cli/test_kanban_cli.py tests/gateway/test_session_work_state.py tests/gateway/test_session_handoff.py tests/kanban/test_ready_gate.py
+# 12 discovered files / 410 tests passed / 0 failed
+
+python - <<'PY'
+from model_tools import get_tool_definitions
+schemas = get_tool_definitions(quiet_mode=True)
+names = [s['function']['name'] for s in schemas]
+print('tool_schema_count', len(names))
+print('has_terminal', 'terminal' in names)
+print('has_tts', 'text_to_speech' in names)
+print('has_google_workspace_profiles', 'google_workspace_profiles' in names)
+print('duplicates', sorted({x for x in names if names.count(x) > 1}))
+from gateway.config import load_gateway_config
+cfg = load_gateway_config()
+print('gateway_config_loaded', type(cfg).__name__, bool(getattr(cfg, 'platforms', None)))
+PY
+# tool_schema_count 35; terminal=True; tts=True; google_workspace_profiles=True; duplicates=[]; GatewayConfig True
+```
+
+### Current completion state
+
+- Slice 1 draft PR remains a previously verified partial proof anchor; it was **not** updated in this pass because fork PR update is a separate side effect.
+- Local Slice 2 branch is verified on latest upstream and ready to become the next draft/update candidate if Chris approves fork push/PR update.
+- RALPLAN still does **not** authorize merge, root materialization, gateway restart/reload, live apply, env/secret/config mutation, or cron mutation.
