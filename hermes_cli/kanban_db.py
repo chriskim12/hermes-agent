@@ -744,6 +744,8 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    review_phase: Optional[str] = None
+    closeout_evidence: Optional[dict] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -757,6 +759,9 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        closeout_evidence = None
+        if "closeout_evidence" in keys and row["closeout_evidence"]:
+            closeout_evidence = _json_loads_maybe(row["closeout_evidence"])
         return cls(
             id=row["id"],
             title=row["title"],
@@ -819,6 +824,10 @@ class Task:
             session_id=(
                 row["session_id"] if "session_id" in keys else None
             ),
+            review_phase=(
+                row["review_phase"] if "review_phase" in keys else None
+            ),
+            closeout_evidence=closeout_evidence,
         )
 
 
@@ -1078,7 +1087,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- for tasks created from the CLI, dashboard, or any path that doesn't
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
-    session_id           TEXT
+    session_id           TEXT,
+    -- Review/remediation carry state. ``review_phase`` stays NULL/empty
+    -- while original-worker remediation is pending; ``closeout_evidence``
+    -- stores structured reviewer/worker handoff payloads as JSON.
+    review_phase         TEXT,
+    closeout_evidence    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1736,6 +1750,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # creation path that doesn't set the env var (CLI, dashboard).
         _add_column_if_missing(
             conn, "tasks", "session_id", "session_id TEXT"
+        )
+
+    if "review_phase" not in cols:
+        _add_column_if_missing(conn, "tasks", "review_phase", "review_phase TEXT")
+    if "closeout_evidence" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "closeout_evidence", "closeout_evidence TEXT"
         )
 
     # Indexes over additive ``tasks`` columns must be created after the
@@ -5835,6 +5856,82 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def _mapping_from_jsonish(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    parsed = _json_loads_maybe(value)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _reviewer_loop_max_attempts(closeout_evidence: Any) -> int:
+    evidence = _mapping_from_jsonish(closeout_evidence)
+    loop_cfg = evidence.get("reviewer_loop") if isinstance(evidence.get("reviewer_loop"), dict) else {}
+    for source in (evidence, loop_cfg):
+        raw = (
+            source.get("max_verification_attempts")
+            or source.get("max_reviewer_attempts")
+            or source.get("max_attempts")
+        )
+        if raw is None:
+            continue
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return 2
+
+
+def _reviewer_fail_remediation_pending(
+    closeout_evidence: Any,
+    *,
+    status: Optional[str] = None,
+    review_phase: Optional[str] = None,
+) -> bool:
+    """True when reviewer FAIL intentionally requeued the original worker.
+
+    This differs from a raw ready task with an active PR: the next worker must
+    update the existing branch/PR with reviewer remediation, not create a
+    duplicate PR.  The dispatcher may therefore respawn the worker even when
+    recent-run or active-PR guards would otherwise defer it.
+    """
+    if status is not None and status not in {"ready", "running"}:
+        return False
+    if review_phase not in (None, ""):
+        return False
+    evidence = _mapping_from_jsonish(closeout_evidence)
+    last_result = evidence.get("last_reviewer_result") if isinstance(evidence.get("last_reviewer_result"), dict) else {}
+    if str(last_result.get("verdict") or "").strip().upper() != "FAIL":
+        return False
+    candidate = evidence.get("worker_done_candidate") if isinstance(evidence.get("worker_done_candidate"), dict) else {}
+    if candidate and str(candidate.get("status") or "").strip().lower() != "rejected":
+        return False
+    loop_state = evidence.get("reviewer_loop") if isinstance(evidence.get("reviewer_loop"), dict) else {}
+    try:
+        attempt = int(loop_state.get("attempt") or candidate.get("attempt") or 1)
+    except (TypeError, ValueError):
+        attempt = 1
+    return attempt < _reviewer_loop_max_attempts(evidence)
+
+
+def _recent_pr_urls(conn: sqlite3.Connection, task_id: str, cutoff: int = 0) -> list[str]:
+    """Return distinct GitHub PR URLs from task comments since ``cutoff``."""
+    urls: list[str] = []
+    seen: set[str] = set()
+    for c in conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ? ORDER BY created_at ASC",
+        (task_id, cutoff),
+    ).fetchall():
+        for match in _RESPAWN_GUARD_PR_URL_RE.finditer(c["body"] or ""):
+            url = match.group(0).rstrip(".,)}]")
+            key = url.lower()
+            if key not in seen:
+                seen.add(key)
+                urls.append(url)
+    return urls
+
+
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -5870,7 +5967,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT status, review_phase, closeout_evidence, last_failure_error FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -5883,9 +5980,17 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
     now = int(time.time())
 
+    remediation_pending = _reviewer_fail_remediation_pending(
+        row["closeout_evidence"],
+        status=row["status"],
+        review_phase=row["review_phase"],
+    )
+
     # 2. Completed run within guard window — proof of recent success.
+    # Reviewer FAIL remediation is an intentional requeue, so a recent reviewer
+    # run must not suppress the worker that should update the existing PR.
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
-    if conn.execute(
+    if not remediation_pending and conn.execute(
         "SELECT id FROM task_runs "
         "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ?",
         (task_id, cutoff),
@@ -5893,13 +5998,11 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         return "recent_success"
 
     # 3. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # For reviewer FAIL remediation, the active PR is the target to update, not
+    # a duplicate-PR reason to suppress the next worker.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+    if _recent_pr_urls(conn, task_id, pr_cutoff) and not remediation_pending:
+        return "active_pr"
 
     return None
 
@@ -6914,6 +7017,29 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.body and task.body.strip():
         lines.append("## Body")
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
+        lines.append("")
+
+    if _reviewer_fail_remediation_pending(
+        task.closeout_evidence,
+        status=task.status,
+        review_phase=task.review_phase,
+    ):
+        lines.append("## Reviewer remediation mode")
+        lines.append(
+            "A reviewer returned FAIL and this worker run is a remediation retry. "
+            "Do not open a new PR. Update the existing task branch/PR only, then "
+            "submit the fixed evidence for another reviewer pass."
+        )
+        pr_urls = _recent_pr_urls(conn, task_id)
+        if pr_urls:
+            lines.append("Existing PR target(s):")
+            for url in pr_urls:
+                lines.append(f"- {url}")
+        evidence = task.closeout_evidence if isinstance(task.closeout_evidence, dict) else {}
+        reviewer_result = evidence.get("last_reviewer_result") if isinstance(evidence.get("last_reviewer_result"), dict) else {}
+        if reviewer_result:
+            lines.append("Reviewer FAIL payload:")
+            lines.append(f"`{_cap(json.dumps(reviewer_result, ensure_ascii=False, sort_keys=True))}`")
         lines.append("")
 
     # Attachments — files uploaded to this task (PDFs, source docs,
