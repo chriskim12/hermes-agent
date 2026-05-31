@@ -122,11 +122,25 @@ def test_run_slash_create_with_parent_and_cascade(kanban_home):
     out2 = kc.run_slash(f"create 'child' --assignee bob --parent {p}")
     assert "todo" in out2  # child starts as todo
 
-    # Complete parent; list should promote child to ready
     kc.run_slash(f"complete {p}")
     # Explicit filter: child should now be ready (was todo before complete).
     ready_list = kc.run_slash("list --status ready")
     assert "child" in ready_list
+
+
+def test_run_slash_list_is_read_only_and_does_not_recompute_ready(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        child = kb.create_task(conn, title="child", assignee="bob", parents=[parent])
+        assert kb.get_task(conn, child).status == "todo"
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))
+        conn.commit()
+
+    ready_list = kc.run_slash("list --status ready")
+
+    assert "child" not in ready_list
+    with kb.connect() as conn:
+        assert kb.get_task(conn, child).status == "todo"
 
 
 def test_run_slash_show_includes_comments(kanban_home):
