@@ -99,6 +99,7 @@ _log = logging.getLogger(__name__)
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+VALID_REVIEW_PHASES = {"worker_done", "review_ready", "closed"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -926,6 +927,12 @@ def _json_loads_maybe(value: Any) -> Optional[dict]:
     except Exception:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _json_dumps_dict(value: dict, label: str) -> str:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return json.dumps(value, ensure_ascii=False)
 
 
 def _strtobool(value: Any, *, default: bool = False) -> bool:
@@ -2158,6 +2165,8 @@ def create_task(
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
+    closeout_evidence: Optional[dict] = None,
+    review_phase: Optional[str] = None,
     board: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
@@ -2323,8 +2332,9 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        review_phase, closeout_evidence
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2346,6 +2356,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        review_phase,
+                        json.dumps(closeout_evidence) if closeout_evidence is not None else None,
                     ),
                 )
                 for pid in parents:
@@ -2410,6 +2422,152 @@ VALID_SORT_ORDERS: dict[str, str] = {
     "title": "title ASC, id ASC",
     "updated": "started_at DESC NULLS LAST, created_at DESC",
 }
+
+
+def set_task_authority(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    review_phase: Optional[str] = None,
+    closeout_evidence: Optional[dict] = None,
+) -> bool:
+    """Set closeout authority metadata without changing raw task lifecycle.
+
+    Test and CLI closeout flows use this to seed a known worker/review phase
+    before running a check-only verifier. It intentionally does not mark the
+    task done, review_ready, or closed.
+    """
+    if review_phase is not None and review_phase not in VALID_REVIEW_PHASES:
+        raise ValueError(f"review_phase must be one of {sorted(VALID_REVIEW_PHASES)}")
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET review_phase = COALESCE(?, review_phase),
+                   closeout_evidence = COALESCE(?, closeout_evidence)
+             WHERE id = ?
+               AND status != 'archived'
+            """,
+            (
+                review_phase,
+                _json_dumps_dict(closeout_evidence, "closeout_evidence")
+                if closeout_evidence is not None
+                else None,
+                task_id,
+            ),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "authority_updated",
+            {
+                "review_phase": review_phase,
+                "closeout_evidence_updated": closeout_evidence is not None,
+            },
+        )
+    return True
+
+
+def apply_closeout_transition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    review_phase: str,
+    closeout_evidence: dict,
+) -> bool:
+    """Persist a verified Kanban-native closeout phase transition.
+
+    The verifier lives in :mod:`hermes_cli.kanban_closeout`; this DB helper only
+    applies already-verified facts to the governance columns. Final ``closed``
+    maps to raw task ``done`` because the v1 task status enum has no separate
+    ``closed`` state. Earlier review phases never imply final closure.
+    """
+    if review_phase not in VALID_REVIEW_PHASES:
+        raise ValueError(f"review_phase must be one of {sorted(VALID_REVIEW_PHASES)}")
+    if not isinstance(closeout_evidence, dict):
+        raise ValueError("closeout_evidence must be a JSON object")
+
+    now = int(time.time())
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if current is None:
+            return False
+
+        if review_phase == "closed":
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET review_phase = ?,
+                       closeout_evidence = ?,
+                       status = 'done',
+                       completed_at = COALESCE(completed_at, ?),
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL
+                 WHERE id = ?
+                   AND status != 'archived'
+                """,
+                (
+                    review_phase,
+                    _json_dumps_dict(closeout_evidence, "closeout_evidence"),
+                    now,
+                    task_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="completed",
+                status="done",
+                summary="Kanban closeout approved and closed",
+                metadata={"closeout_phase": "closed"},
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET review_phase = ?,
+                       closeout_evidence = ?,
+                       status = 'blocked',
+                       completed_at = NULL,
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL
+                 WHERE id = ?
+                   AND status != 'archived'
+                """,
+                (
+                    review_phase,
+                    _json_dumps_dict(closeout_evidence, "closeout_evidence"),
+                    task_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = _current_run_id(conn, task_id)
+
+        _append_event(
+            conn,
+            task_id,
+            "closeout_transition",
+            {
+                "review_phase": review_phase,
+                "blockers": closeout_evidence.get("verification", {}).get("blockers", []),
+                "allowed": closeout_evidence.get("verification", {}).get("allowed"),
+                "linear_done_mutated": False,
+            },
+            run_id=run_id,
+        )
+    if review_phase == "closed":
+        recompute_ready(conn)
+    return True
 
 
 def list_tasks(
@@ -3763,6 +3921,17 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    existing = conn.execute(
+        "SELECT review_phase, closeout_evidence FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if existing is None:
+        return False
+    existing_phase = existing["review_phase"] if "review_phase" in existing.keys() else None
+    existing_closeout = existing["closeout_evidence"] if "closeout_evidence" in existing.keys() else None
+    governed_closeout = bool(existing_phase or existing_closeout)
+    if existing_phase in {"review_ready", "closed"}:
+        return False
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -3796,32 +3965,40 @@ def complete_task(
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status       = 'done',
+                   SET status       = CASE WHEN ? THEN 'blocked' ELSE 'done' END,
                        result       = ?,
-                       completed_at = ?,
+                       completed_at = CASE WHEN ? THEN NULL ELSE ? END,
                        claim_lock   = NULL,
                        claim_expires= NULL,
-                       worker_pid   = NULL
+                       worker_pid   = NULL,
+                       review_phase = CASE
+                           WHEN ? THEN 'worker_done'
+                           ELSE review_phase
+                       END
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                 """,
-                (result, now, task_id),
+                (1 if governed_closeout else 0, result, 1 if governed_closeout else 0, now, 1 if governed_closeout else 0, task_id),
             )
         else:
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status       = 'done',
+                   SET status       = CASE WHEN ? THEN 'blocked' ELSE 'done' END,
                        result       = ?,
-                       completed_at = ?,
+                       completed_at = CASE WHEN ? THEN NULL ELSE ? END,
                        claim_lock   = NULL,
                        claim_expires= NULL,
-                       worker_pid   = NULL
+                       worker_pid   = NULL,
+                       review_phase = CASE
+                           WHEN ? THEN 'worker_done'
+                           ELSE review_phase
+                       END
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                    AND current_run_id = ?
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (1 if governed_closeout else 0, result, 1 if governed_closeout else 0, now, 1 if governed_closeout else 0, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
@@ -3899,8 +4076,9 @@ def complete_task(
     # just tracks "is there a current pathology the breaker should
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
-    # Recompute ready status for dependents (separate txn so children see done).
-    recompute_ready(conn)
+    if not governed_closeout:
+        # Recompute ready status for dependents only after legacy/final done.
+        recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     return True

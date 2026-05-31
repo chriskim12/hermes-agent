@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_closeout
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.profiles import get_active_profile_name, get_profile_dir, seed_profile_skills
 
@@ -544,6 +545,33 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
 
+    p_closeout = sub.add_parser(
+        "closeout",
+        help="Verify and persist worker_done/review_ready/closed governance transitions",
+    )
+    p_closeout.add_argument("task_id")
+    p_closeout.add_argument(
+        "phase",
+        choices=sorted(kb.VALID_REVIEW_PHASES),
+        help="Target review phase: worker_done, review_ready, or closed",
+    )
+    p_closeout.add_argument(
+        "--evidence",
+        default=None,
+        help="JSON object with PR/check/evidence/cleanup/approval closeout facts",
+    )
+    p_closeout.add_argument(
+        "--repo",
+        default=None,
+        help="Repository/worktree path for live git/gh verification (defaults to task workspace_path)",
+    )
+    p_closeout.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Verify but do not write the Kanban task",
+    )
+    p_closeout.add_argument("--json", action="store_true", help="Emit JSON output")
+
     p_edit = sub.add_parser(
         "edit",
         help="Edit recovery fields on an already-completed task",
@@ -964,6 +992,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "comment":  _cmd_comment,
         "complete": _cmd_complete,
         "edit":     _cmd_edit,
+        "closeout": _cmd_closeout,
         "block":    _cmd_block,
         "schedule": _cmd_schedule,
         "unblock":  _cmd_unblock,
@@ -1967,6 +1996,55 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             )
             return 1
     print(f"Edited {args.task_id}")
+    return 0
+
+
+def _cmd_closeout(args: argparse.Namespace) -> int:
+    raw = getattr(args, "evidence", None)
+    try:
+        evidence = json.loads(raw) if raw else {}
+        if not isinstance(evidence, dict):
+            raise ValueError("must be a JSON object")
+    except (ValueError, json.JSONDecodeError) as exc:
+        print(f"kanban: --evidence: {exc}", file=sys.stderr)
+        return 2
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, args.task_id)
+        if task is None:
+            print(f"no such task: {args.task_id}", file=sys.stderr)
+            return 1
+        repo_path = getattr(args, "repo", None) or task.workspace_path
+        if getattr(args, "check_only", False):
+            result = kanban_closeout.verify_closeout_transition(
+                args.phase,
+                evidence,
+                current_phase=task.review_phase,
+                repo_path=repo_path,
+            ).to_dict()
+            result.update({"status": "verified" if result["allowed"] else "blocked", "task_id": task.id})
+        else:
+            result = kanban_closeout.transition_task_closeout(
+                conn,
+                task.id,
+                args.phase,
+                evidence,
+                repo_path=repo_path,
+            )
+
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("status") in {"transitioned", "verified"} and not result.get("blockers") else 2
+
+    if result.get("blockers"):
+        print(
+            f"Closeout blocked for {args.task_id} -> {args.phase}: "
+            + ", ".join(result.get("blockers") or []),
+            file=sys.stderr,
+        )
+        return 2
+    action = "Verified" if getattr(args, "check_only", False) else "Transitioned"
+    print(f"{action} {args.task_id} -> {args.phase}")
     return 0
 
 

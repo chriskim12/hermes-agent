@@ -488,6 +488,10 @@ def _handle_complete(args: dict, **kw) -> str:
     result = args.get("result")
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
+    closeout_evidence = args.get("closeout_evidence")
+    closeout_target_phase = (
+        str(args.get("closeout_target_phase") or "").strip() or None
+    )
     if created_cards is not None:
         if isinstance(created_cards, str):
             # Accept a single id as a string for convenience.
@@ -548,6 +552,17 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
+    if closeout_evidence is not None and not isinstance(closeout_evidence, dict):
+        return tool_error(
+            f"closeout_evidence must be an object/dict, got {type(closeout_evidence).__name__}"
+        )
+    if closeout_target_phase is not None and closeout_target_phase not in {
+        "worker_done",
+        "review_ready",
+    }:
+        return tool_error(
+            "closeout_target_phase must be one of: worker_done, review_ready"
+        )
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
@@ -585,7 +600,37 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
+            closeout_result = None
+            if closeout_evidence is not None:
+                from hermes_cli import kanban_closeout
+
+                target_phase = closeout_target_phase or "review_ready"
+                worker_done = kanban_closeout.transition_task_closeout(
+                    conn,
+                    tid,
+                    target_phase="worker_done",
+                    evidence=closeout_evidence,
+                )
+                if (
+                    target_phase == "worker_done"
+                    or worker_done.get("status") != "transitioned"
+                ):
+                    closeout_result = worker_done
+                else:
+                    review_ready = kanban_closeout.transition_task_closeout(
+                        conn,
+                        tid,
+                        target_phase="review_ready",
+                        evidence=closeout_evidence,
+                    )
+                    closeout_result = {
+                        **review_ready,
+                        "worker_done_transition": worker_done,
+                    }
+            response = {"task_id": tid, "run_id": run.id if run else None}
+            if closeout_result is not None:
+                response["closeout"] = closeout_result
+            return _ok(**response)
         finally:
             conn.close()
     except ValueError as e:
@@ -975,7 +1020,13 @@ KANBAN_COMPLETE_SCHEMA = {
         "human-readable 1-3 sentence description of what you did; put "
         "machine-readable facts in ``metadata`` (changed_files, "
         "tests_run, decisions, findings, etc). At least one of "
-        "``summary`` or ``result`` is required. If you created new "
+        "``summary`` or ``result`` is required. If the task is ready "
+        "for review, include ``closeout_evidence`` with verifier PASS, "
+        "boundaries_confirmed=true, checks, residue, cleanup proof, and "
+        "the simple review package: changed_files non-empty requires a "
+        "live PR; changed_files empty requires no_pr_reason plus proof "
+        "or artifact refs. The kernel will attempt worker_done -> review_ready using "
+        "the same fail-closed closeout verifier. If you created new "
         "tasks via ``kanban_create`` during this run, list their ids "
         "in ``created_cards`` — the kernel verifies them so phantom "
         "references are caught before they leak into downstream "
@@ -1008,6 +1059,28 @@ KANBAN_COMPLETE_SCHEMA = {
                     "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
                     "\"findings\": [...]}. Surfaced to downstream "
                     "workers alongside ``summary``."
+                ),
+            },
+            "closeout_evidence": {
+                "type": "object",
+                "description": (
+                    "Optional Kanban closeout evidence package. When provided, "
+                    "kanban_complete first records worker_done, then attempts "
+                    "review_ready by running the existing fail-closed closeout "
+                    "verifier. Include verifier PASS, boundaries_confirmed=true, "
+                    "checks, residue, cleanup proof, and the simple review "
+                    "package: changed_files non-empty requires a live PR; "
+                    "changed_files empty requires no_pr_reason plus proof or "
+                    "artifact refs."
+                ),
+            },
+            "closeout_target_phase": {
+                "type": "string",
+                "enum": ["worker_done", "review_ready"],
+                "description": (
+                    "Optional closeout target for closeout_evidence. Defaults "
+                    "to review_ready. Use worker_done to record evidence without "
+                    "attempting review_ready promotion."
                 ),
             },
             "result": {
