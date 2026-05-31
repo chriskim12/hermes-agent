@@ -714,3 +714,69 @@ Still unresolved and should not be implied by this proof:
 
 Those are higher-risk lifecycle/accounting behaviors and should be handled as separate sub-slices rather than bundled into the relation metadata proof.
 
+## 16. Slice 3b local proof — reviewer remediation vs duplicate PR guard (2026-06-01)
+
+Status: **local proof complete; not pushed; not merged; no live apply**.
+
+### Scope fixed
+
+Chris approved the recommendation to split the next work at `reviewer remediation vs duplicate PR guard`. During implementation, the old local carry was found to depend on broader review-loop/autopilot substrate (`gateway/kanban_autopilot.py`, full reviewer-loop transitions) that should not be resurrected wholesale on the upstream-based branch.
+
+This sub-slice therefore preserved only the narrow kernel invariant:
+
+- A normal ready task with a recent PR comment remains `active_pr` guarded to prevent duplicate PR creation.
+- A task explicitly marked as reviewer-FAIL remediation may respawn even with an active PR comment, because the worker must update the existing PR rather than create a duplicate.
+- The worker context must clearly say remediation mode and list existing PR target(s).
+
+### Classification
+
+- **Preserve / adapter** for the kernel guard and worker-context warning.
+- **Do not resurrect** the old `gateway/kanban_autopilot.py` substrate in this slice.
+- Full review-loop/autopilot routing remains a later design slice.
+
+### Implementation result
+
+Applied on local Slice 3 branch `yuuka/hermes-upstream-20260601-slice2-local`:
+
+- `00841587b fix(kanban): allow reviewer remediation with active PR`
+
+The cumulative local proof branch now has **10 commits ahead of latest `upstream/main` base `1044d9f25`**.
+
+### TDD / verification
+
+RED was observed first:
+
+- `python -m pytest tests/hermes_cli/test_kanban_db.py::test_dispatch_allows_reviewer_fail_remediation_with_existing_pr -q` initially failed because the upstream-based branch did not yet have `closeout_evidence` task state / remediation handling.
+
+GREEN / focused verification:
+
+- `python -m py_compile hermes_cli/kanban_db.py tests/hermes_cli/test_kanban_db.py` — passed.
+- Specific regression: `python -m pytest tests/hermes_cli/test_kanban_db.py::test_dispatch_allows_reviewer_fail_remediation_with_existing_pr -q` — **1 passed**.
+- DB focused file: `./scripts/run_tests.sh tests/hermes_cli/test_kanban_db.py` — **213 tests passed / 0 failed**.
+- Broader focused bundle:
+  - `./scripts/run_tests.sh tests/hermes_cli/test_kanban_db.py tests/plugins/test_kanban_dashboard_plugin.py tests/tools/test_kanban_tools.py tests/tools/test_terminal_task_cwd.py tests/tools/test_code_execution_modes.py tests/tools/test_terminal_tool.py tests/agent/test_skill_commands.py tests/hermes_cli/test_config_env_refs.py tests/gateway/test_config_env_bridge_authority.py`
+  - **9 files / 495 tests passed / 0 failed**.
+- `git diff --check` — passed before commit.
+
+### Non-actions
+
+- No push.
+- No PR update/new PR.
+- No merge to root `main`.
+- No root checkout materialization.
+- No gateway restart/reload.
+- No live runtime apply.
+- No env/secret/config mutation.
+- No cron mutation.
+
+### Remaining Slice 3 work
+
+Still unresolved and must not be implied by this proof:
+
+- review package simplification / closeout gating.
+- human review handoff context persistence.
+- autopilot worker-candidate review routing.
+- full reviewer-loop lifecycle/adjudication.
+
+Recommended next sub-slice: review package simplification / closeout gating, because it is the next smallest kernel-side behavior before touching gateway/autopilot routing.
+
