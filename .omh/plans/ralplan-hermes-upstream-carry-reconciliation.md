@@ -652,3 +652,65 @@ PY
 - Slice 1 draft PR remains a previously verified partial proof anchor; it was **not** updated in this pass because fork PR update is a separate side effect.
 - Local Slice 2 branch is verified on latest upstream and ready to become the next draft/update candidate if Chris approves fork push/PR update.
 - RALPLAN still does **not** authorize merge, root materialization, gateway restart/reload, live apply, env/secret/config mutation, or cron mutation.
+
+## 15. Slice 3 local proof — Kanban relation metadata (2026-06-01)
+
+Status: **local proof complete; not pushed; not merged; no live apply**.
+
+### Scope fixed
+
+Slice 3 was narrowed to the low-risk Kanban relation metadata carry before touching review/autopilot/handoff behavior:
+
+- `a8dd263639 fix: distinguish kanban hierarchy links from dependencies`
+- `dcf60a7702 feat(kanban): expose relation types in tool and dashboard APIs`
+
+### Classification
+
+- **Preserve / adapter**: relation metadata is still required because parent-child links have two distinct meanings:
+  - `dependency` gates child readiness and dispatch.
+  - `hierarchy` records umbrella/epic structure and must not block executable child work.
+- This is not stale UI decoration. It protects Kanban SSOT from status-word drift where “parent” silently means either blocker or grouping depending on context.
+- No legacy `gateway/kanban_autopilot.py` substrate was resurrected. Review/autopilot/handoff commits remain separate later slices.
+
+### Implementation result
+
+Applied on local Slice 2 worktree branch `yuuka/hermes-upstream-20260601-slice2-local` after conflict resolution:
+
+- `49450e453 fix: distinguish kanban hierarchy links from dependencies`
+- `368ae98f1 feat(kanban): expose relation types in tool and dashboard APIs`
+
+The Slice 3 local branch now has **9 commits ahead of latest `upstream/main` base `1044d9f25`**.
+
+### Verification
+
+- `python -m py_compile hermes_cli/kanban.py hermes_cli/kanban_db.py plugins/kanban/dashboard/plugin_api.py tools/kanban_tools.py` — passed.
+- `git diff --check` — passed.
+- Focused relation/API bundle:
+  - `./scripts/run_tests.sh tests/hermes_cli/test_kanban_db.py tests/plugins/test_kanban_dashboard_plugin.py tests/tools/test_kanban_tools.py`
+  - **3 files / 389 tests passed / 0 failed**.
+- Broader integration bundle:
+  - `./scripts/run_tests.sh tests/tools/test_terminal_task_cwd.py tests/tools/test_code_execution_modes.py tests/tools/test_terminal_tool.py tests/agent/test_skill_commands.py tests/hermes_cli/test_config_env_refs.py tests/gateway/test_config_env_bridge_authority.py tests/hermes_cli/test_kanban_db.py tests/plugins/test_kanban_dashboard_plugin.py tests/tools/test_kanban_tools.py`
+  - **9 files / 494 tests passed / 0 failed**.
+
+### Non-actions
+
+- No push.
+- No PR update/new PR.
+- No merge to root `main`.
+- No root checkout materialization.
+- No gateway restart/reload.
+- No live runtime apply.
+- No env/secret/config mutation.
+- No cron mutation.
+
+### Remaining Slice 3 work
+
+Still unresolved and should not be implied by this proof:
+
+- review package simplification / reviewer remediation semantics.
+- human review handoff context persistence.
+- autopilot worker-candidate review routing.
+- duplicate PR guard vs reviewer remediation distinction.
+
+Those are higher-risk lifecycle/accounting behaviors and should be handled as separate sub-slices rather than bundled into the relation metadata proof.
+
