@@ -780,3 +780,69 @@ Still unresolved and must not be implied by this proof:
 
 Recommended next sub-slice: review package simplification / closeout gating, because it is the next smallest kernel-side behavior before touching gateway/autopilot routing.
 
+## 17. Slice 3c local proof — review package simplification / closeout gating (2026-06-01)
+
+Status: **local proof complete; not pushed; not merged; no live apply**.
+
+### Scope fixed
+
+This sub-slice preserved the closeout/review package kernel required before any broader Autopilot routing can be trusted:
+
+- `worker_done` records executor completion but does **not** mean final Done.
+- `review_ready` requires a fail-closed closeout verifier result with worker evidence, verifier PASS, boundaries confirmation, PR/check evidence or a strict no-PR exception, residue accounting, and cleanup proof.
+- Raw `complete_task` cannot bypass an already-governed review task into board `done`.
+- `kanban_complete` can submit a structured `closeout_evidence` package and the kernel attempts `worker_done -> review_ready` only through the verifier.
+- CLI `/kanban closeout ... --check-only --json` can inspect the gate without mutating the task.
+
+### Classification
+
+- **Preserve / adapter** for closeout package gating and worker_done/review_ready/closed phase separation.
+- **Do not resurrect** old continuous `gateway/kanban_autopilot.py` substrate.
+- This is the output-side verifier kernel needed before later `autopilot worker-candidate review routing` can safely run.
+
+### Implementation result
+
+Applied on local cumulative branch `yuuka/hermes-upstream-20260601-slice2-local`:
+
+- `b94fdb4d0 fix(kanban): gate review package closeout`
+
+The cumulative local proof branch is now **ahead 11** of latest `upstream/main` base `1044d9f25`.
+
+### TDD / verification
+
+RED was observed first:
+
+- A new closeout verifier regression initially failed because the upstream-based branch lacked the local `hermes_cli/kanban_closeout.py` closeout gate module and then lacked the DB authority helpers expected by the review package tests.
+
+GREEN / focused verification:
+
+- `python -m py_compile hermes_cli/kanban.py hermes_cli/kanban_db.py hermes_cli/kanban_closeout.py tools/kanban_tools.py tests/hermes_cli/test_kanban_closeout.py tests/tools/test_kanban_tools.py` — passed.
+- Closeout/tool focused bundle:
+  - `./scripts/run_tests.sh tests/hermes_cli/test_kanban_closeout.py tests/tools/test_kanban_tools.py`
+  - **2 files / 127 tests passed / 0 failed**.
+- Broader Kanban/review integration bundle:
+  - `git diff --check && ./scripts/run_tests.sh tests/hermes_cli/test_kanban_closeout.py tests/tools/test_kanban_tools.py tests/hermes_cli/test_kanban_db.py tests/plugins/test_kanban_dashboard_plugin.py tests/tools/test_kanban_tools.py tests/tools/test_terminal_task_cwd.py tests/tools/test_code_execution_modes.py tests/tools/test_terminal_tool.py tests/agent/test_skill_commands.py tests/hermes_cli/test_config_env_refs.py tests/gateway/test_config_env_bridge_authority.py`
+  - **10 files / 540 tests passed / 0 failed**.
+
+### Non-actions
+
+- No push.
+- No PR update/new PR.
+- No merge to root `main`.
+- No root checkout materialization.
+- No gateway restart/reload.
+- No live runtime apply.
+- No env/secret/config mutation.
+- No cron mutation.
+
+### Remaining Slice 3 work
+
+Still unresolved and must not be implied by this proof:
+
+- human review handoff context persistence.
+- autopilot worker-candidate review routing.
+- full reviewer-loop lifecycle/adjudication.
+- end-to-end bounded `/autopilot` smoke after the evaluator/routing substrate is materialized.
+
+Recommended next sub-slice: **human review handoff context persistence**. The closeout gate now defines what counts as reviewable output; next the review/handoff context needs to persist enough detail for a reviewer or remediation worker to act without rebuilding state from scattered comments.
+
