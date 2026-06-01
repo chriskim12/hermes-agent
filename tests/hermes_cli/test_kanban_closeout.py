@@ -729,6 +729,51 @@ def test_closed_accepts_merged_pr(git_repo):
     assert result.blockers == []
 
 
+def test_closed_accepts_squash_merged_pr_when_merge_commit_matches_repo_head(git_repo):
+    """A squash-merged PR closes against the merge commit, not feature head."""
+    feature_head = "f" * 40
+    merge_commit = _head(git_repo)
+    evidence = _closed_evidence(
+        git_repo,
+        pr={
+            **_closed_evidence(git_repo)["pr"],
+            "head_sha": feature_head,
+            "merge_commit_sha": merge_commit,
+        },
+    )
+
+    result = closeout.verify_closeout_transition(
+        "closed",
+        evidence,
+        current_phase="review_ready",
+        repo_path=git_repo,
+    )
+
+    assert result.allowed is True, f"Blockers: {result.blockers}"
+    assert "stale_pr" not in result.blockers
+
+
+def test_closed_blocks_merged_pr_when_neither_head_nor_merge_commit_matches(git_repo):
+    evidence = _closed_evidence(
+        git_repo,
+        pr={
+            **_closed_evidence(git_repo)["pr"],
+            "head_sha": "f" * 40,
+            "merge_commit_sha": "e" * 40,
+        },
+    )
+
+    result = closeout.verify_closeout_transition(
+        "closed",
+        evidence,
+        current_phase="review_ready",
+        repo_path=git_repo,
+    )
+
+    assert result.allowed is False
+    assert "stale_pr" in result.blockers
+
+
 def test_closed_blocks_missing_cleanup_proof(git_repo):
     """closed with approval but no cleanup proof must block."""
     evidence = _closed_evidence(git_repo)

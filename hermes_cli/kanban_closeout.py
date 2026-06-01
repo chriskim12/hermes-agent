@@ -227,7 +227,7 @@ def _run_gh_pr_view(repo_path: str | Path | None, selector: str | None) -> dict[
         "view",
         *([selector] if selector else []),
         "--json",
-        "number,url,state,isDraft,headRefOid,statusCheckRollup",
+        "number,url,state,isDraft,headRefOid,mergeCommit,statusCheckRollup",
     ]
     result = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, check=False, timeout=30)
     if result.returncode != 0:
@@ -244,6 +244,7 @@ def _run_gh_pr_view(repo_path: str | Path | None, selector: str | None) -> dict[
         "state": data.get("state"),
         "is_draft": data.get("isDraft"),
         "head_sha": data.get("headRefOid"),
+        "merge_commit_sha": _text(_as_mapping(data.get("mergeCommit")).get("oid")),
         "live": True,
         "provider": "gh_pr_view",
         "checks": data.get("statusCheckRollup") or [],
@@ -466,10 +467,13 @@ def _check_closed_pr(evidence: Mapping[str, Any]) -> list[str]:
         blockers.append("pr_unrecognized_state")
 
     pr_head = _text(pr.get("head_sha") or pr.get("headRefOid") or pr.get("head_oid"))
+    merge_commit = _text(pr.get("merge_commit_sha") or pr.get("mergeCommitSha"))
+    if not merge_commit:
+        merge_commit = _text(_as_mapping(pr.get("mergeCommit")).get("oid"))
     git_head = _text(_as_mapping(evidence.get("git")).get("head_sha"))
     if not pr_head:
         blockers.append("missing_pr_head_sha")
-    elif git_head and pr_head != git_head:
+    elif git_head and pr_head != git_head and merge_commit != git_head:
         blockers.append("stale_pr")
     return blockers
 
