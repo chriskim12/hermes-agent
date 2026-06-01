@@ -1655,6 +1655,52 @@ def test_governed_goal_worker_completion_hands_off_to_worker_done(kanban_home):
     assert "missing_verifier_pass" in review_ready.blockers
 
 
+def test_governed_goal_worker_completion_accepts_forbidden_side_effects_alias(kanban_home):
+    """Read-only worker metadata may report forbidden_side_effects=False.
+
+    Live DC-029 v4 smoke showed workers often submit that alias instead of
+    forbidden_actions_performed=False; the generated worker evidence must still
+    confirm the authority boundary for review_ready verifier gates.
+    """
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="governed smoke alias",
+            body=_governed_worker_body(),
+            assignee="arisu",
+            goal_mode=True,
+            goal_max_turns=3,
+        )
+
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="criteria satisfied with read-only evidence",
+            metadata={
+                "changed_files": [],
+                "forbidden_side_effects": False,
+                "read_only": True,
+                "goal_mode_observed_by_worker": True,
+                "commands": {"dc-01-confirm-repo-exists": "test -d /tmp/repo"},
+            },
+        ) is True
+
+        task = kb.get_task(conn, task_id)
+        review_ready = kc.verify_closeout_transition(
+            "review_ready",
+            task.closeout_evidence,
+            current_phase=task.review_phase,
+            live_pr_provider=lambda evidence, repo_path: {},
+        )
+
+    worker = task.closeout_evidence["worker_evidence"]
+    assert worker["authority_boundary_confirmed"] is True
+    assert worker["forbidden_actions_performed"] == []
+    assert "worker_authority_boundary_unconfirmed" not in review_ready.blockers
+    assert review_ready.allowed is False
+    assert "missing_verifier_pass" in review_ready.blockers
+
+
 def test_review_ready_transition_closes_active_verifier_run(kanban_home):
     """A verifier PASS handoff must not leave current_run_id pointing at a closed run."""
     evidence = {
