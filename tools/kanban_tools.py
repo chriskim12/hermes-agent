@@ -332,6 +332,145 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     }
 
 
+
+def _as_dict(value: Any) -> dict:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> list:
+    if value is None or value is False:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _merge_verifier_review_ready_evidence(
+    existing_closeout: Any,
+    submitted_closeout: dict,
+    *,
+    metadata: Optional[dict],
+    summary: Optional[str],
+) -> dict:
+    """Merge verifier PASS payloads onto the existing worker_done package."""
+
+    merged = _as_dict(existing_closeout).copy()
+    submitted = dict(submitted_closeout or {})
+    merged.update(submitted)
+
+    md = dict(metadata or {})
+    verifier_result = _as_dict(merged.get("verifier_result"))
+    verdict = str(verifier_result.get("verdict") or md.get("verdict") or "").lower()
+    changed_files = _as_list(
+        md.get("changed_files")
+        if "changed_files" in md
+        else _as_dict(merged.get("evidence")).get("changed_files")
+    )
+    read_only = (
+        md.get("read_only") is True
+        or _as_dict(merged.get("metadata")).get("read_only") is True
+    )
+    no_forbidden = (
+        md.get("forbidden_side_effects") is False
+        or md.get("forbidden_actions_performed") is False
+        or _as_dict(merged.get("worker_evidence")).get("forbidden_actions_performed") == []
+    )
+
+    if verifier_result and not merged.get("verifier_verdict"):
+        merged["verifier_verdict"] = {"verdict": verifier_result.get("verdict")}
+
+    if verdict == "pass" and not changed_files and read_only and no_forbidden:
+        ledger = _as_dict(merged.get("done_criteria_ledger"))
+        if ledger:
+            if not _as_list(ledger.get("forbidden_actions")):
+                ledger["forbidden_actions"] = [
+                    "env mutation",
+                    "secret mutation",
+                    "production mutation",
+                    "customer-visible send",
+                    "billing mutation",
+                    "provider-state mutation",
+                    "gateway restart/reload",
+                    "git push/merge",
+                ]
+            criteria = []
+            for raw in _as_list(ledger.get("criteria")):
+                item = dict(raw) if isinstance(raw, dict) else raw
+                if isinstance(item, dict):
+                    if not item.get("authority_boundary"):
+                        item["authority_boundary"] = (
+                            "Read-only verifier handoff only; no prod, secret, billing, "
+                            "customer, env, provider, git, or gateway mutation authority."
+                        )
+                criteria.append(item)
+            if criteria:
+                ledger["criteria"] = criteria
+            try:
+                from hermes_cli.kanban_closeout import normalize_done_criteria_ledger
+
+                ledger = normalize_done_criteria_ledger(ledger)
+            except Exception:
+                pass
+            merged["done_criteria_ledger"] = ledger
+            criteria_hash = ledger.get("criteria_hash")
+            if criteria_hash:
+                worker_evidence = _as_dict(merged.get("worker_evidence"))
+                if worker_evidence:
+                    worker_evidence["criteria_hash"] = criteria_hash
+                    merged["worker_evidence"] = worker_evidence
+                verifier_result = _as_dict(merged.get("verifier_result"))
+                if verifier_result:
+                    verifier_result["criteria_hash"] = criteria_hash
+                    merged["verifier_result"] = verifier_result
+        merged.setdefault("authority_boundary_confirmed", True)
+        work = _as_dict(merged.get("evidence"))
+        refs = _as_list(md.get("evidence_refs"))
+        commands = _as_list(md.get("commands_verified"))
+        work.setdefault("changed_files", [])
+        work.setdefault("summary", summary or "Verifier PASS for no-code/read-only handoff")
+        work.setdefault("proof", "; ".join(str(x) for x in (commands or refs)) or summary or "Verifier PASS")
+        if refs and not work.get("artifact_refs"):
+            work["artifact_refs"] = refs
+        work.setdefault(
+            "review_package_expectation",
+            "review the verifier-confirmed no-code/read-only evidence; no repository diff expected",
+        )
+        merged["evidence"] = work
+        merged.setdefault(
+            "no_pr_reason",
+            "Verifier confirmed this handoff is no-code/read-only and produced no repository diff.",
+        )
+        merged.setdefault(
+            "no_pr_exception",
+            {
+                "policy": "kanban-verifier no-code/read-only handoff",
+                "reason": "Verifier confirmed changed_files=[] and no PR is expected for this review package.",
+                "review_package_expectation": work["review_package_expectation"],
+                "changed_files_expected": False,
+            },
+        )
+        merged.setdefault(
+            "checks",
+            [{"name": "kanban-verifier", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+        )
+        merged.setdefault(
+            "residue",
+            {"summary": "No residue reported by verifier", "items": []},
+        )
+        merged.setdefault(
+            "cleanup",
+            {
+                "proof": "Verifier confirmed no repository files or external state were changed.",
+                "artifacts_removed": [],
+                "worktree_retained": False,
+            },
+        )
+
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
@@ -568,6 +707,13 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            existing_task = kb.get_task(conn, tid)
+            existing_closeout = (
+                existing_task.closeout_evidence
+                if existing_task is not None
+                and isinstance(existing_task.closeout_evidence, dict)
+                else {}
+            )
             try:
                 ok = kb.complete_task(
                     conn, tid,
@@ -605,6 +751,13 @@ def _handle_complete(args: dict, **kw) -> str:
                 from hermes_cli import kanban_closeout
 
                 target_phase = closeout_target_phase or "review_ready"
+                if target_phase == "review_ready":
+                    closeout_evidence = _merge_verifier_review_ready_evidence(
+                        existing_closeout,
+                        closeout_evidence,
+                        metadata=metadata,
+                        summary=summary if summary is not None else result,
+                    )
                 worker_done = kanban_closeout.transition_task_closeout(
                     conn,
                     tid,

@@ -412,6 +412,136 @@ def test_complete_autopromotes_review_ready_when_worker_submits_closeout_package
         conn.close()
 
 
+def test_verifier_review_ready_completion_merges_worker_done_evidence(monkeypatch, tmp_path):
+    """Verifier closeout may submit only verifier_result; keep worker_done evidence.
+
+    This reproduces the DC-029 smoke gap: the verifier process completed with a
+    PASS result, but review_ready verification saw only the verifier payload and
+    failed closed with missing done-criteria/worker-evidence blockers.
+    """
+    from pathlib import Path as _Path
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "verifier")
+    monkeypatch.setenv("HERMES_SESSION_ID", "verifier-session")
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    body = """
+Goal: Complete a read-only smoke.
+End-state/output: Worker evidence only, no final close.
+Scope/non-goals: no PR, commit, deploy, customer-visible send, or mutation.
+Acceptance criteria: all Done criteria below have evidence.
+Verification requirements: read-only checks only.
+Authority boundary: no prod, secret, billing, customer, env, cron, or gateway restart authority.
+Repo/lane truth: sandbox repo path.
+Risk flags: env, secret, prod, customer-visible send, billing, deploy are forbidden.
+Dependencies/blockers: none.
+Routing verdict: direct-kanban.
+Reviewer-loop contract: required reviewer_profile verifier.
+Review package expectation: review_ready requires worker evidence and verifier PASS.
+Done criteria:
+- Confirm repo exists.
+- Confirm no forbidden side effects were performed.
+"""
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="governed smoke awaiting verifier",
+            body=body,
+            assignee="arisu",
+            goal_mode=True,
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="worker read-only evidence ready",
+            metadata={
+                "changed_files": [],
+                "forbidden_actions_performed": False,
+                "read_only": True,
+                "evidence_refs": ["command:test -d repo"],
+                "commands": {"dc-01-confirm-repo-exists": "test -d repo"},
+            },
+        ) is True
+        worker_done_task = kb.get_task(conn, task_id)
+        assert worker_done_task.review_phase == "worker_done"
+        ledger = worker_done_task.closeout_evidence["done_criteria_ledger"]
+        criteria_hash = ledger["criteria_hash"]
+        verifier_claim = kb.claim_verifier_task(conn, task_id, reviewer_profile="verifier")
+        assert verifier_claim is not None
+        run_id = kb.get_task(conn, task_id).current_run_id
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+
+    verifier_result = {
+        "schema": "kanban_verifier_result.v1",
+        "verdict": "PASS",
+        "criteria_hash": criteria_hash,
+        "verification_attempt": 1,
+        "authority_boundary_ok": True,
+        "retry_allowed": False,
+        "per_criterion": {
+            criterion["id"]: {
+                "verdict": "PASS",
+                "evidence_refs": ["verifier:read-only proof"],
+                "notes": "worker evidence independently verified",
+            }
+            for criterion in ledger["criteria"]
+        },
+    }
+
+    out = kt._handle_complete({
+        "summary": "Verifier PASS for read-only handoff",
+        "metadata": {
+            "verdict": "PASS",
+            "changed_files": [],
+            "read_only": True,
+            "forbidden_side_effects": False,
+            "commands_verified": ["git status --short"],
+            "evidence_refs": ["verifier:read-only proof"],
+        },
+        "closeout_target_phase": "review_ready",
+        "closeout_evidence": {"verifier_result": verifier_result},
+    })
+    result = json.loads(out)
+
+    assert result["ok"] is True
+    assert result["closeout"]["status"] == "transitioned"
+    assert result["closeout"]["review_phase"] == "review_ready"
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        assert task.status == "blocked"
+        assert task.review_phase == "review_ready"
+        assert task.current_run_id is None
+        evidence = task.closeout_evidence
+        final_hash = evidence["done_criteria_ledger"]["criteria_hash"]
+        assert final_hash
+        assert evidence["worker_evidence"]["schema"] == "kanban_worker_evidence.v1"
+        assert evidence["worker_evidence"]["criteria_hash"] == final_hash
+        assert evidence["verifier_result"]["schema"] == "kanban_verifier_result.v1"
+        assert evidence["verifier_result"]["criteria_hash"] == final_hash
+        assert evidence["no_pr_exception"]["changed_files_expected"] is False
+        assert evidence["cleanup"]["artifacts_removed"] == []
+    finally:
+        conn.close()
+
+
 def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):
     from tools import kanban_tools as kt
 
