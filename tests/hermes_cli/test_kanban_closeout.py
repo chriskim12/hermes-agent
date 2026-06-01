@@ -857,3 +857,354 @@ def test_closed_happy_path_end_to_end(kanban_home, git_repo):
         t3 = kb.get_task(conn, task_id)
         assert t3.review_phase == "closed"
         assert t3.status == "done"
+
+
+def _done_criteria_ledger(**overrides):
+    ledger = {
+        "schema": "kanban_done_criteria_ledger.v1",
+        "task_id": "t_test",
+        "public_id": "BO-188",
+        "source": {"kind": "card_description", "ref": "kanban://BO-188"},
+        "version": 1,
+        "criteria": [
+            {
+                "id": "DC-001",
+                "text": "Implement the criteria ledger validator.",
+                "source_section": "Done criteria",
+                "required_evidence_types": ["diff", "test"],
+                "deterministic_checks": ["pytest tests/hermes_cli/test_kanban_closeout.py"],
+                "authority_boundary": "No merge, restart, live apply, or env/secret mutation.",
+                "ambiguous": False,
+            }
+        ],
+        "forbidden_actions": ["merge", "gateway_restart", "live_apply", "env_secret_mutation"],
+        "refinement_required": False,
+    }
+    ledger.update(overrides)
+    return ledger
+
+
+_DEFAULT_LEDGER = object()
+
+
+def _governed_evidence(repo: Path, ledger=_DEFAULT_LEDGER, worker_evidence=None, verifier_result=None, **overrides):
+    ledger = _done_criteria_ledger() if ledger is _DEFAULT_LEDGER else ledger
+    normalized_ledger = closeout.normalize_done_criteria_ledger(ledger)
+    worker_evidence = worker_evidence if worker_evidence is not None else {
+        "schema": "kanban_worker_evidence.v1",
+        "task_id": "t_test",
+        "public_id": "BO-188",
+        "criteria_hash": normalized_ledger["criteria_hash"],
+        "attempt": 1,
+        "worker_run_id": "run_1",
+        "branch": "work/BO-188-worker-verifier-loop",
+        "commit": _head(repo),
+        "pr_url": "https://github.com/chriskim12/hermes-agent/pull/188",
+        "diff_refs": ["git:HEAD"],
+        "tests_run": [
+            {"command": "pytest tests/hermes_cli/test_kanban_closeout.py", "result": "passed"}
+        ],
+        "per_criterion": {
+            "DC-001": {
+                "claim": "satisfied",
+                "evidence_refs": ["tests/hermes_cli/test_kanban_closeout.py"],
+            }
+        },
+        "known_gaps": [],
+        "authority_boundary_confirmed": True,
+        "forbidden_actions_performed": [],
+    }
+    verifier_result = verifier_result if verifier_result is not None else {
+        "schema": "kanban_verifier_result.v1",
+        "task_id": "t_test",
+        "public_id": "BO-188",
+        "criteria_hash": normalized_ledger["criteria_hash"],
+        "worker_run_id": "run_1",
+        "verification_attempt": 1,
+        "verdict": "PASS",
+        "per_criterion": {
+            "DC-001": {
+                "verdict": "PASS",
+                "reason_codes": [],
+                "evidence_checked": ["tests/hermes_cli/test_kanban_closeout.py"],
+                "missing_evidence": [],
+            }
+        },
+        "deterministic_checks": [
+            {"name": "pytest", "status": "passed", "output_ref": "local"}
+        ],
+        "retry_allowed": False,
+        "remediation_goal": None,
+        "blocker_reason": None,
+        "authority_boundary_ok": True,
+    }
+    evidence = _review_ready_evidence(
+        repo,
+        done_criteria_ledger=ledger,
+        worker_evidence=worker_evidence,
+        verifier_result=verifier_result,
+        reviewer_loop={"enabled": True, "max_attempts": 3, "attempt": 1},
+        require_done_criteria_ledger=True,
+        require_worker_evidence_contract=True,
+        require_verifier_result_contract=True,
+    )
+    evidence.update(overrides)
+    return evidence
+
+
+def test_done_criteria_ledger_hash_is_stable_across_formatting_noise():
+    left = _done_criteria_ledger()
+    right = _done_criteria_ledger(
+        criteria=[
+            {
+                "id": "DC-001",
+                "text": "  Implement   the criteria ledger validator.\n",
+                "source_section": "Done criteria",
+                "required_evidence_types": ["test", "diff"],
+                "deterministic_checks": ["pytest tests/hermes_cli/test_kanban_closeout.py"],
+                "authority_boundary": "No merge, restart, live apply, or env/secret mutation.",
+                "ambiguous": False,
+            }
+        ],
+        forbidden_actions=["env_secret_mutation", "live_apply", "gateway_restart", "merge"],
+    )
+
+    assert closeout.normalize_done_criteria_ledger(left)["criteria_hash"] == closeout.normalize_done_criteria_ledger(right)["criteria_hash"]
+
+
+def test_done_criteria_ledger_hash_changes_when_meaning_changes():
+    left = _done_criteria_ledger()
+    right = _done_criteria_ledger(
+        criteria=[
+            {
+                **left["criteria"][0],
+                "text": "Implement a verifier-result contract instead.",
+            }
+        ]
+    )
+
+    assert closeout.normalize_done_criteria_ledger(left)["criteria_hash"] != closeout.normalize_done_criteria_ledger(right)["criteria_hash"]
+
+
+@pytest.mark.parametrize(
+    "ledger,blocker",
+    [
+        (None, "missing_done_criteria_ledger"),
+        (_done_criteria_ledger(criteria=[]), "empty_done_criteria"),
+        (_done_criteria_ledger(criteria=[{**_done_criteria_ledger()["criteria"][0], "ambiguous": True}]), "refinement_required"),
+        (_done_criteria_ledger(criteria=[{k: v for k, v in _done_criteria_ledger()["criteria"][0].items() if k != "authority_boundary"}]), "missing_authority_boundary"),
+        (_done_criteria_ledger(criteria=[{**_done_criteria_ledger()["criteria"][0], "deterministic_checks": []}]), "missing_deterministic_checks"),
+    ],
+)
+def test_review_ready_fails_closed_for_invalid_done_criteria_ledger(git_repo, ledger, blocker):
+    result = closeout.verify_closeout_transition(
+        "review_ready",
+        _governed_evidence(git_repo, ledger=ledger),
+        current_phase="worker_done",
+        repo_path=git_repo,
+    )
+
+    assert result.allowed is False
+    assert blocker in result.blockers
+
+
+def test_review_ready_fails_when_worker_uses_stale_criteria_hash(git_repo):
+    evidence = _governed_evidence(git_repo)
+    evidence["worker_evidence"]["criteria_hash"] = "sha256:" + "0" * 64
+
+    result = closeout.verify_closeout_transition(
+        "review_ready",
+        evidence,
+        current_phase="worker_done",
+        repo_path=git_repo,
+    )
+
+    assert result.allowed is False
+    assert "stale_worker_criteria_hash" in result.blockers
+
+
+@pytest.mark.parametrize(
+    "mutate,blocker",
+    [
+        (lambda ev: ev["worker_evidence"].pop("per_criterion"), "missing_worker_per_criterion_evidence"),
+        (lambda ev: ev["worker_evidence"].update({"authority_boundary_confirmed": False}), "worker_authority_boundary_unconfirmed"),
+        (lambda ev: ev["worker_evidence"].update({"forbidden_actions_performed": ["merge"]}), "forbidden_action_performed"),
+    ],
+)
+def test_worker_evidence_contract_fails_closed(git_repo, mutate, blocker):
+    evidence = _governed_evidence(git_repo)
+    mutate(evidence)
+
+    result = closeout.verify_closeout_transition(
+        "review_ready",
+        evidence,
+        current_phase="worker_done",
+        repo_path=git_repo,
+    )
+
+    assert result.allowed is False
+    assert blocker in result.blockers
+
+
+@pytest.mark.parametrize(
+    "mutate,blocker",
+    [
+        (lambda ev: ev["verifier_result"].update({"verdict": "FAIL", "retry_allowed": True, "remediation_goal": "Add missing tests."}), "verifier_result_not_pass"),
+        (lambda ev: ev["verifier_result"].update({"criteria_hash": "sha256:" + "1" * 64}), "stale_verifier_criteria_hash"),
+        (lambda ev: ev["verifier_result"]["per_criterion"]["DC-001"].update({"verdict": "FAIL"}), "criterion_verifier_not_pass"),
+        (lambda ev: ev["verifier_result"].update({"authority_boundary_ok": False}), "verifier_authority_boundary_failed"),
+    ],
+)
+def test_verifier_result_contract_fails_closed(git_repo, mutate, blocker):
+    evidence = _governed_evidence(git_repo)
+    mutate(evidence)
+
+    result = closeout.verify_closeout_transition(
+        "review_ready",
+        evidence,
+        current_phase="worker_done",
+        repo_path=git_repo,
+    )
+
+    assert result.allowed is False
+    assert blocker in result.blockers
+
+
+def test_reviewer_fail_requests_exactly_one_dispatcher_owned_remediation(kanban_home, git_repo):
+    evidence = _governed_evidence(git_repo)
+    evidence["verifier_result"].update(
+        {
+            "verdict": "FAIL",
+            "retry_allowed": True,
+            "remediation_goal": "Add criterion DC-001 evidence and update existing PR.",
+        }
+    )
+    evidence["verifier_result"]["per_criterion"]["DC-001"].update(
+        {"verdict": "FAIL", "missing_evidence": ["test output"]}
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="reviewer remediation",
+            workspace_kind="dir",
+            workspace_path=str(git_repo),
+            closeout_evidence={"reviewer_loop": {"attempt": 1, "max_attempts": 3}},
+        )
+        closeout.transition_task_closeout(conn, task_id, "worker_done", {"summary": "worker candidate"})
+        result = closeout.transition_task_closeout(
+            conn,
+            task_id,
+            "review_ready",
+            evidence,
+            repo_path=git_repo,
+        )
+        task = kb.get_task(conn, task_id)
+        events = [ev for ev in kb.list_events(conn, task_id) if ev.kind == "remediation_requested"]
+
+    assert result["status"] == "remediation_requested"
+    assert task.status == "ready"
+    assert task.assignee is not None
+    assert task.review_phase is None
+    assert len(events) == 1
+    assert events[-1].payload["dispatcher_owned"] is True
+    assert "Add criterion DC-001 evidence" in events[-1].payload["remediation_goal"]
+
+
+def test_reviewer_fail_blocks_after_max_attempts(kanban_home, git_repo):
+    evidence = _governed_evidence(git_repo)
+    evidence["reviewer_loop"] = {"attempt": 3, "max_attempts": 3}
+    evidence["verifier_result"].update(
+        {"verdict": "FAIL", "retry_allowed": True, "remediation_goal": "Try again."}
+    )
+    evidence["verifier_result"]["per_criterion"]["DC-001"].update({"verdict": "FAIL"})
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="reviewer max attempts",
+            workspace_kind="dir",
+            workspace_path=str(git_repo),
+        )
+        closeout.transition_task_closeout(conn, task_id, "worker_done", {"summary": "worker candidate"})
+        result = closeout.transition_task_closeout(conn, task_id, "review_ready", evidence, repo_path=git_repo)
+        task = kb.get_task(conn, task_id)
+
+    assert result["status"] == "blocked"
+    assert "remediation_attempts_exhausted" in result["blockers"]
+    assert task.status == "blocked"
+    assert task.review_phase == "worker_done"
+
+
+def test_done_criteria_ledger_requires_contract_schema(git_repo):
+    ledger = _done_criteria_ledger()
+    ledger.pop("schema")
+
+    result = closeout.verify_closeout_transition(
+        "review_ready",
+        _governed_evidence(git_repo, ledger=ledger),
+        current_phase="worker_done",
+        repo_path=git_repo,
+    )
+
+    assert result.allowed is False
+    assert "invalid_done_criteria_ledger_schema" in result.blockers
+
+
+def test_worker_and_verifier_contracts_require_schema(git_repo):
+    evidence = _governed_evidence(git_repo)
+    evidence["worker_evidence"].pop("schema")
+    evidence["verifier_result"].pop("schema")
+
+    result = closeout.verify_closeout_transition(
+        "review_ready",
+        evidence,
+        current_phase="worker_done",
+        repo_path=git_repo,
+    )
+
+    assert result.allowed is False
+    assert "invalid_worker_evidence_schema" in result.blockers
+    assert "invalid_verifier_result_schema" in result.blockers
+
+
+def test_reviewer_fail_does_not_requeue_when_unrelated_blockers_exist(kanban_home, git_repo):
+    evidence = _governed_evidence(git_repo)
+    evidence["checks"] = [{"name": "ci", "status": "COMPLETED", "conclusion": "FAILURE"}]
+    evidence["verifier_result"].update(
+        {"verdict": "FAIL", "retry_allowed": True, "remediation_goal": "Add criterion evidence."}
+    )
+    evidence["verifier_result"]["per_criterion"]["DC-001"].update({"verdict": "FAIL"})
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="unrelated blocker", workspace_kind="dir", workspace_path=str(git_repo))
+        closeout.transition_task_closeout(conn, task_id, "worker_done", {"summary": "candidate"})
+        result = closeout.transition_task_closeout(conn, task_id, "review_ready", evidence, repo_path=git_repo)
+        task = kb.get_task(conn, task_id)
+        events = [ev for ev in kb.list_events(conn, task_id) if ev.kind == "remediation_requested"]
+
+    assert result["status"] == "blocked"
+    assert "failed_checks" in result["blockers"]
+    assert task.status == "blocked"
+    assert task.review_phase == "worker_done"
+    assert events == []
+
+
+def test_reviewer_fail_remediation_request_is_idempotent(kanban_home, git_repo):
+    evidence = _governed_evidence(git_repo)
+    evidence["verifier_result"].update(
+        {"verdict": "FAIL", "retry_allowed": True, "remediation_goal": "Add criterion evidence."}
+    )
+    evidence["verifier_result"]["per_criterion"]["DC-001"].update({"verdict": "FAIL"})
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="idempotent remediation", workspace_kind="dir", workspace_path=str(git_repo))
+        closeout.transition_task_closeout(conn, task_id, "worker_done", {"summary": "candidate"})
+        first = closeout.transition_task_closeout(conn, task_id, "review_ready", evidence, repo_path=git_repo)
+        second = closeout.transition_task_closeout(conn, task_id, "review_ready", evidence, repo_path=git_repo)
+        events = [ev for ev in kb.list_events(conn, task_id) if ev.kind == "remediation_requested"]
+
+    assert first["status"] == "remediation_requested"
+    assert second["status"] == "remediation_requested"
+    assert second["reason"] == "reviewer_fail_remediation_already_queued"
+    assert len(events) == 1

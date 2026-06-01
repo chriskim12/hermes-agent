@@ -10,7 +10,9 @@ gateway restart/reload are outside this surface.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import re
 import shutil
 import subprocess
 import time
@@ -22,6 +24,9 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_drift_audit
 
 CLOSEOUT_EVIDENCE_SCHEMA = "kanban_closeout_evidence.v1"
+DONE_CRITERIA_LEDGER_SCHEMA = "kanban_done_criteria_ledger.v1"
+WORKER_EVIDENCE_SCHEMA = "kanban_worker_evidence.v1"
+VERIFIER_RESULT_SCHEMA = "kanban_verifier_result.v1"
 VALID_CLOSEOUT_PHASES = ("worker_done", "review_ready", "closed")
 _SUCCESSFUL_CHECK_CONCLUSIONS = {"success", "neutral", "skipped"}
 _FAILED_CHECK_CONCLUSIONS = {
@@ -93,6 +98,74 @@ def _as_list(value: Any) -> list[Any]:
     if isinstance(value, tuple):
         return list(value)
     return [value]
+
+
+def _collapse_ws(value: Any) -> str:
+    return re.sub(r"\s+", " ", _text(value)).strip()
+
+
+def _normalize_string_list(value: Any) -> list[str]:
+    return sorted({_collapse_ws(item) for item in _as_list(value) if _collapse_ws(item)})
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def normalize_done_criteria_ledger(ledger: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return a canonical Done Criteria Ledger with a stable criteria hash.
+
+    The hash intentionally covers criteria meaning and authority boundaries,
+    not incidental formatting/order noise or mutable task metadata.
+    """
+
+    raw = _as_mapping(ledger)
+    normalized: dict[str, Any] = {
+        "schema": _text(raw.get("schema")) or DONE_CRITERIA_LEDGER_SCHEMA,
+        "task_id": _text(raw.get("task_id")),
+        "public_id": _text(raw.get("public_id")),
+        "source": _as_mapping(raw.get("source")),
+        "version": raw.get("version"),
+        "criteria": [],
+        "forbidden_actions": _normalize_string_list(raw.get("forbidden_actions")),
+        "refinement_required": raw.get("refinement_required") is True,
+    }
+
+    for item in _as_list(raw.get("criteria")):
+        if not isinstance(item, Mapping):
+            normalized["criteria"].append({"invalid": True, "raw": item})
+            continue
+        criterion = _as_mapping(item)
+        normalized["criteria"].append(
+            {
+                "id": _collapse_ws(criterion.get("id")),
+                "text": _collapse_ws(criterion.get("text")),
+                "source_section": _collapse_ws(criterion.get("source_section")),
+                "required_evidence_types": _normalize_string_list(criterion.get("required_evidence_types")),
+                "deterministic_checks": _normalize_string_list(criterion.get("deterministic_checks")),
+                "authority_boundary": _collapse_ws(criterion.get("authority_boundary")),
+                "ambiguous": criterion.get("ambiguous") is True,
+            }
+        )
+    normalized["criteria"].sort(key=lambda c: (_text(c.get("id")), _text(c.get("text"))))
+
+    hash_material = {
+        "schema": DONE_CRITERIA_LEDGER_SCHEMA,
+        "criteria": [
+            {
+                "id": c.get("id"),
+                "text": c.get("text"),
+                "required_evidence_types": c.get("required_evidence_types"),
+                "deterministic_checks": c.get("deterministic_checks"),
+                "authority_boundary": c.get("authority_boundary"),
+                "ambiguous": c.get("ambiguous"),
+            }
+            for c in normalized["criteria"]
+        ],
+        "forbidden_actions": normalized["forbidden_actions"],
+    }
+    normalized["criteria_hash"] = "sha256:" + hashlib.sha256(_canonical_json(hash_material).encode("utf-8")).hexdigest()
+    return normalized
 
 
 def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -220,6 +293,9 @@ def collect_live_closeout_evidence(
 
 
 def _has_worker_evidence(evidence: Mapping[str, Any]) -> bool:
+    worker_evidence = _as_mapping(evidence.get("worker_evidence"))
+    if worker_evidence:
+        return True
     direct = (
         _text(evidence.get("summary"))
         or _text(evidence.get("proof"))
@@ -441,10 +517,160 @@ def _check_statuses(evidence: Mapping[str, Any]) -> list[str]:
 
 
 def _verifier_pass_present(evidence: Mapping[str, Any]) -> bool:
+    result = _as_mapping(evidence.get("verifier_result"))
+    if result:
+        return _lower(result.get("verdict")) == "pass"
     verdict = evidence.get("verifier_verdict") or evidence.get("verifier")
     if isinstance(verdict, Mapping):
         return _lower(verdict.get("verdict") or verdict.get("status")) == "pass"
     return _lower(verdict) == "pass"
+
+
+def _governed_reviewer_loop_enabled(evidence: Mapping[str, Any]) -> bool:
+    return bool(
+        evidence.get("require_done_criteria_ledger") is True
+        or evidence.get("require_worker_evidence_contract") is True
+        or evidence.get("require_verifier_result_contract") is True
+        or isinstance(evidence.get("done_criteria_ledger"), Mapping)
+        or isinstance(evidence.get("worker_evidence"), Mapping)
+        or isinstance(evidence.get("verifier_result"), Mapping)
+        or isinstance(evidence.get("reviewer_loop"), Mapping)
+    )
+
+
+def _validate_done_criteria_ledger(evidence: Mapping[str, Any]) -> tuple[list[str], dict[str, Any] | None]:
+    raw = evidence.get("done_criteria_ledger")
+    if not isinstance(raw, Mapping):
+        return (["missing_done_criteria_ledger"] if _governed_reviewer_loop_enabled(evidence) else []), None
+    if _text(raw.get("schema")) != DONE_CRITERIA_LEDGER_SCHEMA:
+        return ["invalid_done_criteria_ledger_schema"], normalize_done_criteria_ledger(raw)
+    ledger = normalize_done_criteria_ledger(raw)
+    blockers: list[str] = []
+    criteria = ledger.get("criteria") or []
+    if not criteria:
+        blockers.append("empty_done_criteria")
+    if ledger.get("refinement_required") is True:
+        blockers.append("refinement_required")
+    if not ledger.get("forbidden_actions"):
+        blockers.append("missing_forbidden_actions")
+    for criterion in criteria:
+        if criterion.get("invalid"):
+            blockers.append("invalid_done_criteria")
+            continue
+        if not _text(criterion.get("id")) or not _text(criterion.get("text")):
+            blockers.append("invalid_done_criteria")
+        if criterion.get("ambiguous") is True:
+            blockers.append("refinement_required")
+        if not _text(criterion.get("authority_boundary")):
+            blockers.append("missing_authority_boundary")
+        required_evidence_types = set(_as_list(criterion.get("required_evidence_types")))
+        requires_deterministic = bool(required_evidence_types & {"test", "db_query", "screenshot", "no_code_proof"})
+        if requires_deterministic and not _as_list(criterion.get("deterministic_checks")):
+            blockers.append("missing_deterministic_checks")
+    if isinstance(evidence, dict):
+        cast(MutableMapping[str, Any], evidence)["done_criteria_ledger"] = ledger
+    return list(dict.fromkeys(blockers)), ledger
+
+
+def _criterion_ids(ledger: Mapping[str, Any] | None) -> list[str]:
+    if not ledger:
+        return []
+    return [_text(c.get("id")) for c in _as_list(ledger.get("criteria")) if isinstance(c, Mapping) and _text(c.get("id"))]
+
+
+def _validate_worker_evidence_contract(evidence: Mapping[str, Any], ledger: Mapping[str, Any] | None) -> list[str]:
+    if not _governed_reviewer_loop_enabled(evidence):
+        return []
+    worker = _as_mapping(evidence.get("worker_evidence"))
+    if not worker:
+        return ["missing_worker_evidence_contract"] if evidence.get("require_worker_evidence_contract") is True else []
+    blockers: list[str] = []
+    if _text(worker.get("schema")) != WORKER_EVIDENCE_SCHEMA:
+        blockers.append("invalid_worker_evidence_schema")
+    expected_hash = _text((ledger or {}).get("criteria_hash"))
+    if expected_hash and _text(worker.get("criteria_hash")) != expected_hash:
+        blockers.append("stale_worker_criteria_hash")
+    per_criterion = worker.get("per_criterion") if isinstance(worker.get("per_criterion"), Mapping) else {}
+    ids = _criterion_ids(ledger)
+    if ids and not per_criterion:
+        blockers.append("missing_worker_per_criterion_evidence")
+    for cid in ids:
+        item = _as_mapping(per_criterion.get(cid))
+        if not item or _lower(item.get("claim")) not in {"satisfied", "not_applicable"}:
+            blockers.append("missing_worker_per_criterion_evidence")
+        if not (_as_list(item.get("evidence_refs")) or _text(item.get("notes"))):
+            blockers.append("missing_worker_per_criterion_evidence")
+    if worker.get("authority_boundary_confirmed") is not True:
+        blockers.append("worker_authority_boundary_unconfirmed")
+    if _as_list(worker.get("forbidden_actions_performed")):
+        blockers.append("forbidden_action_performed")
+    return list(dict.fromkeys(blockers))
+
+
+def _validate_verifier_result_contract(evidence: Mapping[str, Any], ledger: Mapping[str, Any] | None) -> list[str]:
+    if not _governed_reviewer_loop_enabled(evidence):
+        return []
+    result = _as_mapping(evidence.get("verifier_result"))
+    if not result:
+        return ["missing_verifier_result_contract"] if evidence.get("require_verifier_result_contract") is True else []
+    blockers: list[str] = []
+    if _text(result.get("schema")) != VERIFIER_RESULT_SCHEMA:
+        blockers.append("invalid_verifier_result_schema")
+    expected_hash = _text((ledger or {}).get("criteria_hash"))
+    if expected_hash and _text(result.get("criteria_hash")) != expected_hash:
+        blockers.append("stale_verifier_criteria_hash")
+    verdict = _lower(result.get("verdict"))
+    if verdict != "pass":
+        blockers.append("verifier_result_not_pass")
+    per_criterion = result.get("per_criterion") if isinstance(result.get("per_criterion"), Mapping) else {}
+    for cid in _criterion_ids(ledger):
+        item = _as_mapping(per_criterion.get(cid))
+        if not item or _lower(item.get("verdict")) != "pass":
+            blockers.append("criterion_verifier_not_pass")
+    if result.get("authority_boundary_ok") is not True:
+        blockers.append("verifier_authority_boundary_failed")
+    return list(dict.fromkeys(blockers))
+
+
+def _reviewer_loop_attempt(evidence: Mapping[str, Any]) -> tuple[int, int]:
+    loop = _as_mapping(evidence.get("reviewer_loop"))
+    try:
+        attempt = int(loop.get("attempt") or _as_mapping(evidence.get("verifier_result")).get("verification_attempt") or 1)
+    except (TypeError, ValueError):
+        attempt = 1
+    try:
+        max_attempts = int(loop.get("max_attempts") or loop.get("max_verification_attempts") or 3)
+    except (TypeError, ValueError):
+        max_attempts = 3
+    return max(1, attempt), max(1, max_attempts)
+
+
+def _remediation_candidate(evidence: Mapping[str, Any], blockers: list[str] | None = None) -> dict[str, Any] | None:
+    result = _as_mapping(evidence.get("verifier_result"))
+    if _lower(result.get("verdict")) != "fail" or result.get("retry_allowed") is not True:
+        return None
+    allowed_blockers = {"verifier_result_not_pass", "criterion_verifier_not_pass", "missing_verifier_pass"}
+    if blockers is not None and (set(blockers) - allowed_blockers):
+        return None
+    goal = _text(result.get("remediation_goal"))
+    if not goal:
+        return None
+    attempt, max_attempts = _reviewer_loop_attempt(evidence)
+    if attempt >= max_attempts:
+        return {
+            "allowed": False,
+            "blocker": "remediation_attempts_exhausted",
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+        }
+    return {
+        "allowed": True,
+        "remediation_goal": goal,
+        "attempt": attempt,
+        "next_attempt": attempt + 1,
+        "max_attempts": max_attempts,
+        "dispatcher_owned": True,
+    }
 
 
 def _review_package_work(evidence: Mapping[str, Any]) -> dict[str, Any]:
@@ -531,6 +757,13 @@ def _review_package_blockers(evidence: Mapping[str, Any]) -> list[str]:
 
 def _review_ready_blockers(evidence: Mapping[str, Any]) -> list[str]:
     blockers: list[str] = []
+    ledger_blockers, ledger = _validate_done_criteria_ledger(evidence)
+    blockers.extend(ledger_blockers)
+    blockers.extend(_validate_worker_evidence_contract(evidence, ledger))
+    blockers.extend(_validate_verifier_result_contract(evidence, ledger))
+    remediation = _remediation_candidate(evidence, blockers)
+    if remediation and remediation.get("allowed") is False:
+        blockers.append(_text(remediation.get("blocker")) or "remediation_blocked")
     if not _has_worker_evidence(evidence):
         blockers.append("missing_worker_evidence")
     if not _verifier_pass_present(evidence):
@@ -728,6 +961,88 @@ def transition_task_closeout(
         live_pr_provider=live_pr_provider,
     )
     if not verification.allowed:
+        existing_closeout = _as_mapping(task.closeout_evidence)
+        existing_remediation = _as_mapping(existing_closeout.get("remediation_request"))
+        if existing_remediation and verification.target_phase == "review_ready":
+            return {
+                "status": "remediation_requested",
+                "reason": "reviewer_fail_remediation_already_queued",
+                "task_id": task_id,
+                "current_phase": task.review_phase,
+                "target_phase": verification.target_phase,
+                "blockers": verification.blockers,
+                "remediation": existing_remediation,
+                "evidence": existing_closeout,
+                "side_effects": {"kanban_task_written": False, "linear_done_mutated": False},
+            }
+        remediation = _remediation_candidate(verification.evidence, verification.blockers) if verification.target_phase == "review_ready" else None
+        if remediation and remediation.get("allowed") is True and "remediation_attempts_exhausted" not in verification.blockers:
+            patched_evidence = copy.deepcopy(verification.evidence)
+            patched_evidence["last_reviewer_result"] = _as_mapping(patched_evidence.get("verifier_result"))
+            patched_evidence["worker_done_candidate"] = {"status": "rejected", "attempt": remediation.get("attempt")}
+            loop = _as_mapping(patched_evidence.get("reviewer_loop"))
+            loop.update(
+                {
+                    "enabled": True,
+                    "attempt": remediation.get("next_attempt"),
+                    "max_attempts": remediation.get("max_attempts"),
+                    "last_remediation_goal": remediation.get("remediation_goal"),
+                }
+            )
+            patched_evidence["reviewer_loop"] = loop
+            patched_evidence["remediation_request"] = remediation
+            try:
+                with kb.write_txn(conn):
+                    conn.execute(
+                        """
+                        UPDATE tasks
+                           SET status = 'ready',
+                               assignee = COALESCE(assignee, ?),
+                               review_phase = NULL,
+                               closeout_evidence = ?,
+                               claim_lock = NULL,
+                               claim_expires = NULL,
+                               worker_pid = NULL,
+                               completed_at = NULL
+                         WHERE id = ?
+                           AND status != 'archived'
+                        """,
+                        (
+                            task.assignee or "arisu",
+                            kb._json_dumps_dict(patched_evidence, "closeout_evidence"),
+                            task_id,
+                        ),
+                    )
+                    kb._append_event(
+                        conn,
+                        task_id,
+                        "verifier_result",
+                        {
+                            "target_phase": verification.target_phase,
+                            "verdict": "FAIL",
+                            "reason": verification.reason,
+                            "reason_codes": list(verification.blockers),
+                            "blockers": list(verification.blockers),
+                            "review_ready_input_eligible": False,
+                            "allowed": False,
+                        },
+                    )
+                    kb._append_event(conn, task_id, "remediation_requested", remediation)
+            except Exception:
+                pass
+            updated = kb.get_task(conn, task_id)
+            if updated and updated.status == "ready":
+                return {
+                    "status": "remediation_requested",
+                    "reason": "reviewer_fail_remediation_queued",
+                    "task_id": task_id,
+                    "current_phase": task.review_phase,
+                    "target_phase": verification.target_phase,
+                    "blockers": verification.blockers,
+                    "remediation": remediation,
+                    "evidence": patched_evidence,
+                    "side_effects": {"kanban_task_written": True, "linear_done_mutated": False},
+                }
         try:
             with kb.write_txn(conn):
                 kb._append_event(
