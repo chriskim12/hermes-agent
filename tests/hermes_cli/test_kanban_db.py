@@ -59,6 +59,79 @@ def test_init_creates_expected_tables(kanban_home):
     assert link_cols["relation_type"]["dflt_value"] == "'dependency'"
 
 
+def test_init_adds_admission_snapshot_to_legacy_tasks(tmp_path):
+    db = tmp_path / "legacy-no-admission-kanban.db"
+    raw = sqlite3.connect(db)
+    raw.executescript(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER DEFAULT 0,
+            created_by TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER,
+            tenant TEXT,
+            result TEXT,
+            idempotency_key TEXT,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            worker_pid INTEGER,
+            last_failure_error TEXT,
+            max_runtime_seconds INTEGER,
+            last_heartbeat_at INTEGER,
+            current_run_id INTEGER,
+            workflow_template_id TEXT,
+            current_step_key TEXT,
+            skills TEXT,
+            model_override TEXT,
+            max_retries INTEGER,
+            goal_mode INTEGER NOT NULL DEFAULT 0,
+            goal_max_turns INTEGER,
+            session_id TEXT,
+            review_phase TEXT,
+            closeout_evidence TEXT
+        );
+        CREATE TABLE task_links (
+            parent_id TEXT NOT NULL,
+            child_id TEXT NOT NULL,
+            relation_type TEXT NOT NULL DEFAULT 'dependency',
+            PRIMARY KEY (parent_id, child_id)
+        );
+        CREATE TABLE task_comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            author TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            run_id INTEGER,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        );
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    kb.init_db(db)
+
+    with kb.connect(db) as conn:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    assert "admission_snapshot" in cols
+
+
 def test_init_migrates_legacy_task_links_to_dependency(tmp_path):
     db = tmp_path / "legacy-kanban.db"
     raw = sqlite3.connect(db)
@@ -1548,6 +1621,106 @@ def test_dispatch_strict_ready_gate_dry_run_does_not_mutate(kanban_home, monkeyp
     assert task.assignee == "alice"
 
 
+def _structured_ready_contract(**overrides):
+    from hermes_cli.kanban_ready_contract import READY_CONTRACT_SCHEMA
+
+    contract = {
+        "schema": READY_CONTRACT_SCHEMA,
+        "goal": "Run a governed implementation slice.",
+        "end_state": "Worker evidence parks for verifier review.",
+        "scope": ["repo-local code and tests"],
+        "non_goals": ["gateway restart", "prod mutation"],
+        "repo_lane_truth": {"repository": "chriskim12/hermes-agent", "branch": "main", "workspace": "worktree"},
+        "routing_verdict": {"verdict": "direct-kanban", "assignee": "alice", "reason": "structured contract complete"},
+        "authority_boundary": {"allowed": ["code edits", "tests"], "forbidden": ["gateway restart", "prod mutation"]},
+        "risk_flags": {"env": "none", "secret": "none", "prod": "none", "customer_visible": "none", "restart": "forbidden"},
+        "dependencies_blockers": {"kind": "none"},
+        "acceptance_criteria": [{"id": "ac-01", "text": "Ready gate accepts structured contract."}],
+        "done_criteria": [{"id": "dc-01", "text": "Tests pass."}],
+        "verification_requirements": [{"id": "vr-01", "command_or_proof": "pytest"}],
+        "review_package_expectation": {"changed_files_expected": True, "pr_expected": True},
+        "reviewer_loop": {"required": True, "reviewer_profile": "verifier"},
+    }
+    contract.update(overrides)
+    return contract
+
+
+def test_dispatch_strict_ready_gate_accepts_structured_ready_contract_without_markers(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_STRICT_READY_GATE", "true")
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name in {"alice", "verifier"})
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append((task.id, workspace))
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="structured ready only",
+            body="Human display intentionally omits old marker folklore.",
+            assignee="alice",
+            goal_mode=True,
+        )
+        conn.execute(
+            "UPDATE tasks SET admission_snapshot = ? WHERE id = ?",
+            (json.dumps({"ready_contract": _structured_ready_contract()}), t),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        task = kb.get_task(conn, t)
+
+    assert res.auto_blocked == []
+    assert [item[0] for item in res.spawned] == [t]
+    assert spawns and spawns[0][0] == t
+    assert task.status == "running"
+
+
+def test_dispatch_strict_ready_gate_rejects_reviewer_loop_markers_without_structured_contract(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_STRICT_READY_GATE", "true")
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="marker-only reviewer loop",
+            body=_governed_worker_body(),
+            assignee="alice",
+            goal_mode=True,
+        )
+        res = kb.dispatch_once(conn, dry_run=False)
+        task = kb.get_task(conn, t)
+        events = kb.list_events(conn, t)
+
+    assert t in res.auto_blocked
+    assert not res.spawned
+    assert task.status == "blocked"
+    payload = events[-1].payload or {}
+    assert "missing_structured_ready_contract" in payload["ready_gate"]["reason_codes"]
+
+
+def test_dispatch_strict_ready_gate_rejects_structured_reviewer_loop_without_goal_mode(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_STRICT_READY_GATE", "true")
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="structured no goal mode", body="display", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET admission_snapshot = ? WHERE id = ?",
+            (json.dumps({"ready_contract": _structured_ready_contract()}), t),
+        )
+        res = kb.dispatch_once(conn, dry_run=False)
+        task = kb.get_task(conn, t)
+        events = kb.list_events(conn, t)
+
+    assert t in res.auto_blocked
+    assert task.status == "blocked"
+    payload = events[-1].payload or {}
+    assert "ready_contract_reviewer_loop_requires_goal_mode" in payload["ready_gate"]["reason_codes"]
+
+
 def test_dispatch_strict_ready_gate_uses_native_evaluator_after_gateway_autopilot_drop(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_STRICT_READY_GATE", "true")
     from hermes_cli import profiles
@@ -1576,7 +1749,17 @@ Done criteria:
 - Confirm no forbidden side effects were performed.
 """
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="strict gate smoke", body=body, assignee="alice")
+        t = kb.create_task(
+            conn,
+            title="strict gate smoke",
+            body=body,
+            assignee="alice",
+            goal_mode=True,
+        )
+        conn.execute(
+            "UPDATE tasks SET admission_snapshot = ? WHERE id = ?",
+            (json.dumps({"ready_contract": _structured_ready_contract()}), t),
+        )
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
         task = kb.get_task(conn, t)
 

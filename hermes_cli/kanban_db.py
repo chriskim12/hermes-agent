@@ -1267,6 +1267,53 @@ def _evaluate_autopilot_ready_gate_for_row(row: sqlite3.Row) -> dict[str, Any]:
         closeout_evidence = _json_loads_maybe(closeout_evidence) or {}
     if not isinstance(closeout_evidence, dict):
         closeout_evidence = {}
+    admission_snapshot = candidate.get("admission_snapshot") or {}
+    if isinstance(admission_snapshot, str):
+        admission_snapshot = _json_loads_maybe(admission_snapshot) or {}
+    if not isinstance(admission_snapshot, dict):
+        admission_snapshot = {}
+    structured_ready_contract = admission_snapshot.get("ready_contract")
+    if structured_ready_contract:
+        from hermes_cli import profiles
+        from hermes_cli.kanban_ready_contract import validate_ready_contract
+
+        validation = validate_ready_contract(
+            structured_ready_contract,
+            goal_mode=bool(candidate.get("goal_mode")),
+            assignee=str(candidate.get("assignee") or "").strip() or None,
+            profile_exists=profiles.profile_exists,
+        )
+        if validation.accepted:
+            ledger = validation.ready_contract
+            return {
+                "task_id": candidate.get("id"),
+                "public_id": candidate.get("public_id"),
+                "autopilot_ready": True,
+                "status": "accepted",
+                "reason_codes": [],
+                "human_reason": "ready for autopilot dry-run selection",
+                "ready_contract": validation.ready_contract,
+                "criteria_hash": None,
+                "criteria_ids": [
+                    str(item.get("id") or "")
+                    for item in validation.ready_contract.get("done_criteria", [])
+                    if isinstance(item, dict)
+                ],
+                "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0},
+            }
+        reason_codes.extend(validation.reason_codes)
+        missing_labels.append("valid structured ready contract")
+    else:
+        reviewer_loop_declared_in_body = (
+            "reviewer-loop contract" in haystack
+            or "reviewer_loop" in haystack
+            or "reviewer profile" in haystack
+            or "reviewer_profile" in haystack
+        )
+        if reviewer_loop_declared_in_body:
+            reason_codes.append("missing_structured_ready_contract")
+            missing_labels.append("structured ready contract")
+
     reviewer_loop = closeout_evidence.get("reviewer_loop") or {}
     if isinstance(reviewer_loop, str):
         reviewer_loop = _json_loads_maybe(reviewer_loop) or {}
@@ -1424,6 +1471,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Review/remediation carry state. ``review_phase`` stays NULL/empty
     -- while original-worker remediation is pending; ``closeout_evidence``
     -- stores structured reviewer/worker handoff payloads as JSON.
+    admission_snapshot   TEXT,
     review_phase         TEXT,
     closeout_evidence    TEXT
 );
@@ -2085,6 +2133,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    if "admission_snapshot" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "admission_snapshot", "admission_snapshot TEXT"
+        )
     if "review_phase" not in cols:
         _add_column_if_missing(conn, "tasks", "review_phase", "review_phase TEXT")
     if "closeout_evidence" not in cols:
