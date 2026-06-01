@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from hermes_cli import kanban_closeout as kc
 from hermes_cli import kanban_db as kb
 
 
@@ -1496,6 +1497,132 @@ Done criteria:
     assert [item[0] for item in res.spawned] == [t]
     assert spawns and spawns[0][0] == t
     assert task.status == "running"
+
+
+def _governed_worker_body() -> str:
+    return """
+Goal: Complete a read-only smoke.
+End-state/output: Worker evidence only, no final close.
+Scope/non-goals: no PR, commit, deploy, customer-visible send, or mutation.
+Acceptance criteria: all Done criteria below have evidence.
+Verification requirements: read-only checks only.
+Authority boundary: no prod, secret, billing, customer, env, cron, or gateway restart authority.
+Repo/lane truth: sandbox repo path.
+Risk flags: env, secret, prod, customer-visible send, billing, deploy are forbidden.
+Dependencies/blockers: none.
+Routing verdict: direct-kanban.
+Reviewer-loop contract: required reviewer_profile verifier.
+Review package expectation: review_ready requires worker evidence and verifier PASS.
+Done criteria:
+- Confirm repo exists.
+- Confirm no forbidden side effects were performed.
+"""
+
+
+def test_governed_goal_worker_completion_hands_off_to_worker_done(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="governed smoke",
+            body=_governed_worker_body(),
+            assignee="arisu",
+            goal_mode=True,
+            goal_max_turns=3,
+        )
+
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="criteria satisfied with read-only evidence",
+            metadata={
+                "changed_files": [],
+                "forbidden_actions_performed": False,
+                "goal_mode_observed_by_worker": True,
+                "commands": {"dc-01-confirm-repo-exists": "test -d /tmp/repo"},
+            },
+        ) is True
+
+        task = kb.get_task(conn, task_id)
+        worker_done = kc.verify_closeout_transition(
+            "worker_done",
+            task.closeout_evidence,
+            current_phase=task.review_phase,
+            live_pr_provider=lambda evidence, repo_path: {},
+        )
+        review_ready = kc.verify_closeout_transition(
+            "review_ready",
+            task.closeout_evidence,
+            current_phase=task.review_phase,
+            live_pr_provider=lambda evidence, repo_path: {},
+        )
+
+    assert task.status == "blocked"
+    assert task.completed_at is None
+    assert task.review_phase == "worker_done"
+    assert task.closeout_evidence["worker_evidence"]["schema"] == "kanban_worker_evidence.v1"
+    assert task.closeout_evidence["worker_evidence"]["authority_boundary_confirmed"] is True
+    assert task.closeout_evidence["worker_evidence"]["forbidden_actions_performed"] == []
+    assert worker_done.allowed is True
+    assert "missing_worker_evidence" not in worker_done.blockers
+    assert review_ready.allowed is False
+    assert "missing_verifier_pass" in review_ready.blockers
+
+
+def test_legacy_worker_completion_without_reviewer_loop_still_finalizes(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy worker", goal_mode=True)
+        assert kb.complete_task(conn, task_id, summary="done") is True
+        task = kb.get_task(conn, task_id)
+
+    assert task.status == "done"
+    assert task.review_phase is None
+    assert task.closeout_evidence is None
+
+
+def test_goal_worker_with_incidental_verifier_words_still_finalizes(kanban_home):
+    body = """Goal: finish a simple task.
+Done criteria:
+- Mention that no verifier pass is required for this legacy task.
+"""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy verifier wording", body=body, goal_mode=True)
+        assert kb.complete_task(conn, task_id, summary="done") is True
+        task = kb.get_task(conn, task_id)
+
+    assert task.status == "done"
+    assert task.review_phase is None
+    assert task.closeout_evidence is None
+
+
+def test_worker_done_handoff_preserves_existing_closeout_contract(kanban_home):
+    existing = {
+        "schema": "kanban_closeout_evidence.v1",
+        "reviewer_loop": {"enabled": True, "required": True, "reviewer_profile": "auditor", "attempt": 2, "max_attempts": 5},
+        "remediation_request": {"allowed": True, "remediation_goal": "fix missing proof"},
+        "custom_note": "preserve me",
+    }
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="governed retry",
+            body=_governed_worker_body(),
+            assignee="arisu",
+            goal_mode=True,
+            closeout_evidence=existing,
+        )
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="retry evidence ready",
+            metadata={"forbidden_actions_performed": False},
+        ) is True
+        task = kb.get_task(conn, task_id)
+
+    assert task.closeout_evidence["custom_note"] == "preserve me"
+    assert task.closeout_evidence["remediation_request"] == existing["remediation_request"]
+    assert task.closeout_evidence["reviewer_loop"]["reviewer_profile"] == "auditor"
+    assert task.closeout_evidence["reviewer_loop"]["attempt"] == 2
+    assert task.closeout_evidence["reviewer_loop"]["max_attempts"] == 5
 
 
 def test_dispatch_skips_nonspawnable_into_separate_bucket(kanban_home, monkeypatch):

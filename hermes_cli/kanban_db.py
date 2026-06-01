@@ -85,7 +85,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from toolsets import get_toolset_names
 
@@ -1055,6 +1055,157 @@ def _task_row_to_ready_gate_candidate(row: sqlite3.Row) -> dict[str, Any]:
         except Exception:
             pass
     return candidate
+
+
+def _string_list(value: Any) -> list[str]:
+    if value is None or value is False:
+        return []
+    if isinstance(value, str):
+        items: Iterable[Any] = [value]
+    elif isinstance(value, Iterable) and not isinstance(value, (bytes, bytearray, dict)):
+        items = value
+    else:
+        items = [value]
+    out: list[str] = []
+    for item in items:
+        text = str(item).strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _body_declares_reviewer_loop(body: str) -> bool:
+    haystack = str(body or "").lower()
+    return (
+        "reviewer-loop contract" in haystack
+        or "reviewer_loop" in haystack
+    )
+
+
+def _completion_governed_by_reviewer_loop(row: sqlite3.Row | Mapping[str, Any]) -> bool:
+    try:
+        review_phase = row["review_phase"]
+    except Exception:
+        review_phase = None
+    try:
+        closeout_evidence = row["closeout_evidence"]
+    except Exception:
+        closeout_evidence = None
+    try:
+        body = row["body"] or ""
+    except Exception:
+        body = ""
+    try:
+        goal_mode = bool(row["goal_mode"])
+    except Exception:
+        goal_mode = False
+    if review_phase or closeout_evidence:
+        return True
+    return goal_mode and _body_declares_reviewer_loop(str(body))
+
+
+def _row_closeout_evidence(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        raw = row["closeout_evidence"]
+    except Exception:
+        raw = None
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    if isinstance(raw, str):
+        parsed = _json_loads_maybe(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _worker_completion_closeout_evidence(
+    row: sqlite3.Row | Mapping[str, Any],
+    *,
+    run_id: int | None,
+    summary: str | None,
+    result: str | None,
+    metadata: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    from hermes_cli.kanban_closeout import (
+        CLOSEOUT_EVIDENCE_SCHEMA,
+        DONE_CRITERIA_LEDGER_SCHEMA,
+        WORKER_EVIDENCE_SCHEMA,
+        normalize_done_criteria_ledger,
+    )
+
+    md = dict(metadata or {})
+    body = str(row["body"] or "") if "body" in row.keys() else ""
+    ledger = normalize_done_criteria_ledger(
+        {
+            "schema": DONE_CRITERIA_LEDGER_SCHEMA,
+            "task_id": row["id"],
+            "public_id": row["public_id"] if "public_id" in row.keys() else None,
+            "source": {"kind": "task_body", "section": "Done criteria"},
+            "criteria": _extract_body_done_criteria(body),
+            "forbidden_actions": _string_list(md.get("forbidden_actions")),
+        }
+    )
+    criteria = ledger.get("criteria") or []
+    command_map = md.get("commands") if isinstance(md.get("commands"), Mapping) else {}
+    evidence_refs = _string_list(md.get("evidence_refs"))
+    notes = (summary if summary is not None else result) or "worker completed"
+    per_criterion: dict[str, Any] = {}
+    for item in criteria:
+        cid = str(item.get("id") or "").strip()
+        if not cid:
+            continue
+        refs = list(evidence_refs)
+        command = command_map.get(cid) or command_map.get(str(item.get("text") or ""))
+        if command:
+            refs.append(f"command:{command}")
+        per_criterion[cid] = {
+            "claim": "satisfied",
+            "evidence_refs": refs,
+            "notes": notes,
+        }
+    forbidden_raw = md.get("forbidden_actions_performed")
+    if forbidden_raw is False or forbidden_raw is None:
+        forbidden_actions: list[str] = []
+    else:
+        forbidden_actions = _string_list(forbidden_raw)
+    authority_ok = forbidden_raw is False or md.get("authority_boundary_confirmed") is True
+    worker_evidence = {
+        "schema": WORKER_EVIDENCE_SCHEMA,
+        "task_id": row["id"],
+        "run_id": run_id,
+        "criteria_hash": ledger.get("criteria_hash"),
+        "per_criterion": per_criterion,
+        "authority_boundary_confirmed": authority_ok,
+        "forbidden_actions_performed": forbidden_actions,
+        "summary": summary,
+        "metadata": md,
+    }
+    reviewer_loop = dict(_row_closeout_evidence(row).get("reviewer_loop") or {})
+    reviewer_loop.setdefault("enabled", True)
+    reviewer_loop.setdefault("required", True)
+    reviewer_loop.setdefault("reviewer_profile", "verifier")
+    reviewer_loop.setdefault("attempt", 1)
+    reviewer_loop.setdefault("max_attempts", 3)
+    closeout = _row_closeout_evidence(row)
+    closeout.update(
+        {
+            "schema": CLOSEOUT_EVIDENCE_SCHEMA,
+            "task_id": row["id"],
+            "done_criteria_ledger": ledger,
+            "worker_evidence": worker_evidence,
+            "require_done_criteria_ledger": True,
+            "require_worker_evidence_contract": True,
+            "require_verifier_result_contract": True,
+            "reviewer_loop": reviewer_loop,
+            "review_package": {
+                "schema": "kanban_review_package.v1",
+                "kind": "no_pr_evidence" if not md.get("pr") else "pr_evidence",
+                "changed_files": md.get("changed_files", []),
+            },
+            "metadata": md,
+        }
+    )
+    return closeout
 
 
 def _evaluate_autopilot_ready_gate_for_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -4092,14 +4243,13 @@ def complete_task(
     """
     now = int(time.time())
     existing = conn.execute(
-        "SELECT review_phase, closeout_evidence FROM tasks WHERE id = ?",
+        "SELECT * FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if existing is None:
         return False
     existing_phase = existing["review_phase"] if "review_phase" in existing.keys() else None
-    existing_closeout = existing["closeout_evidence"] if "closeout_evidence" in existing.keys() else None
-    governed_closeout = bool(existing_phase or existing_closeout)
+    governed_closeout = _completion_governed_by_reviewer_loop(existing)
     if existing_phase in {"review_ready", "closed"}:
         return False
 
@@ -4188,6 +4338,18 @@ def complete_task(
                 outcome="completed",
                 summary=summary if summary is not None else result,
                 metadata=metadata,
+            )
+        if governed_closeout:
+            closeout_evidence = _worker_completion_closeout_evidence(
+                existing,
+                run_id=run_id,
+                summary=summary if summary is not None else result,
+                result=result,
+                metadata=metadata,
+            )
+            conn.execute(
+                "UPDATE tasks SET closeout_evidence = ? WHERE id = ?",
+                (_json_dumps_dict(closeout_evidence, "closeout_evidence"), task_id),
             )
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
