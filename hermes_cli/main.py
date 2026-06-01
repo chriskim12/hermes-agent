@@ -6269,6 +6269,20 @@ def cmd_kanban(args):
     return kanban_command(args)
 
 
+def cmd_ultragoal(args):
+    """Source-compatible Ultragoal durable goal artifacts."""
+    from hermes_cli.ultragoal import ultragoal_command
+
+    return ultragoal_command(args)
+
+
+def cmd_kanban_ultragoal(args):
+    """Durable Kanban-authority Ultragoal controller."""
+    from hermes_cli.kanban_ultragoal import kanban_ultragoal_command
+
+    return kanban_ultragoal_command(args)
+
+
 def cmd_hooks(args):
     """Shell-hook inspection and management."""
     from hermes_cli.hooks import hooks_command
@@ -11182,11 +11196,11 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "computer-use",
         "config", "cron", "curator", "dashboard", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
-        "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
+        "kanban", "kanban-ultragoal", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
         "model", "pairing", "plugins", "portal", "postinstall", "profile", "proxy",
         "prompt-size",
         "send", "sessions", "setup",
-        "skills", "slack", "status", "tools", "uninstall", "update",
+        "skills", "slack", "status", "tools", "ultragoal", "uninstall", "update",
         "version", "webhook", "whatsapp", "chat", "secrets", "security",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
@@ -12497,7 +12511,23 @@ def main():
     kanban_parser.set_defaults(func=cmd_kanban)
 
     # =========================================================================
-    # hooks command — shell-hook inspection and management
+    # ultragoal command — source-compatible durable goal artifacts
+    # =========================================================================
+    from hermes_cli.ultragoal import build_parser as _build_ultragoal_parser
+
+    ultragoal_parser = _build_ultragoal_parser(subparsers)
+    ultragoal_parser.set_defaults(func=cmd_ultragoal)
+
+    # =========================================================================
+    # kanban-ultragoal command — durable Kanban-authority Ultragoal controller
+    # =========================================================================
+    from hermes_cli.kanban_ultragoal import build_parser as _build_kanban_ultragoal_parser
+
+    kanban_ultragoal_parser = _build_kanban_ultragoal_parser(subparsers)
+    kanban_ultragoal_parser.set_defaults(func=cmd_kanban_ultragoal)
+
+    # =========================================================================
+    # hooks command — lifecycle hooks
     # =========================================================================
     hooks_parser = subparsers.add_parser(
         "hooks",
