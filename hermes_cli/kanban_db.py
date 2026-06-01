@@ -1164,11 +1164,16 @@ def _worker_completion_closeout_evidence(
             "notes": notes,
         }
     forbidden_raw = md.get("forbidden_actions_performed")
+    forbidden_side_effects = md.get("forbidden_side_effects")
     if forbidden_raw is False or forbidden_raw is None:
         forbidden_actions: list[str] = []
     else:
         forbidden_actions = _string_list(forbidden_raw)
-    authority_ok = forbidden_raw is False or md.get("authority_boundary_confirmed") is True
+    authority_ok = (
+        forbidden_raw is False
+        or forbidden_side_effects is False
+        or md.get("authority_boundary_confirmed") is True
+    )
     worker_evidence = {
         "schema": WORKER_EVIDENCE_SCHEMA,
         "task_id": row["id"],
