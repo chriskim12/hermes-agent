@@ -968,6 +968,78 @@ def _strict_ready_gate_enabled() -> bool:
     return _kanban_config_bool("strict_ready_gate", default=False)
 
 
+_READY_GATE_REQUIREMENTS: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    ("missing_goal", ("goal:", "goal -", "objective:"), "goal"),
+    ("missing_end_state", ("end-state", "end state", "output:", "deliverable"), "end-state/output"),
+    ("missing_scope_non_goals", ("scope/non-goals", "non-goals", "non goals", "out of scope"), "scope/non-goals"),
+    ("missing_acceptance_criteria", ("acceptance criteria", "acceptance:"), "acceptance criteria"),
+    ("missing_verification_requirements", ("verification requirements", "verification:", "tests_run", "test:"), "verification requirements"),
+    ("missing_authority_boundary", ("authority boundary", "authority:", "kanban"), "authority boundary"),
+    ("missing_repo_lane_truth", ("repo/lane truth", "repo_full_name", "repository", "branch"), "repo/lane truth"),
+    ("missing_risk_flags", ("risk flags", "risk:", "env", "secret", "prod", "customer-visible", "restart"), "risk flags"),
+    ("missing_dependencies_blockers", ("dependencies/blockers", "dependencies:", "blockers:", "none"), "dependencies/blockers"),
+    ("missing_review_package_expectation", ("review package", "review_ready", "changed files", "commit"), "review package expectation"),
+)
+_DONE_CRITERIA_HEADER_RE = re.compile(
+    r"^\s*done criteria(?: ledger)?\s*:\s*(?P<inline>.*\S)?\s*$",
+    re.IGNORECASE,
+)
+_BULLET_RE = re.compile(r"^\s*(?:[-*+•]|\d+[.)])\s+(?P<text>.+\S)\s*$")
+_SECTION_HEADER_RE = re.compile(r"^\s*[A-Za-z][A-Za-z0-9 /_-]{0,80}:\s*$")
+
+
+def _slugify_for_ready_gate(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug or "criterion"
+
+
+def _extract_body_done_criteria(body: str) -> list[dict[str, Any]]:
+    """Extract a simple done-criteria ledger from card markdown.
+
+    Creation-time cards often have human-authored ``Done criteria:`` sections
+    rather than a structured ledger yet.  The strict ready gate only needs a
+    deterministic ledger candidate; the closeout path later enforces the full
+    evidence/verifier contracts.
+    """
+
+    criteria: list[dict[str, Any]] = []
+    collecting = False
+    for raw_line in str(body or "").splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        header = _DONE_CRITERIA_HEADER_RE.match(stripped)
+        if header:
+            collecting = True
+            inline = (header.group("inline") or "").strip()
+            if inline:
+                criteria.append(
+                    {
+                        "id": f"dc-{len(criteria) + 1:02d}-{_slugify_for_ready_gate(inline)}",
+                        "text": inline,
+                        "source_section": "Done criteria",
+                    }
+                )
+            continue
+        if not collecting:
+            continue
+        if _SECTION_HEADER_RE.match(stripped) and not _BULLET_RE.match(stripped):
+            break
+        item = _BULLET_RE.match(stripped)
+        if item:
+            text = item.group("text").strip()
+            criteria.append(
+                {
+                    "id": f"dc-{len(criteria) + 1:02d}-{_slugify_for_ready_gate(text)}",
+                    "text": text,
+                    "source_section": "Done criteria",
+                }
+            )
+        elif criteria:
+            criteria[-1]["text"] = f"{criteria[-1]['text']} {stripped}".strip()
+    return criteria
+
+
 def _task_row_to_ready_gate_candidate(row: sqlite3.Row) -> dict[str, Any]:
     candidate = dict(row)
     for field in ("routing_verdict", "admission_snapshot", "closeout_evidence"):
@@ -986,18 +1058,116 @@ def _task_row_to_ready_gate_candidate(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _evaluate_autopilot_ready_gate_for_row(row: sqlite3.Row) -> dict[str, Any]:
-    try:
-        from gateway.kanban_autopilot import evaluate_autopilot_ready_gate
+    """Evaluate the strict raw-ready gate without the removed gateway module.
 
-        return evaluate_autopilot_ready_gate(_task_row_to_ready_gate_candidate(row))
+    Older local carry hosted this pure gate in ``gateway.kanban_autopilot``.
+    Upstream-native reconciliation intentionally dropped that gateway runtime
+    substrate, but the dispatcher still needs the gate when
+    ``kanban.strict_ready_gate`` is enabled.  Keep the evaluator local to the
+    Kanban DB/dispatcher surface so raw ``ready`` remains fail-closed without a
+    stale import dependency on the removed gateway module.
+    """
+
+    candidate = _task_row_to_ready_gate_candidate(row)
+    body = str(candidate.get("body") or "")
+    title = str(candidate.get("title") or "")
+    haystack = "\n".join(
+        [title, body, json.dumps(candidate, ensure_ascii=False, sort_keys=True)]
+    ).lower()
+    reason_codes: list[str] = []
+    missing_labels: list[str] = []
+
+    if str(candidate.get("status") or "").lower() != "ready":
+        reason_codes.append("kanban_status_not_ready")
+        missing_labels.append("Kanban status=ready")
+
+    for code, markers, label in _READY_GATE_REQUIREMENTS:
+        if not any(marker in haystack for marker in markers):
+            reason_codes.append(code)
+            missing_labels.append(label)
+
+    try:
+        from hermes_cli.kanban_closeout import normalize_done_criteria_ledger
+
+        ledger = normalize_done_criteria_ledger(
+            {
+                "task_id": candidate.get("id"),
+                "public_id": candidate.get("public_id"),
+                "criteria": _extract_body_done_criteria(body),
+            }
+        )
     except Exception as exc:
-        return {
-            "task_id": row["id"],
-            "autopilot_ready": False,
-            "status": "rejected",
-            "reason_codes": ["ready_gate_evaluator_error"],
-            "human_reason": f"ready gate evaluator failed: {exc}",
-        }
+        ledger = {}
+        reason_codes.append("invalid_done_criteria_ledger")
+        missing_labels.append(f"explicit done criteria ledger ({exc})")
+
+    if not ledger.get("criteria"):
+        if "missing_done_criteria_ledger" not in reason_codes:
+            reason_codes.append("missing_done_criteria_ledger")
+        missing_labels.append("explicit done criteria ledger")
+
+    closeout_evidence = candidate.get("closeout_evidence") or {}
+    if isinstance(closeout_evidence, str):
+        closeout_evidence = _json_loads_maybe(closeout_evidence) or {}
+    if not isinstance(closeout_evidence, dict):
+        closeout_evidence = {}
+    reviewer_loop = closeout_evidence.get("reviewer_loop") or {}
+    if isinstance(reviewer_loop, str):
+        reviewer_loop = _json_loads_maybe(reviewer_loop) or {}
+    if not isinstance(reviewer_loop, dict):
+        reviewer_loop = {}
+    require_reviewer_loop = (
+        closeout_evidence.get("require_reviewer_loop") is True
+        or reviewer_loop.get("required") is True
+        or reviewer_loop.get("enabled") is True
+    )
+    reviewer_profile = str(
+        closeout_evidence.get("reviewer_profile")
+        or reviewer_loop.get("reviewer_profile")
+        or ""
+    ).strip()
+    if not require_reviewer_loop or not reviewer_profile:
+        reviewer_loop_declared_in_body = (
+            "reviewer-loop contract" in haystack
+            or "reviewer_loop" in haystack
+            or "reviewer profile" in haystack
+            or "reviewer_profile" in haystack
+        )
+        if not reviewer_loop_declared_in_body:
+            reason_codes.append("missing_reviewer_loop_contract")
+            missing_labels.append("reviewer-loop contract")
+
+    routing = candidate.get("routing_verdict") or {}
+    if isinstance(routing, str):
+        routing = _json_loads_maybe(routing) or {}
+    verdict = str((routing or {}).get("verdict") or "").strip().lower()
+    if not verdict and ("routing verdict" in haystack or "direct-kanban" in haystack):
+        verdict = "body-declared"
+    if not verdict:
+        reason_codes.append("missing_routing_verdict")
+        missing_labels.append("routing verdict")
+
+    accepted = not reason_codes
+    return {
+        "task_id": candidate.get("id"),
+        "public_id": candidate.get("public_id"),
+        "autopilot_ready": accepted,
+        "status": "accepted" if accepted else "rejected",
+        "reason_codes": reason_codes,
+        "human_reason": (
+            "ready for autopilot dry-run selection"
+            if accepted else
+            "Missing executable contract fields: " + ", ".join(missing_labels)
+        ),
+        "done_criteria_ledger": ledger or None,
+        "criteria_hash": ledger.get("criteria_hash") if isinstance(ledger, dict) else None,
+        "criteria_ids": [
+            str(item.get("id") or "")
+            for item in (ledger.get("criteria") if isinstance(ledger, dict) else [])
+            if isinstance(item, dict)
+        ],
+        "dry_run_side_effects": {"claimed": 0, "spawned": 0, "mutated": 0},
+    }
 
 
 def _block_for_ready_gate_failure(conn: sqlite3.Connection, row: sqlite3.Row, gate: dict[str, Any], *, source: str) -> None:
@@ -4479,7 +4649,7 @@ def promote_task(
         parents = conn.execute(
             "SELECT t.id, t.status FROM tasks t "
             "JOIN task_links l ON l.parent_id = t.id "
-            "WHERE l.child_id = ?",
+            "WHERE l.child_id = ? AND l.relation_type = 'dependency'",
             (task_id,),
         ).fetchall()
         unsatisfied = [
