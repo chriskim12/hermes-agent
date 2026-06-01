@@ -1868,7 +1868,7 @@ def test_dispatch_spawns_verifier_for_worker_done_handoff(kanban_home, all_assig
             {
                 "task_id": task_id,
                 "assignee": "verifier",
-                "skills": ["sdlc-review"],
+                "skills": ["kanban-verifier"],
                 "goal_mode": False,
                 "workspace": str(kanban_home),
             }
