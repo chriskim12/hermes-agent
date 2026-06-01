@@ -845,4 +845,81 @@ Still unresolved and must not be implied by this proof:
 - end-to-end bounded `/autopilot` smoke after the evaluator/routing substrate is materialized.
 
 Recommended next sub-slice: **human review handoff context persistence**. The closeout gate now defines what counts as reviewable output; next the review/handoff context needs to persist enough detail for a reviewer or remediation worker to act without rebuilding state from scattered comments.
+## 18. Draft PR anchor + packaging-smoke repair (2026-06-01)
+
+Status: **draft PR anchor created; hosted CI green; not merged; no live apply**.
+
+### Scope fixed
+
+Chris approved leaving a PR anchor for the completed RALPLAN proof slices. The cumulative Slice 2/3/3b/3c branch was pushed to the fork and opened as a draft PR:
+
+- PR: https://github.com/chriskim12/hermes-agent/pull/81
+- Base: `yuuka/upstream-main-20260601-base`
+- Base SHA: `1044d9f25d63b48c51fe40af0a4cfeea3b6de516`
+- Head branch: `yuuka/hermes-upstream-20260601-slice2-local`
+- Final head SHA: `6bb84afa58808ed66ea0f325fbca1579c4691a36`
+- PR state: `OPEN`, `draft: true`, `mergeStateStatus: CLEAN`, `mergeable: MERGEABLE`
+
+The first PR head `b94fdb4d09b7e7c0cb0b49a830d3918b28c7f2c0` exposed a hosted Nix packaging smoke failure rather than a local focused-test failure. The Nix `hermes-cli-commands` check failed with:
+
+```text
+FAIL: gateway subcommand missing
+```
+
+Root cause: `hermes_cli/kanban_closeout.py` imported `hermes_cli.kanban_drift_audit`, but the source file was missing from the upstream-based proof branch. The local source checkout could hide this through stale `__pycache__`, while a clean wheel/Nix package could not.
+
+### Implementation result
+
+Applied on cumulative branch `yuuka/hermes-upstream-20260601-slice2-local`:
+
+- `6bb84afa5 fix(kanban): include drift audit helper for closeout packaging`
+
+This added:
+
+- `hermes_cli/kanban_drift_audit.py`
+- `tests/hermes_cli/test_kanban_closeout_packaging.py`
+
+### Verification
+
+Local repair verification:
+
+- `git diff --check` — passed.
+- `python -m py_compile hermes_cli/kanban_drift_audit.py hermes_cli/kanban_closeout.py hermes_cli/kanban.py hermes_cli/main.py` — passed.
+- Clean-pycache import smoke using `PYTHONPYCACHEPREFIX=/tmp/hermes-pr81-clean-pycache` — passed.
+- `python -m hermes_cli.main --help | grep -q gateway` — passed.
+- Fresh pip package smoke in `/tmp/hermes-pr81-pip-smoke`: install `.[all]`, run packaged `hermes --help`, require `gateway` and `config` — passed.
+- Focused closeout package bundle:
+  - `./scripts/run_tests.sh tests/hermes_cli/test_kanban_closeout_packaging.py tests/hermes_cli/test_kanban_closeout.py tests/tools/test_kanban_tools.py`
+  - **3 files / 128 tests passed / 0 failed**.
+- Broader focused integration bundle:
+  - `git diff --check && ./scripts/run_tests.sh tests/hermes_cli/test_kanban_closeout_packaging.py tests/hermes_cli/test_kanban_closeout.py tests/tools/test_kanban_tools.py tests/hermes_cli/test_kanban_db.py tests/plugins/test_kanban_dashboard_plugin.py tests/tools/test_terminal_task_cwd.py tests/tools/test_code_execution_modes.py tests/tools/test_terminal_tool.py tests/agent/test_skill_commands.py tests/hermes_cli/test_config_env_refs.py tests/gateway/test_config_env_bridge_authority.py`
+  - **11 files / 541 tests passed / 0 failed**.
+
+Hosted PR CI at final head `6bb84afa58808ed66ea0f325fbca1579c4691a36`:
+
+- `nix (ubuntu-latest)` — success.
+- `nix (macos-latest)` — success.
+- `changes` — success.
+- `Scan PR for critical supply chain risks` — success/skipped matrix entries.
+- `Check PyPI dependency upper bounds` — success/skipped matrix entries.
+
+### Non-actions
+
+- No merge.
+- No root/canonical checkout materialization.
+- No gateway restart/reload.
+- No live runtime apply.
+- No env/secret/config mutation.
+- No cron mutation.
+- No upstream PR.
+
+### Remaining work
+
+The PR is an anchor for verified slices, not full carry reconciliation completion. Still unresolved:
+
+- human review handoff context persistence.
+- autopilot worker-candidate review routing.
+- full reviewer-loop lifecycle/adjudication.
+- Codex/OMX/Hindsight/OAuth bridge verdicts.
+- final root materialization / runtime apply / gateway restart gates, each requiring separate approval.
 
