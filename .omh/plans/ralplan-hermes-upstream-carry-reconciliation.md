@@ -1,5 +1,7 @@
 ---
 status: pending approval
+admission_ready: true
+review_ready: true
 target_repo: /home/ubuntu/.hermes/hermes-agent
 plan_worktree: /home/ubuntu/.hermes/hermes-agent/.worktrees/plan-20260531-hermes-upstream-carry-reconciliation
 canonical_path: .omh/plans/ralplan-hermes-upstream-carry-reconciliation.md
@@ -8,8 +10,10 @@ fallback: false
 created_at_utc: 2026-05-31T17:11:16Z
 owner: Hayase Yuuka
 execution_authority: not_admitted
-admission_state: pending_approval
+admission_state: admission_ready_pending_approval
 execution_approved: false
+latest_proof_pr: https://github.com/chriskim12/hermes-agent/pull/81
+latest_proof_head: 6bb84afa58808ed66ea0f325fbca1579c4691a36
 ---
 
 # RALPLAN — Hermes upstream update carry reconciliation
@@ -615,10 +619,11 @@ New local-only cumulative proof worktree:
 
 ### Slice 4/5 classification outcome
 
-- Upstream `codex_app_server` runtime/session is native and should be adopted as substrate.
-- Old local `codex_session` value is not fully upstream-native: preserve only as a narrow evidence-only shim or migration bridge, not default runtime.
-- OMX stays frozen/legacy/special; do not promote as default execution lane.
-- Hindsight reflect metadata and Codex OAuth bridge are local-only: preserve only as opt-in, loopback/secret-gated, non-default behavior until separate proof.
+- Codex runtime / evidence semantics: **B / adapter** — adopt upstream-native `codex_app_server` / Codex app-server session substrate and preserve local evidence semantics only through the current upstream-compatible projector/session test surface. Do not resurrect old `codex_session` as default runtime.
+- Old local `codex_session` executor/tooling commits: **drop as implementation substrate; preserve only semantic coverage through current Codex app-server tests**.
+- OMX/Ralph lane carries: **defer / legacy-special** — keep OMX frozen as a special lane; do not promote OMX as default execution route in this upstream reconciliation proof.
+- Hindsight reflect metadata and Hindsight Codex OAuth bridge: **drop by Chris decision** — keep Hermes-native Hindsight provider and Codex OAuth/provider flows as authority; do not port `972bf4db43` or `dedca0e9d1`.
+- Upstream advanced caveat: newer upstream runtime capability does not imply live/default migration. Runtime default changes, root materialization, and gateway/runtime apply remain separate approval gates.
 
 ### Verification run on local Slice 2 branch
 
@@ -915,13 +920,172 @@ Hosted PR CI at final head `6bb84afa58808ed66ea0f325fbca1579c4691a36`:
 - No cron mutation.
 - No upstream PR.
 
-### Remaining work
+### Remaining work classification
 
-The PR is an anchor for verified slices, not full carry reconciliation completion. Still unresolved:
+The PR is now the reviewable/admission-ready anchor for the verified reconciliation slices, not root/live completion.
 
-- human review handoff context persistence.
-- autopilot worker-candidate review routing.
-- full reviewer-loop lifecycle/adjudication.
-- Codex/OMX/Hindsight/OAuth bridge verdicts.
-- final root materialization / runtime apply / gateway restart gates, each requiring separate approval.
+- Human review handoff context persistence: **preserve/adapt** through the current `worker_done -> closeout verifier -> review_ready` package path; no separate `gateway/kanban_autopilot.py` resurrection.
+- Autopilot worker-candidate review routing: **defer** as a separate lifecycle feature; current closeout correctness is covered by the fail-closed closeout verifier.
+- Full reviewer-loop lifecycle/adjudication: **defer**; too broad for this proof and risks duplicating the current closeout gate.
+- Codex runtime/evidence: **adapted** to upstream Codex app-server/session/projector substrate; old local `codex_session` implementation is not admitted as default runtime.
+- OMX/Ralph: **defer / legacy-special**; not a default lane.
+- Hindsight/OAuth bridge carries: **drop**.
+- Final root materialization / runtime apply / gateway restart gates remain separate approvals.
 
+## 19. Final review-ready / admission-ready closeout (2026-06-01)
+
+### 결론
+
+This RALPLAN is **review-ready / admission-ready pending approval** for the current fork-local proof anchor. It is **not** merge approval, root materialization approval, gateway restart approval, or live runtime approval.
+
+### 실제 반영
+
+- Latest proof PR: https://github.com/chriskim12/hermes-agent/pull/81
+- Proof branch: `yuuka/hermes-upstream-20260601-slice2-local`
+- Proof head: `6bb84afa58808ed66ea0f325fbca1579c4691a36`
+- Base anchor: `yuuka/upstream-main-20260601-base` at `1044d9f25d63b48c51fe40af0a4cfeea3b6de516`
+- Verified preserved/adapted carries:
+  - test isolation for `HERMES_CRON_SESSION`
+  - Kanban strict-ready/list-read-only semantics
+  - Bitwarden/GWS/BWS read-only and runtime secret-governance adapters
+  - gateway scoped intake state
+  - Kanban hierarchy-vs-dependency relation metadata
+  - reviewer remediation vs duplicate PR guard
+  - fail-closed review package closeout gating
+  - closeout packaging helper required by clean package/Nix smoke
+- Classified remaining carries:
+  - human review handoff context: **preserve/adapt** through current closeout evidence path
+  - autopilot worker-candidate review routing: **defer**
+  - full reviewer-loop lifecycle/adjudication: **defer**
+  - Codex runtime/evidence: **adapt** to upstream Codex app-server/session/projector substrate
+  - old local `codex_session` implementation substrate: **drop as default/runtime substrate**
+  - OMX/Ralph lanes: **defer / legacy-special**, not default execution route
+  - Hindsight reflect metadata and Hindsight Codex OAuth bridge: **drop** by Chris decision
+
+### 아직 안 한 것
+
+- No upstream/NouResearch PR, comment, push, or update.
+- No merge into fork/main or canonical `main`.
+- No root/canonical checkout materialization.
+- No gateway restart/reload.
+- No live runtime apply.
+- No env/secret/provider/config mutation.
+- No cron mutation.
+- No customer-facing/external send.
+- No cost-bearing action.
+
+### 다음 판단
+
+Chris can review the proof PR and this RALPLAN as an admission-ready package. The next decisions remain separate:
+
+1. whether to merge the fork-local proof PR;
+2. whether/when to materialize the canonical root checkout;
+3. whether/when to restart/reload the gateway;
+4. whether/when to run live/runtime verification;
+5. whether deferred Autopilot reviewer-loop / OMX lanes should become separate future work.
+
+### Policy check
+
+- RALPLAN remains a planning/admission artifact.
+- Kanban remains execution SSOT after approval.
+- PR existence is evidence, not merge/root/live authority.
+- `worker_done`, `review_ready`, `closed`, PR merged, root materialized, and runtime applied remain distinct ledger states.
+- Hindsight/memory is not promoted above repo/Kanban/PR truth.
+
+### Green 완료
+
+- PR #81 exists as a draft/open review anchor.
+- PR #81 hosted checks are green at head `6bb84afa58808ed66ea0f325fbca1579c4691a36`.
+- All remaining carry buckets have an explicit preserve/adapt/drop/defer classification.
+- Hindsight/OAuth local carries are explicitly dropped.
+- OMX is explicitly not promoted to default.
+- Closeout verifier path is tested and packaged.
+
+### Yellow 대기
+
+- `upstream/main` has advanced after the PR #81 base anchor. This does not invalidate the current proof package, but a future merge/materialization decision should either retain the anchored base intentionally or refresh/rebase in a new proof pass.
+- Deferred Autopilot reviewer-loop routing and OMX retirement/migration remain future separately-scoped work, not blockers for this admission-ready closeout.
+- Runtime import/config binding verification before root materialization remains required if Chris later approves root landing.
+
+### Red 필요
+
+None inside the approved review-ready/admission-ready scope. Red gates only appear if someone tries to proceed to upstream mutation, merge, root materialization, gateway restart, live apply, env/secret mutation, cron mutation, customer-facing send, or cost-bearing work without separate approval.
+
+### 검증
+
+Latest closeout verification on proof branch:
+
+```bash
+python -m py_compile hermes_cli/kanban.py hermes_cli/kanban_db.py hermes_cli/kanban_closeout.py hermes_cli/kanban_drift_audit.py tools/kanban_tools.py agent/transports/codex_app_server_session.py agent/transports/codex_event_projector.py hermes_cli/runtime_provider.py
+./scripts/run_tests.sh tests/hermes_cli/test_kanban_closeout_packaging.py tests/hermes_cli/test_kanban_closeout.py tests/tools/test_kanban_tools.py tests/hermes_cli/test_kanban_db.py tests/agent/transports/test_codex_app_server_session.py tests/agent/transports/test_codex_event_projector.py tests/run_agent/test_codex_app_server_integration.py
+# 7 files / 436 tests passed / 0 failed
+
+git diff --check
+
+python - <<'PY'
+from model_tools import get_tool_definitions
+schemas = get_tool_definitions(quiet_mode=True)
+names = [s['function']['name'] for s in schemas]
+print('tool_schema_count', len(names))
+print('has_terminal', 'terminal' in names)
+print('has_tts', 'text_to_speech' in names)
+print('has_google_workspace_profiles', 'google_workspace_profiles' in names)
+print('duplicates', sorted({x for x in names if names.count(x)>1}))
+from gateway.config import load_gateway_config
+cfg = load_gateway_config()
+print('gateway_config_loaded', type(cfg).__name__, bool(getattr(cfg,'platforms',None)))
+PY
+# tool_schema_count=45; has_terminal=True; has_tts=True; has_google_workspace_profiles=True; duplicates=[]; gateway_config_loaded=GatewayConfig True
+```
+
+Hindsight/OAuth drop check:
+
+```bash
+BASE=$(git merge-base HEAD upstream/main)
+git diff --name-only "$BASE...HEAD" | grep -Ei 'hindsight|oauth|codex.*bridge' || echo 'no Hindsight/OAuth bridge files in proof diff'
+# no Hindsight/OAuth bridge files in proof diff
+```
+
+### Git 상태
+
+- Root checkout: inspected read-only; not mutated.
+- Proof worktree: clean at `6bb84afa58808ed66ea0f325fbca1579c4691a36`, tracking `fork/yuuka/hermes-upstream-20260601-slice2-local`.
+- Plan worktree: this RALPLAN closeout section is the final planning artifact update and should be committed/pushed as plan evidence.
+- PR #81: draft/open, base `yuuka/upstream-main-20260601-base`, head `yuuka/hermes-upstream-20260601-slice2-local`, hosted checks green at recorded head.
+
+### Live 상태
+
+- Gateway not restarted or reloaded.
+- Live runtime not applied.
+- Root/canonical checkout not materialized.
+- Env/secret/provider/config not mutated.
+- Cron not mutated.
+
+### ralplan_consensus_gate
+
+```yaml
+ralplan_consensus_gate:
+  complete: true
+  final_planner_plan: .omh/plans/ralplan-hermes-upstream-carry-reconciliation.md
+  architect_review: present
+  critic_review: present
+  revisions_folded: true
+hermes_overlay:
+  admission_ready: true
+  review_ready: true
+  admission_state: admission_ready_pending_approval
+  execution_authority: not_admitted
+  execution_approved: false
+approval_boundary:
+  approved: local proof work, tests, commits, fork push/PR update, RALPLAN update/commit
+  still_requires_separate_approval:
+    - upstream PR/comment/push/update
+    - merge
+    - root/canonical checkout materialization
+    - gateway restart/reload
+    - live runtime apply
+    - env/secret/provider/config mutation
+    - cron mutation
+    - customer-facing/external send
+    - cost-bearing work
+```
