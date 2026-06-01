@@ -244,9 +244,11 @@ Candidate commits/features:
 - `972bf4db43 fix(hindsight): expose reflect evidence metadata`
 - `dedca0e9d1 feat(hindsight): add Codex OAuth bridge`
 
-Classification target:
+Classification outcome:
 
-- Defer until config/default behavior impact is isolated.
+- **Drop both local carries by Chris decision.**
+- Keep upstream/Hermes-native Hindsight provider and Codex OAuth/provider flows as the authority.
+- Do not port local reflect evidence metadata or local Hindsight Codex OAuth bridge into the upstream integration proof branch.
 - Must not broaden autonomous memory/curator/self-improvement behavior by accident.
 
 ## 8. Implementation slices and gates
@@ -320,18 +322,18 @@ Classification target:
 - Evidence schema tests.
 - No OMX path becomes default execution lane without explicit approval.
 
-### Slice 5 — Hindsight/OAuth bridge
+### Slice 5 — Hindsight/OAuth local carry drop
 
 **Scope**
 
-- Reflect evidence metadata and Codex OAuth bridge.
-- Isolate config/default behavior changes.
+- No integration work for local `972bf4db43` reflect evidence metadata.
+- No integration work for local `dedca0e9d1` Hindsight Codex OAuth bridge.
+- Keep upstream/Hermes-native Hindsight provider and Codex OAuth/provider flows as the authority.
 
 **Verification**
 
-- Hindsight provider tests.
-- Config migration/precedence tests.
-- Explicit no-autonomous-mutation gate.
+- Verify the cumulative proof branch does not include `hermes_cli/hindsight_codex_bridge.py` or local Hindsight reflect evidence metadata changes.
+- Verify no config/default behavior is changed for Hindsight, OAuth, memory, curator, or self-improvement flows.
 
 ### Slice 6 — Final materialization plan
 
