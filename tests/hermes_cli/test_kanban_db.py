@@ -382,6 +382,22 @@ def test_hierarchy_link_does_not_gate_child_readiness_or_completion(kanban_home)
         assert kb.get_task(conn, parent).status == "ready"
 
 
+def test_manual_promote_ignores_hierarchy_parents(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="umbrella parent")
+        child = kb.create_task(conn, title="executable child")
+        kb.block_task(conn, child, reason="manual hold")
+        kb.link_tasks(conn, parent, child, relation_type="hierarchy")
+
+        promoted, error = kb.promote_task(
+            conn, child, actor="tester", reason="hierarchy is non-blocking"
+        )
+
+        assert promoted is True
+        assert error is None
+        assert kb.get_task(conn, child).status == "ready"
+
+
 def test_converting_dependency_to_hierarchy_releases_child_gate(kanban_home):
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="umbrella parent")
@@ -1442,6 +1458,44 @@ def test_dispatch_strict_ready_gate_dry_run_does_not_mutate(kanban_home, monkeyp
     assert not res.spawned
     assert task.status == "ready"
     assert task.assignee == "alice"
+
+
+def test_dispatch_strict_ready_gate_uses_native_evaluator_after_gateway_autopilot_drop(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_STRICT_READY_GATE", "true")
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append((task.id, workspace))
+
+    body = """
+Goal: Prove read-only dispatch smoke.
+End-state/output: Worker evidence only; no file edits.
+Scope/non-goals: Out of scope: commits, PRs, releases, env changes.
+Acceptance criteria: Criteria below are satisfied.
+Verification requirements: tests_run: read-only command evidence only.
+Authority boundary: Kanban smoke only; no customer-visible or production mutation.
+Repo/lane truth: repository chriskim12/dailychingu branch develop.
+Risk flags: env, secret, prod, customer-visible, restart are forbidden.
+Dependencies/blockers: none.
+Routing verdict: direct-kanban.
+Reviewer-loop contract: required reviewer_profile verifier.
+Review package expectation: review_ready requires worker evidence and verifier PASS; changed files none; commit none.
+Done criteria:
+- Confirm repo status with a read-only git status command.
+- Confirm no forbidden side effects were performed.
+"""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="strict gate smoke", body=body, assignee="alice")
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        task = kb.get_task(conn, t)
+
+    assert res.auto_blocked == []
+    assert [item[0] for item in res.spawned] == [t]
+    assert spawns and spawns[0][0] == t
+    assert task.status == "running"
 
 
 def test_dispatch_skips_nonspawnable_into_separate_bucket(kanban_home, monkeypatch):

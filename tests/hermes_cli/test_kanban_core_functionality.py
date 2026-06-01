@@ -3699,12 +3699,11 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
     # First tick connect (dispatch) + two probes per `_has_ready_work` call
-    # (ready then review, both via _kb.connect). The second dispatch tick
-    # skips the dispatch connect because the corrupt board fingerprint is
-    # disabled, but the ready/review probes still each connect. PR f55d94a1e
-    # added the review-column probe alongside the existing ready-column
-    # probe, bumping this from 3 → 5.
-    assert calls["connect"] == 5
+    # (ready then review, both via _kb.connect). Once a corrupt board is
+    # fingerprint-disabled, later ticks avoid probing the same corrupt DB
+    # again until the quarantine window expires. That keeps the log to one
+    # actionable error and prevents repeated SQLite opens on known-bad files.
+    assert calls["connect"] == 3
 
 
 def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
