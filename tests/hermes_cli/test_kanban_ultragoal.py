@@ -449,6 +449,37 @@ def test_pilot_check_is_strict_read_only_and_blocks_unapproved_authority(tmp_pat
     assert "executionApproved" in out["blockers"]
 
 
+def test_main_cli_propagates_kanban_ultragoal_nonzero_without_global_returncode_side_effects(tmp_path):
+    import os
+    import sqlite3
+    import subprocess
+    import sys
+
+    db_path = tmp_path / "kanban.db"
+    _seed_live_task(db_path, execution_approved=False)
+    before = sqlite3.connect(db_path).execute("select count(*) from task_events").fetchone()[0]
+    env = os.environ.copy()
+    env["HERMES_KANBAN_DB"] = str(db_path)
+    env["HERMES_HOME"] = str(tmp_path / ".hermes")
+    env["PYTHONPATH"] = os.getcwd()
+
+    result = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "kanban-ultragoal", "--json", "pilot-check", "BO-217"],
+        cwd=os.getcwd(),
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    after = sqlite3.connect(db_path).execute("select count(*) from task_events").fetchone()[0]
+    out = json.loads(result.stdout)
+
+    assert result.returncode == 2, result.stderr + result.stdout
+    assert before == after
+    assert out["eligible"] is False
+    assert "executionApproved" in out["blockers"]
+
+
 def test_authority_snapshot_is_read_only_and_fails_closed_when_db_missing(tmp_path, monkeypatch):
     from hermes_cli.kanban_ultragoal import build_authority_snapshot
 
