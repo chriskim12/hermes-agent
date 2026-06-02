@@ -1072,6 +1072,19 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         entries.append((slack_name, desc[:140], hint[:100]))
         seen.add(slack_name)
 
+    # Pin high-value aliases before the 50-command cap can crowd them out.
+    # These are documented first-class slash forms, not optional niceties;
+    # without this pass a growth in canonical commands silently drops short
+    # aliases such as /q even though the tests and user contract require them.
+    priority_aliases = {"btw", "bg", "reset", "q"}
+    for alias in sorted(priority_aliases):
+        for cmd in COMMAND_REGISTRY:
+            if not _is_gateway_available(cmd, overrides):
+                continue
+            if alias in cmd.aliases:
+                _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
+                break
+
     # First pass: canonical names (so they win slots if we hit the cap).
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):

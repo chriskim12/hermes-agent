@@ -227,6 +227,49 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     assert tenant_ids == [c]
 
 
+def test_show_and_list_expose_lifecycle_state_review_ready(monkeypatch, worker_env):
+    """Tool show/list expose compact lifecycle truth for reviewer handoffs."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="review-ready task",
+            body="Reviewer-loop contract: verifier review required",
+            assignee="factory",
+            goal_mode=True,
+            goal_max_turns=4,
+        )
+        conn.execute(
+            "UPDATE tasks SET status='blocked', review_phase='review_ready', closeout_evidence=? WHERE id=?",
+            (json.dumps({"schema": "kanban_closeout_evidence.v1", "checks": []}), tid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    shown = json.loads(kt._handle_show({"task_id": tid}))
+    listed = json.loads(kt._handle_list({"assignee": "factory", "status": "blocked", "limit": 10}))
+
+    assert shown["task"]["status"] == "blocked"
+    assert shown["task"]["review_phase"] == "review_ready"
+    assert shown["task"]["lifecycle_state"] == "review_ready"
+    assert shown["task"]["goal_mode"] is True
+    assert shown["task"]["goal_max_turns"] == 4
+    assert shown["task"]["closeout_evidence_keys"] == ["checks", "schema"]
+    assert shown["task"]["ready_contract_present"] is True
+
+    summary = next(t for t in listed["tasks"] if t["id"] == tid)
+    assert summary["lifecycle_state"] == "review_ready"
+    assert summary["review_phase"] == "review_ready"
+    assert summary["goal_mode"] is True
+    assert summary["goal_max_turns"] == 4
+    assert summary["closeout_evidence_keys"] == ["checks", "schema"]
+    assert summary["ready_contract_present"] is True
+
+
 def test_list_rejects_invalid_status(monkeypatch, worker_env):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     from tools import kanban_tools as kt

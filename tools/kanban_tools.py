@@ -315,6 +315,8 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "title": task.title,
         "assignee": task.assignee,
         "status": task.status,
+        "review_phase": task.review_phase,
+        "lifecycle_state": task.lifecycle_state,
         "priority": task.priority,
         "tenant": task.tenant,
         "workspace_kind": task.workspace_kind,
@@ -325,6 +327,10 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
+        "goal_mode": task.goal_mode,
+        "goal_max_turns": task.goal_max_turns,
+        "closeout_evidence_keys": task.closeout_evidence_keys,
+        "ready_contract_present": task.ready_contract_present,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -528,6 +534,8 @@ def _handle_show(args: dict, **kw) -> str:
                 return {
                     "id": t.id, "title": t.title, "body": t.body,
                     "assignee": t.assignee, "status": t.status,
+                    "review_phase": t.review_phase,
+                    "lifecycle_state": t.lifecycle_state,
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,
@@ -537,6 +545,10 @@ def _handle_show(args: dict, **kw) -> str:
                     "result": t.result,
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
+                    "goal_mode": t.goal_mode,
+                    "goal_max_turns": t.goal_max_turns,
+                    "closeout_evidence_keys": t.closeout_evidence_keys,
+                    "ready_contract_present": t.ready_contract_present,
                 }
 
             def _run_dict(r):
