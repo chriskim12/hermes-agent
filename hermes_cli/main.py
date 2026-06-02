@@ -14653,7 +14653,9 @@ Examples:
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
+        result = args.func(args)
+        if isinstance(result, int) and result != 0:
+            raise SystemExit(result)
     else:
         parser.print_help()
 
