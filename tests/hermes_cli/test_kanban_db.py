@@ -44,6 +44,66 @@ def test_init_db_is_idempotent(kanban_home):
     assert tasks[0].title == "persisted"
 
 
+def test_task_lifecycle_state_and_contract_summary_fields(kanban_home):
+    """Task rows expose compact lifecycle truth without changing raw status."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="review-ready surface",
+            body="Reviewer-loop contract: verifier review required",
+            assignee="reviewer",
+            goal_mode=True,
+            goal_max_turns=3,
+        )
+        conn.execute(
+            "UPDATE tasks SET status='blocked', review_phase='review_ready', "
+            "closeout_evidence=? WHERE id=?",
+            (
+                json.dumps(
+                    {
+                        "schema": "kanban_closeout_evidence.v1",
+                        "done_criteria_ledger": {"criteria": []},
+                        "worker_evidence": {"summary": "done"},
+                    }
+                ),
+                task_id,
+            ),
+        )
+        conn.commit()
+
+        task = kb.get_task(conn, task_id)
+        listed = kb.list_tasks(conn, status="blocked")
+
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.lifecycle_state == "review_ready"
+    assert task.review_phase == "review_ready"
+    assert task.goal_mode is True
+    assert task.goal_max_turns == 3
+    assert task.closeout_evidence_keys == [
+        "done_criteria_ledger",
+        "schema",
+        "worker_evidence",
+    ]
+    assert task.ready_contract_present is True
+    assert listed[0].lifecycle_state == "review_ready"
+
+
+def test_task_lifecycle_state_worker_done_mapping(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="worker handoff")
+        conn.execute(
+            "UPDATE tasks SET status='blocked', review_phase='worker_done' WHERE id=?",
+            (task_id,),
+        )
+        conn.commit()
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.lifecycle_state == "worker_done"
+
+
 def test_init_creates_expected_tables(kanban_home):
     with kb.connect() as conn:
         rows = conn.execute(

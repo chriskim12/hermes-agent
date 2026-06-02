@@ -748,6 +748,32 @@ class Task:
     review_phase: Optional[str] = None
     closeout_evidence: Optional[dict] = None
 
+    @property
+    def lifecycle_state(self) -> str:
+        """Derived operator-facing lifecycle state without changing raw status.
+
+        Review handoff phases live in ``review_phase`` while raw ``status`` may
+        remain ``blocked`` for dispatcher safety. Exposing this derived field
+        prevents operators and agents from misreading governed handoffs as
+        ordinary failures.
+        """
+        if self.review_phase in VALID_REVIEW_PHASES:
+            return self.review_phase
+        return self.status
+
+    @property
+    def closeout_evidence_keys(self) -> list[str]:
+        if not isinstance(self.closeout_evidence, dict):
+            return []
+        return sorted(str(k) for k in self.closeout_evidence.keys())
+
+    @property
+    def ready_contract_present(self) -> bool:
+        if self.goal_mode:
+            return True
+        body = self.body or ""
+        return _body_declares_reviewer_loop(body) or _body_has_structured_ready_contract(body)
+
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
         keys = set(row.keys())
@@ -1079,6 +1105,15 @@ def _body_declares_reviewer_loop(body: str) -> bool:
     return (
         "reviewer-loop contract" in haystack
         or "reviewer_loop" in haystack
+    )
+
+
+def _body_has_structured_ready_contract(body: str) -> bool:
+    haystack = str(body or "").lower()
+    return (
+        "ready_contract" in haystack
+        or "kanban_ready_contract" in haystack
+        or "structured ready contract" in haystack
     )
 
 

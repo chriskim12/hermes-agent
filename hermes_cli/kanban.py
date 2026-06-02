@@ -54,7 +54,8 @@ def _fmt_task_line(t: kb.Task) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    lifecycle = f"/{t.lifecycle_state}" if t.lifecycle_state != t.status else ""
+    return f"{icon} {t.id}  {t.status + lifecycle:20s}  {assignee:20s}{tenant}  {t.title}"
 
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
@@ -64,6 +65,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "body": t.body,
         "assignee": t.assignee,
         "status": t.status,
+        "review_phase": t.review_phase,
+        "lifecycle_state": t.lifecycle_state,
         "priority": t.priority,
         "tenant": t.tenant,
         "workspace_kind": t.workspace_kind,
@@ -79,6 +82,10 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "goal_mode": t.goal_mode,
+        "goal_max_turns": t.goal_max_turns,
+        "closeout_evidence_keys": t.closeout_evidence_keys,
+        "ready_contract_present": t.ready_contract_present,
     }
 
 
@@ -1569,6 +1576,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     print(f"Task {task.id}: {task.title}")
     print(f"  status:    {task.status}")
+    if task.review_phase:
+        print(f"  review:    {task.review_phase}")
+    print(f"  lifecycle: {task.lifecycle_state}")
     print(f"  assignee:  {task.assignee or '-'}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
