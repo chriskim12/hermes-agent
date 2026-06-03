@@ -1020,6 +1020,97 @@ def verify_closeout_transition(
     )
 
 
+def _decode_closeout_evidence(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return {}
+        return dict(data) if isinstance(data, Mapping) else {}
+    return {}
+
+
+def _hierarchy_child_review_matrix(conn: Any, parent_task_id: str) -> list[dict[str, Any]]:
+    """Return Kanban SSOT review state for hierarchy children of a parent card."""
+
+    rows = conn.execute(
+        """
+        SELECT child.id,
+               child.title,
+               child.status,
+               child.review_phase,
+               child.closeout_evidence
+          FROM task_links AS link
+          JOIN tasks AS child ON child.id = link.child_id
+         WHERE link.parent_id = ?
+           AND link.relation_type = 'hierarchy'
+         ORDER BY child.created_at ASC, child.id ASC
+        """,
+        (parent_task_id,),
+    ).fetchall()
+
+    matrix: list[dict[str, Any]] = []
+    for row in rows:
+        evidence = _decode_closeout_evidence(row["closeout_evidence"])
+        verification = _as_mapping(evidence.get("verification"))
+        closeout_allowed = verification.get("allowed")
+        review_phase = row["review_phase"]
+        ready = review_phase in {"review_ready", "closed"} and closeout_allowed is True
+        matrix.append(
+            {
+                "task_id": row["id"],
+                "title": row["title"],
+                "status": row["status"],
+                "review_phase": review_phase,
+                "closeout_allowed": closeout_allowed,
+                "ready": ready,
+                "reason": None if ready else "child_not_review_ready",
+            }
+        )
+    return matrix
+
+
+def _with_child_review_matrix(
+    verification: CloseoutVerification,
+    *,
+    conn: Any,
+    task_id: str,
+) -> CloseoutVerification:
+    if verification.target_phase != "review_ready":
+        return verification
+
+    matrix = _hierarchy_child_review_matrix(conn, task_id)
+    if not matrix:
+        return verification
+
+    evidence = copy.deepcopy(verification.evidence)
+    evidence["child_review_matrix"] = matrix
+    child_blockers = ["child_not_review_ready"] if any(not item.get("ready") for item in matrix) else []
+    if not child_blockers:
+        return CloseoutVerification(
+            allowed=verification.allowed,
+            target_phase=verification.target_phase,
+            blockers=list(verification.blockers),
+            evidence=evidence,
+            reason=verification.reason,
+        )
+
+    blockers = list(dict.fromkeys([*verification.blockers, *child_blockers]))
+    verification_state = _as_mapping(evidence.get("verification"))
+    verification_state["allowed"] = False
+    verification_state["blockers"] = blockers
+    evidence["verification"] = verification_state
+    return CloseoutVerification(
+        allowed=False,
+        target_phase=verification.target_phase,
+        blockers=blockers,
+        evidence=evidence,
+        reason="closeout_blocked_fail_closed",
+    )
+
+
 def transition_task_closeout(
     conn: Any,
     task_id: str,
@@ -1049,6 +1140,7 @@ def transition_task_closeout(
         repo_path=repo_path or task.workspace_path,
         live_pr_provider=live_pr_provider,
     )
+    verification = _with_child_review_matrix(verification, conn=conn, task_id=task_id)
     if not verification.allowed:
         existing_closeout = _as_mapping(task.closeout_evidence)
         existing_remediation = _as_mapping(existing_closeout.get("remediation_request"))

@@ -239,6 +239,95 @@ def test_review_ready_requires_live_pr_checks_evidence_and_cleanup(kanban_home, 
     assert task.closeout_evidence["verification"]["pr_merged"] is False
 
 
+def test_parent_review_ready_blocks_when_hierarchy_child_not_review_ready(kanban_home, git_repo):
+    """Parent review_ready cannot substitute embedded childEvidence for child Kanban closeouts."""
+
+    with kb.connect() as conn:
+        parent_id = kb.create_task(
+            conn,
+            title="parent ultragoal",
+            workspace_kind="dir",
+            workspace_path=str(git_repo),
+            goal_mode=True,
+            closeout_evidence={"evidence_status": "not_started"},
+        )
+        child_id = kb.create_task(conn, title="child still triage", triage=True)
+        conn.execute(
+            "INSERT OR IGNORE INTO task_links (parent_id, child_id, relation_type) VALUES (?, ?, 'hierarchy')",
+            (parent_id, child_id),
+        )
+        closeout.transition_task_closeout(conn, parent_id, "worker_done", {"summary": "parent worker done"})
+
+        result = closeout.transition_task_closeout(
+            conn,
+            parent_id,
+            "review_ready",
+            _review_ready_evidence(
+                git_repo,
+                childEvidence={child_id: {"summary": "embedded parent evidence is not child closeout"}},
+            ),
+            repo_path=git_repo,
+        )
+        parent = kb.get_task(conn, parent_id)
+        child = kb.get_task(conn, child_id)
+
+    assert result["status"] == "blocked"
+    assert "child_not_review_ready" in result["blockers"]
+    assert parent.review_phase == "worker_done"
+    assert child.status == "triage"
+    assert child.review_phase is None
+    matrix = result["evidence"]["child_review_matrix"]
+    assert matrix == [
+        {
+            "task_id": child_id,
+            "title": "child still triage",
+            "status": "triage",
+            "review_phase": None,
+            "closeout_allowed": None,
+            "ready": False,
+            "reason": "child_not_review_ready",
+        }
+    ]
+
+
+def test_parent_review_ready_allows_when_hierarchy_child_review_ready(kanban_home, git_repo):
+    with kb.connect() as conn:
+        parent_id = kb.create_task(
+            conn,
+            title="parent ultragoal",
+            workspace_kind="dir",
+            workspace_path=str(git_repo),
+            goal_mode=True,
+            closeout_evidence={"evidence_status": "not_started"},
+        )
+        child_id = kb.create_task(
+            conn,
+            title="child review ready",
+            review_phase="review_ready",
+            closeout_evidence={"verification": {"allowed": True}},
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO task_links (parent_id, child_id, relation_type) VALUES (?, ?, 'hierarchy')",
+            (parent_id, child_id),
+        )
+        closeout.transition_task_closeout(conn, parent_id, "worker_done", {"summary": "parent worker done"})
+
+        result = closeout.transition_task_closeout(
+            conn,
+            parent_id,
+            "review_ready",
+            _review_ready_evidence(git_repo),
+            repo_path=git_repo,
+        )
+        parent = kb.get_task(conn, parent_id)
+
+    assert result["status"] == "transitioned"
+    assert parent.review_phase == "review_ready"
+    matrix = result["evidence"]["child_review_matrix"]
+    assert matrix[0]["task_id"] == child_id
+    assert matrix[0]["ready"] is True
+
+
 def test_review_ready_requires_worker_done_phase(git_repo):
     result = closeout.verify_closeout_transition(
         "review_ready",
