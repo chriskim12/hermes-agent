@@ -2085,6 +2085,46 @@ def test_autopilot_parent_report_does_not_show_done_child_as_autopilot_ready(kan
     assert "non_dispatchable_status" in report["autopilot_blocked"][0]["ready_gate_reason_codes"]
 
 
+def test_parent_scoped_dispatch_enforces_ready_gate_even_when_global_strict_gate_off(kanban_home, monkeypatch):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name in {"alice", "verifier"})
+    monkeypatch.setattr(kb, "recompute_ready", lambda *args, **kwargs: 0)
+    monkeypatch.setenv("HERMES_KANBAN_STRICT_READY_GATE", "false")
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append((task.id, workspace))
+
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="autopilot parent", triage=True)
+        blocked_child = kb.create_task(
+            conn,
+            title="already in review child",
+            assignee="alice",
+            review_phase="worker_done",
+            closeout_evidence={"schema": "kanban_closeout_evidence.v1"},
+        )
+        kb.link_tasks(conn, parent, blocked_child, relation_type="hierarchy")
+        conn.execute("UPDATE tasks SET status='ready', assignee='alice' WHERE id=?", (blocked_child,))
+        conn.execute(
+            "UPDATE tasks SET admission_snapshot=? WHERE id=?",
+            (
+                json.dumps({"ready_contract": _structured_ready_contract(reviewer_loop={"required": False})}),
+                blocked_child,
+            ),
+        )
+
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, parent_task_id=parent)
+        after = kb.get_task(conn, blocked_child)
+
+    assert res.spawned == []
+    assert spawns == []
+    assert blocked_child in res.auto_blocked
+    assert after.status == "blocked"
+    assert after.review_phase == "worker_done"
+
+
 def _review_ready_child_evidence(child_id: str, *, summary: str = "child verified") -> dict:
     return {
         "schema": "kanban_closeout_evidence.v1",

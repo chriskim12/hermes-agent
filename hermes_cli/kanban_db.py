@@ -1241,6 +1241,10 @@ def _evaluate_autopilot_ready_gate_for_row(row: sqlite3.Row) -> dict[str, Any]:
     if str(candidate.get("status") or "").lower() != "ready":
         reason_codes.append("kanban_status_not_ready")
         missing_labels.append("Kanban status=ready")
+    if str(candidate.get("review_phase") or "").strip():
+        reason_codes.append("review_phase_not_empty")
+        missing_labels.append("empty review_phase")
+    structural_reason_codes = list(reason_codes)
 
     for code, markers, label in _READY_GATE_REQUIREMENTS:
         if not any(marker in haystack for marker in markers):
@@ -1278,7 +1282,7 @@ def _evaluate_autopilot_ready_gate_for_row(row: sqlite3.Row) -> dict[str, Any]:
     if not isinstance(admission_snapshot, dict):
         admission_snapshot = {}
     structured_ready_contract = admission_snapshot.get("ready_contract")
-    if structured_ready_contract:
+    if structured_ready_contract and not structural_reason_codes:
         from hermes_cli import profiles
         from hermes_cli.kanban_ready_contract import validate_ready_contract
 
@@ -7946,7 +7950,8 @@ def dispatch_once(
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
-        if _strict_ready_gate_enabled():
+        enforce_ready_gate = bool(parent_task_id) or _strict_ready_gate_enabled()
+        if enforce_ready_gate:
             gate = _evaluate_autopilot_ready_gate_for_row(row)
             if not gate.get("autopilot_ready"):
                 result.auto_blocked.append(row["id"])
