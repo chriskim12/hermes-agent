@@ -1099,6 +1099,33 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
+def _handle_admit_ready(args: dict, **kw) -> str:
+    guard = _require_orchestrator_tool("kanban_admit_ready")
+    if guard:
+        return guard
+    tid = args.get("task_id")
+    if not tid:
+        return tool_error("task_id is required")
+    contract = args.get("ready_contract")
+    if not isinstance(contract, dict):
+        return tool_error("ready_contract must be a JSON object")
+    dry_run, bool_error = _parse_bool_arg(args, "dry_run")
+    if bool_error:
+        return tool_error(bool_error)
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            return _ok(**kb.admit_ready_task(conn, str(tid), ready_contract=contract, apply=not dry_run))
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_admit_ready: {e}")
+    except Exception as e:
+        logger.exception("kanban_admit_ready failed")
+        return tool_error(f"kanban_admit_ready: {e}")
+
+
 def _handle_unblock(args: dict, **kw) -> str:
     """Transition a blocked task back to ready."""
     guard = _require_orchestrator_tool("kanban_unblock")
@@ -1612,6 +1639,26 @@ KANBAN_CREATE_SCHEMA = {
     },
 }
 
+KANBAN_ADMIT_READY_SCHEMA = {
+    "name": "kanban_admit_ready",
+    "description": (
+        "Validate and persist a structured kanban_ready_contract.v1 for a task, "
+        "promoting it to ready only when the executable contract passes. "
+        "Orchestrator-only; task workers should complete/block their own card."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "Task id or public id to admit."},
+            "ready_contract": {"type": "object", "description": "kanban_ready_contract.v1 object."},
+            "dry_run": {"type": "boolean", "description": "Validate without mutating state."},
+            "board": {"type": "string", "description": "Optional Kanban board slug."},
+        },
+        "required": ["task_id", "ready_contract"],
+    },
+}
+
+
 KANBAN_UNBLOCK_SCHEMA = {
     "name": "kanban_unblock",
     "description": (
@@ -1726,6 +1773,15 @@ registry.register(
     handler=_handle_create,
     check_fn=_check_kanban_mode,
     emoji="➕",
+)
+
+registry.register(
+    name="kanban_admit_ready",
+    toolset="kanban",
+    schema=KANBAN_ADMIT_READY_SCHEMA,
+    handler=_handle_admit_ready,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="🧾",
 )
 
 registry.register(

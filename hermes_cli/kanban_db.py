@@ -3426,6 +3426,104 @@ def _contract_requires_blocker(contract: Mapping[str, Any]) -> list[str]:
     return list(dict.fromkeys(reasons))
 
 
+def admit_ready_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    ready_contract: Mapping[str, Any],
+    apply: bool = True,
+) -> dict[str, Any]:
+    """Validate and persist a structured ready contract for one task.
+
+    This is the single-card admission path behind the agent-facing
+    ``kanban_admit_ready`` tool and ``hermes kanban admit-ready`` CLI.  It is
+    intentionally narrower than parent prepare: callers supply one explicit
+    contract, the validator decides whether the card is executable, and only an
+    accepted contract may promote the task to raw ``ready``.
+    """
+    task = resolve_task_ref(conn, task_id)
+    if task is None:
+        raise ValueError(f"no such task: {task_id}")
+    task_cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+    public_expr = "public_id" if "public_id" in task_cols else "NULL AS public_id"
+    row = conn.execute(
+        f"SELECT id, {public_expr}, title, status, assignee, goal_mode, review_phase, admission_snapshot FROM tasks WHERE id = ?",
+        (task,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"no such task: {task_id}")
+    from hermes_cli import profiles
+    from hermes_cli.kanban_ready_contract import validate_ready_contract
+
+    validation = validate_ready_contract(
+        ready_contract,
+        goal_mode=bool(row["goal_mode"]),
+        assignee=str(row["assignee"] or "").strip() or _contract_assignee(ready_contract),
+        profile_exists=profiles.profile_exists,
+    )
+    reason_codes: list[str] = []
+    if validation.accepted:
+        reason_codes.extend(_contract_requires_blocker(validation.ready_contract or {}))
+    else:
+        reason_codes.extend(validation.reason_codes)
+    if row["review_phase"]:
+        reason_codes.append("review_phase_not_empty")
+    if str(row["status"] or "") not in {"triage", "todo", "blocked", "ready"}:
+        reason_codes.append("non_promotable_status")
+    reason_codes = list(dict.fromkeys(reason_codes))
+    accepted = not reason_codes
+    snapshot = _json_loads_maybe(row["admission_snapshot"]) or {}
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    if validation.ready_contract:
+        snapshot["ready_contract"] = validation.ready_contract
+    snapshot["autopilot_eligible"] = accepted
+    snapshot["ready_gate_result"] = "accepted" if accepted else "blocked"
+    snapshot["ready_gate_reason_codes"] = reason_codes
+    snapshot["ready_gate_source"] = "kanban_admit_ready"
+    assignee = _contract_assignee(validation.ready_contract or {})
+    if apply:
+        with write_txn(conn):
+            if accepted:
+                conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status = 'ready',
+                           assignee = COALESCE(NULLIF(assignee, ''), ?),
+                           admission_snapshot = ?,
+                           claim_lock = NULL,
+                           claim_expires = NULL,
+                           worker_pid = NULL
+                     WHERE id = ?
+                       AND status IN ('triage', 'todo', 'blocked', 'ready')
+                       AND (review_phase IS NULL OR review_phase = '')
+                    """,
+                    (assignee, json.dumps(snapshot), task),
+                )
+            else:
+                conn.execute("UPDATE tasks SET admission_snapshot = ? WHERE id = ?", (json.dumps(snapshot), task))
+            _append_event(
+                conn,
+                task,
+                "kanban_admit_ready",
+                {
+                    "decision": "ready" if accepted else "blocked",
+                    "autopilot_eligible": accepted,
+                    "reason_codes": reason_codes,
+                    "applied": True,
+                },
+            )
+    return {
+        "task_id": task,
+        "public_id": row["public_id"] or task,
+        "decision": "ready" if accepted else "blocked",
+        "autopilot_eligible": accepted,
+        "reason_codes": reason_codes,
+        "applied": bool(apply),
+        "contract_source": "provided",
+    }
+
+
 def autopilot_prepare_parent(
     conn: sqlite3.Connection,
     parent_task_id: str,

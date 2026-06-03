@@ -1712,6 +1712,40 @@ def _structured_ready_contract(**overrides):
     return contract
 
 
+def test_admit_ready_task_persists_contract_and_promotes(kanban_home, monkeypatch):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name in {"alice", "verifier"})
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="needs admission", body="display", assignee="alice", goal_mode=True, triage=True)
+        result = kb.admit_ready_task(conn, t, ready_contract=_structured_ready_contract(), apply=True)
+        task = kb.get_task(conn, t)
+        events = kb.list_events(conn, t)
+
+    assert result["autopilot_eligible"] is True
+    assert result["decision"] == "ready"
+    assert task.status == "ready"
+    assert task.admission_snapshot["ready_contract"]["schema"] == "kanban_ready_contract.v1"
+    assert task.admission_snapshot["ready_gate_source"] == "kanban_admit_ready"
+    assert any(event.kind == "kanban_admit_ready" for event in events)
+
+
+def test_admit_ready_task_blocks_invalid_contract_without_promoting(kanban_home, monkeypatch):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    contract = _structured_ready_contract(reviewer_loop={"required": True, "reviewer_profile": "verifier"})
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="needs goal mode", body="display", assignee="alice", triage=True)
+        result = kb.admit_ready_task(conn, t, ready_contract=contract, apply=True)
+        task = kb.get_task(conn, t)
+
+    assert result["autopilot_eligible"] is False
+    assert "ready_contract_reviewer_loop_requires_goal_mode" in result["reason_codes"]
+    assert task.status == "triage"
+    assert task.admission_snapshot["ready_gate_result"] == "blocked"
+
+
 def test_dispatch_strict_ready_gate_accepts_structured_ready_contract_without_markers(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_STRICT_READY_GATE", "true")
     from hermes_cli import profiles
