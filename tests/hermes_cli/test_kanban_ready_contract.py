@@ -68,3 +68,52 @@ def test_validate_ready_contract_rejects_empty_marker_only_payload():
 
     assert result.accepted is False
     assert result.reason_codes == ["missing_structured_ready_contract"]
+
+
+def test_validate_ready_contract_rejects_missing_required_fields():
+    required_fields = (
+        "goal",
+        "end_state",
+        "scope",
+        "non_goals",
+        "acceptance_criteria",
+        "done_criteria",
+        "verification_requirements",
+        "repo_lane_truth",
+        "routing_verdict",
+        "authority_boundary",
+        "risk_flags",
+        "dependencies_blockers",
+        "review_package_expectation",
+    )
+    for field in required_fields:
+        contract = valid_ready_contract()
+        contract.pop(field)
+        result = validate_ready_contract(
+            contract,
+            goal_mode=True,
+            assignee="arisu",
+            profile_exists=lambda name: name in {"arisu", "verifier"},
+        )
+        assert result.accepted is False, field
+        assert any(code.startswith("missing_ready_contract_") for code in result.reason_codes), field
+
+
+def test_validate_ready_contract_rejects_unresolved_dependency_ambiguity():
+    result = validate_ready_contract(
+        valid_ready_contract(dependencies_blockers={"kind": "unresolved"}),
+        goal_mode=True,
+        assignee="arisu",
+        profile_exists=lambda name: name in {"arisu", "verifier"},
+    )
+    assert result.accepted is False
+    assert "unresolved_ready_contract_dependency_ambiguity" in result.reason_codes
+
+    result2 = validate_ready_contract(
+        valid_ready_contract(dependencies_blockers={"kind": "dependency", "unresolved_ambiguity": True}),
+        goal_mode=True,
+        assignee="arisu",
+        profile_exists=lambda name: name in {"arisu", "verifier"},
+    )
+    assert result2.accepted is False
+    assert "unresolved_ready_contract_dependency_ambiguity" in result2.reason_codes

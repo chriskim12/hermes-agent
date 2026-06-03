@@ -102,6 +102,11 @@ def validate_ready_contract(
         if not _as_mapping(contract.get(field_name)):
             reason_codes.append(f"missing_ready_contract_{field_name}")
 
+    dependencies_blockers = _as_mapping(contract.get("dependencies_blockers"))
+    dependency_kind = _text(dependencies_blockers.get("kind")).lower()
+    if dependency_kind == "unresolved" or dependencies_blockers.get("unresolved_ambiguity") is True:
+        reason_codes.append("unresolved_ready_contract_dependency_ambiguity")
+
     routing = _as_mapping(contract.get("routing_verdict"))
     contract_assignee = _text(routing.get("assignee"))
     effective_assignee = _text(assignee) or contract_assignee
