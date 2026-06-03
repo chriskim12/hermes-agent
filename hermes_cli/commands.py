@@ -1078,7 +1078,19 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
             continue
         _add(cmd.name, cmd.description, cmd.args_hint or "")
 
-    # Second pass: aliases.
+    # Second pass: high-value aliases that must survive Slack's 50-command cap.
+    # Keep this list intentionally small: it is the native-slash parity surface
+    # covered by regression tests, while the generic alias pass below still
+    # fills any remaining slots opportunistically.
+    priority_aliases = {"reset", "bg", "btw", "q"}
+    for cmd in COMMAND_REGISTRY:
+        if not _is_gateway_available(cmd, overrides):
+            continue
+        for alias in cmd.aliases:
+            if alias in priority_aliases:
+                _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
+
+    # Third pass: remaining aliases.
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
             continue
