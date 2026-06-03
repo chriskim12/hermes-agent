@@ -2535,6 +2535,39 @@ def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable
         assert kb.get_task(conn, c).status == "running"
 
 
+def test_complete_governed_task_records_worker_done_candidate_event(kanban_home):
+    """Worker completion in a reviewer-loop lane is only a candidate, not review_ready."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="governed completion candidate",
+            body="Reviewer-loop contract\n\nDone criteria:\n- prove it",
+            assignee="arisu",
+            goal_mode=True,
+        )
+        kb.complete_task(
+            conn,
+            task_id,
+            result="done",
+            summary="worker submitted candidate evidence",
+            metadata={"authority_boundary_confirmed": True, "forbidden_actions_performed": False},
+        )
+
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert task.status == "blocked"
+    assert task.review_phase == "worker_done"
+    candidate_events = [event for event in events if event.kind == "worker_done_candidate"]
+    assert candidate_events, "governed worker completion must emit candidate intake evidence"
+    payload = candidate_events[-1].payload
+    assert payload["status"] == "submitted"
+    assert payload["review_phase"] == "worker_done"
+    assert payload["requires_verifier"] is True
+    assert payload["worker_evidence_schema"] == "kanban_worker_evidence.v1"
+    assert payload["run_id"] is not None
+
+
 def test_dispatch_spawns_verifier_for_worker_done_handoff(kanban_home, all_assignees_spawnable):
     """worker_done handoffs must spawn a verifier agent, not rerun worker."""
     spawns = []
@@ -2603,6 +2636,14 @@ def test_dispatch_spawns_verifier_for_worker_done_handoff(kanban_home, all_assig
             (task.current_run_id,),
         ).fetchone()
         assert dict(run) == {"profile": "verifier", "status": "running", "outcome": None}
+        events = kb.list_events(conn, task_id)
+        verifier_events = [event for event in events if event.kind == "verifier_spawned"]
+        assert verifier_events, "dispatcher must record first-class verifier spawn intake"
+        payload = verifier_events[-1].payload
+        assert payload["reviewer_profile"] == "verifier"
+        assert payload["source_phase"] == "worker_done"
+        assert payload["run_id"] == task.current_run_id
+        assert payload["worker_task_id"] == task_id
 
 
 def test_dispatch_dry_run_reports_worker_done_verifier_without_claiming(kanban_home, all_assignees_spawnable):

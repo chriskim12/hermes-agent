@@ -228,6 +228,7 @@ def test_review_ready_requires_live_pr_checks_evidence_and_cleanup(kanban_home, 
             repo_path=git_repo,
         )
         task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
 
     assert result["status"] == "transitioned"
     assert task.review_phase == "review_ready"
@@ -237,6 +238,13 @@ def test_review_ready_requires_live_pr_checks_evidence_and_cleanup(kanban_home, 
     assert task.closeout_evidence["verification"]["allowed"] is True
     assert task.closeout_evidence["verification"]["gateway_restarted_or_reloaded"] is False
     assert task.closeout_evidence["verification"]["pr_merged"] is False
+    verifier_events = [event for event in events if event.kind == "verifier_result"]
+    assert verifier_events, "review_ready PASS must leave a first-class verifier verdict event"
+    payload = verifier_events[-1].payload
+    assert payload["target_phase"] == "review_ready"
+    assert payload["verdict"] == "PASS"
+    assert payload["allowed"] is True
+    assert payload["review_ready_input_eligible"] is True
 
 
 def test_parent_review_ready_blocks_when_hierarchy_child_not_review_ready(kanban_home, git_repo):

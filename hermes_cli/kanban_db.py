@@ -3928,6 +3928,27 @@ def apply_closeout_transition(
             },
             run_id=run_id,
         )
+        if review_phase == "review_ready":
+            verifier_result = closeout_evidence.get("verifier_result")
+            verdict = "PASS"
+            if isinstance(verifier_result, Mapping) and verifier_result.get("verdict"):
+                verdict = str(verifier_result.get("verdict") or "PASS").upper()
+            _append_event(
+                conn,
+                task_id,
+                "verifier_result",
+                {
+                    "target_phase": "review_ready",
+                    "verdict": verdict,
+                    "reason": "closeout_verified",
+                    "reason_codes": [],
+                    "blockers": [],
+                    "review_ready_input_eligible": True,
+                    "allowed": True,
+                },
+                run_id=run_id,
+            )
+
     if review_phase == "closed":
         recompute_ready(conn)
     return True
@@ -5044,6 +5065,20 @@ def claim_verifier_task(
             },
             run_id=run_id,
         )
+        _append_event(
+            conn,
+            task_id,
+            "verifier_spawned",
+            {
+                "worker_task_id": task_id,
+                "reviewer_profile": profile,
+                "source_status": "blocked",
+                "source_phase": "worker_done",
+                "run_id": run_id,
+                "stale_run_reclaimed": stale_run_id,
+            },
+            run_id=run_id,
+        )
         task = get_task(conn, task_id)
         if task is not None:
             task.assignee = profile
@@ -5601,6 +5636,43 @@ def complete_task(
             conn.execute(
                 "UPDATE tasks SET closeout_evidence = ? WHERE id = ?",
                 (_json_dumps_dict(closeout_evidence, "closeout_evidence"), task_id),
+            )
+            worker_evidence = (
+                closeout_evidence.get("worker_evidence")
+                if isinstance(closeout_evidence, Mapping)
+                else {}
+            )
+            reviewer_loop = (
+                closeout_evidence.get("reviewer_loop")
+                if isinstance(closeout_evidence, Mapping)
+                else {}
+            )
+            _append_event(
+                conn,
+                task_id,
+                "worker_done_candidate",
+                {
+                    "status": "submitted",
+                    "review_phase": "worker_done",
+                    "requires_verifier": True,
+                    "reviewer_profile": (
+                        reviewer_loop.get("reviewer_profile")
+                        if isinstance(reviewer_loop, Mapping)
+                        else None
+                    ),
+                    "run_id": run_id,
+                    "worker_evidence_schema": (
+                        worker_evidence.get("schema")
+                        if isinstance(worker_evidence, Mapping)
+                        else None
+                    ),
+                    "criteria_hash": (
+                        worker_evidence.get("criteria_hash")
+                        if isinstance(worker_evidence, Mapping)
+                        else None
+                    ),
+                },
+                run_id=run_id,
             )
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
