@@ -2328,6 +2328,53 @@ def test_governed_goal_worker_completion_hands_off_to_worker_done(kanban_home):
     assert "missing_verifier_pass" in review_ready.blockers
 
 
+def test_governed_goal_worker_completion_extracts_markdown_done_criteria_from_ready_contract(kanban_home):
+    """admit-ready renders `## Done criteria`; worker closeout must not lose the ledger."""
+    body = """
+# Structured Kanban Ready Contract
+
+## Goal
+Run a no-code smoke.
+
+Reviewer-loop contract: required reviewer_profile verifier.
+
+## Done criteria
+- {'id': 'DC-001', 'text': 'Worker command output contains worker-smoke-ok.'}
+- {'id': 'DC-002', 'text': 'Verifier produces PASS review_ready evidence.'}
+
+## Verification requirements
+- Inspect task events.
+"""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="governed smoke ready contract markdown",
+            body=body,
+            assignee="arisu",
+            goal_mode=True,
+            goal_max_turns=3,
+        )
+
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="criteria satisfied with read-only evidence",
+            metadata={
+                "changed_files": [],
+                "forbidden_side_effects": False,
+                "read_only": True,
+                "commands": {"dc-01": "echo worker-smoke-ok"},
+            },
+        ) is True
+
+        task = kb.get_task(conn, task_id)
+
+    criteria = task.closeout_evidence["done_criteria_ledger"]["criteria"]
+    worker_per_criterion = task.closeout_evidence["worker_evidence"]["per_criterion"]
+    assert len(criteria) == 2
+    assert worker_per_criterion
+
+
 def test_governed_goal_worker_completion_accepts_forbidden_side_effects_alias(kanban_home):
     """Read-only worker metadata may report forbidden_side_effects=False.
 

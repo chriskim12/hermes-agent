@@ -986,11 +986,11 @@ _READY_GATE_REQUIREMENTS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("missing_review_package_expectation", ("review package", "review_ready", "changed files", "commit"), "review package expectation"),
 )
 _DONE_CRITERIA_HEADER_RE = re.compile(
-    r"^\s*done criteria(?: ledger)?\s*:\s*(?P<inline>.*\S)?\s*$",
+    r"^\s*(?:#{1,6}\s*)?done criteria(?: ledger)?\s*:?(?:\s*(?P<inline>.*\S))?\s*$",
     re.IGNORECASE,
 )
 _BULLET_RE = re.compile(r"^\s*(?:[-*+•]|\d+[.)])\s+(?P<text>.+\S)\s*$")
-_SECTION_HEADER_RE = re.compile(r"^\s*[A-Za-z][A-Za-z0-9 /_-]{0,80}:\s*$")
+_SECTION_HEADER_RE = re.compile(r"^\s*(?:#{1,6}\s*)?[A-Za-z][A-Za-z0-9 /_-]{0,80}:?\s*$")
 
 
 def _slugify_for_ready_gate(text: str) -> str:
