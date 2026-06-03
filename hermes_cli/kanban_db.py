@@ -3114,7 +3114,7 @@ def autopilot_parent_report(conn: sqlite3.Connection, parent_task_id: str) -> di
     public_expr = "public_id" if "public_id" in task_cols else "NULL AS public_id"
     rows = conn.execute(
         f"""
-        SELECT id, {public_expr}, title, status, assignee, review_phase, closeout_evidence
+        SELECT id, {public_expr}, title, status, assignee, review_phase, closeout_evidence, admission_snapshot
           FROM tasks
          WHERE id IN ({placeholders})
          ORDER BY public_id, created_at, id
@@ -3125,7 +3125,28 @@ def autopilot_parent_report(conn: sqlite3.Connection, parent_task_id: str) -> di
     counts: dict[str, int] = {}
     review_ready: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
+    autopilot_ready: list[dict[str, Any]] = []
+    autopilot_blocked: list[dict[str, Any]] = []
     for row in rows:
+        admission_snapshot = _json_loads_maybe(row["admission_snapshot"]) or {}
+        if not isinstance(admission_snapshot, dict):
+            admission_snapshot = {}
+        autopilot_eligible = admission_snapshot.get("autopilot_eligible")
+        ready_reason_codes = admission_snapshot.get("ready_gate_reason_codes") or []
+        if not isinstance(ready_reason_codes, list):
+            ready_reason_codes = [str(ready_reason_codes)]
+        report_autopilot_eligible = (
+            autopilot_eligible is True
+            and row["status"] == "ready"
+            and not row["review_phase"]
+        )
+        if autopilot_eligible is True and not report_autopilot_eligible:
+            ready_reason_codes = list(ready_reason_codes)
+            if row["status"] != "ready":
+                ready_reason_codes.append("non_dispatchable_status")
+            if row["review_phase"]:
+                ready_reason_codes.append("review_phase_not_empty")
+            ready_reason_codes = list(dict.fromkeys(ready_reason_codes))
         item = {
             "task_id": row["id"],
             "public_id": row["public_id"] or row["id"],
@@ -3134,6 +3155,9 @@ def autopilot_parent_report(conn: sqlite3.Connection, parent_task_id: str) -> di
             "assignee": row["assignee"],
             "review_phase": row["review_phase"],
             "has_closeout_evidence": bool(row["closeout_evidence"]),
+            "autopilot_eligible": report_autopilot_eligible,
+            "ready_gate_result": admission_snapshot.get("ready_gate_result"),
+            "ready_gate_reason_codes": ready_reason_codes,
         }
         children.append(item)
         key = row["review_phase"] or row["status"]
@@ -3142,6 +3166,10 @@ def autopilot_parent_report(conn: sqlite3.Connection, parent_task_id: str) -> di
             review_ready.append(item)
         if row["status"] == "blocked":
             blocked.append(item)
+        if report_autopilot_eligible:
+            autopilot_ready.append(item)
+        elif ready_reason_codes or autopilot_eligible is False:
+            autopilot_blocked.append(item)
     return {
         "parent_task_id": parent,
         "parent_public_id": _task_public_id(conn, parent),
@@ -3149,6 +3177,191 @@ def autopilot_parent_report(conn: sqlite3.Connection, parent_task_id: str) -> di
         "counts": counts,
         "review_ready": review_ready,
         "blocked": blocked,
+        "autopilot_ready": autopilot_ready,
+        "autopilot_blocked": autopilot_blocked,
+    }
+
+
+def _contract_lookup_keys(row: sqlite3.Row) -> list[str]:
+    keys: list[str] = []
+    for field in ("id", "public_id", "title"):
+        try:
+            value = row[field]
+        except Exception:
+            value = None
+        text = str(value or "").strip()
+        if text and text not in keys:
+            keys.append(text)
+    return keys
+
+
+def _ready_contract_for_row(
+    row: sqlite3.Row,
+    ready_contracts: Optional[Mapping[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if not ready_contracts:
+        return None
+    for key in _contract_lookup_keys(row):
+        value = ready_contracts.get(key)
+        if isinstance(value, Mapping):
+            return dict(value)
+    return None
+
+
+def _contract_assignee(contract: Mapping[str, Any]) -> Optional[str]:
+    routing = contract.get("routing_verdict")
+    if isinstance(routing, Mapping):
+        assignee = str(routing.get("assignee") or "").strip()
+        if assignee:
+            return assignee
+    return None
+
+
+def _contract_requires_blocker(contract: Mapping[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    risk_flags = contract.get("risk_flags")
+    if isinstance(risk_flags, Mapping):
+        if risk_flags.get("approval_required") is True:
+            reasons.append("approval_required")
+        for key in ("prod", "env", "secret", "customer_visible", "billing", "deploy", "restart"):
+            value = str(risk_flags.get(key) or "").strip().lower()
+            if value in {"required", "allowed", "pending", "needs_approval", "approval_required"}:
+                reasons.append(f"{key}_approval_required")
+    authority = contract.get("authority_boundary")
+    if isinstance(authority, Mapping):
+        if authority.get("approval_required") is True:
+            reasons.append("authority_approval_required")
+    blockers = contract.get("dependencies_blockers")
+    if isinstance(blockers, Mapping):
+        kind = str(blockers.get("kind") or "").strip().lower()
+        if kind not in {"", "none", "clear", "cleared"}:
+            reasons.append("dependency_blocked")
+    return list(dict.fromkeys(reasons))
+
+
+def autopilot_prepare_parent(
+    conn: sqlite3.Connection,
+    parent_task_id: str,
+    *,
+    ready_contracts: Optional[Mapping[str, Any]] = None,
+    apply: bool = False,
+) -> dict[str, Any]:
+    """Prepare an admitted parent hierarchy for Autopilot execution.
+
+    This is an admission/repair helper: it may write structured ready contracts
+    and promote mechanically safe children to ``ready`` when ``apply=True``.
+    It never dispatches workers. ``/autopilot on`` remains a readiness consumer.
+    """
+    parent = resolve_task_ref(conn, parent_task_id)
+    if parent is None:
+        raise ValueError(f"no such parent task: {parent_task_id}")
+    descendants = hierarchy_descendant_ids(conn, parent)
+    summary = {"ready": 0, "blocked": 0, "unchanged": 0}
+    children: list[dict[str, Any]] = []
+    if not descendants:
+        return {"parent_task_id": parent, "parent_public_id": _task_public_id(conn, parent), "summary": summary, "children": children}
+
+    placeholders = ",".join("?" for _ in descendants)
+    task_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    public_expr = "public_id" if "public_id" in task_cols else "NULL AS public_id"
+    rows = conn.execute(
+        f"""
+        SELECT id, {public_expr}, title, status, assignee, goal_mode, review_phase, admission_snapshot
+          FROM tasks
+         WHERE id IN ({placeholders})
+         ORDER BY public_id, created_at, id
+        """,
+        tuple(descendants),
+    ).fetchall()
+
+    from hermes_cli import profiles
+    from hermes_cli.kanban_ready_contract import validate_ready_contract
+
+    for row in rows:
+        snapshot = _json_loads_maybe(row["admission_snapshot"]) or {}
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        source_contract = _ready_contract_for_row(row, ready_contracts)
+        contract = source_contract or snapshot.get("ready_contract")
+        reason_codes: list[str] = []
+        validation = validate_ready_contract(
+            contract,
+            goal_mode=bool(row["goal_mode"]),
+            assignee=str(row["assignee"] or "").strip() or _contract_assignee(contract or {}),
+            profile_exists=profiles.profile_exists,
+        )
+        if validation.accepted:
+            reason_codes.extend(_contract_requires_blocker(validation.ready_contract or {}))
+        else:
+            reason_codes.extend(validation.reason_codes)
+        if row["review_phase"]:
+            reason_codes.append("review_phase_not_empty")
+        if str(row["status"] or "") not in {"triage", "todo", "blocked", "ready"}:
+            reason_codes.append("non_promotable_status")
+        reason_codes = list(dict.fromkeys(reason_codes))
+        ready = not reason_codes
+        decision = "ready" if ready else "blocked"
+        summary[decision] += 1
+        item = {
+            "task_id": row["id"],
+            "public_id": row["public_id"] or row["id"],
+            "title": row["title"],
+            "status_before": row["status"],
+            "decision": decision,
+            "autopilot_eligible": ready,
+            "reason_codes": reason_codes,
+            "contract_source": "provided" if source_contract else "existing" if snapshot.get("ready_contract") else "missing",
+        }
+        children.append(item)
+        if not apply:
+            continue
+        new_snapshot = dict(snapshot)
+        if validation.ready_contract:
+            new_snapshot["ready_contract"] = validation.ready_contract
+        new_snapshot["autopilot_eligible"] = ready
+        new_snapshot["ready_gate_result"] = "accepted" if ready else "blocked"
+        new_snapshot["ready_gate_reason_codes"] = reason_codes
+        new_snapshot["ready_gate_source"] = "autopilot_prepare_parent"
+        assignee = _contract_assignee(validation.ready_contract or {})
+        with write_txn(conn):
+            if ready:
+                conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status = 'ready',
+                           assignee = COALESCE(NULLIF(assignee, ''), ?),
+                           admission_snapshot = ?,
+                           claim_lock = NULL,
+                           claim_expires = NULL,
+                           worker_pid = NULL
+                     WHERE id = ?
+                       AND status IN ('triage', 'todo', 'blocked', 'ready')
+                       AND (review_phase IS NULL OR review_phase = '')
+                    """,
+                    (assignee, json.dumps(new_snapshot), row["id"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE tasks SET admission_snapshot = ? WHERE id = ?",
+                    (json.dumps(new_snapshot), row["id"]),
+                )
+            _append_event(
+                conn,
+                row["id"],
+                "autopilot_prepare",
+                {
+                    "parent_task_id": parent,
+                    "decision": decision,
+                    "autopilot_eligible": ready,
+                    "reason_codes": reason_codes,
+                    "applied": True,
+                },
+            )
+    return {
+        "parent_task_id": parent,
+        "parent_public_id": _task_public_id(conn, parent),
+        "summary": summary,
+        "children": children,
     }
 
 

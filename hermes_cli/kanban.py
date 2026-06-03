@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import sys
 import time
@@ -695,6 +696,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_ap_status = ap_sub.add_parser("status", help="Show durable Autopilot state and grouped parent report")
     p_ap_status.add_argument("parent_task_id", nargs="?", default=None)
     p_ap_status.add_argument("--json", action="store_true")
+    p_ap_prepare = ap_sub.add_parser("prepare", help="Admission-repair a parent so contract-backed children become Autopilot-ready")
+    p_ap_prepare.add_argument("parent_task_id")
+    p_ap_prepare.add_argument("--from-ralplan", dest="from_ralplan", default=None,
+                              help="Plan/RALPLAN markdown or JSON file containing ready_contract objects")
+    p_ap_prepare.add_argument("--contract-json", default=None,
+                              help="JSON file mapping task id/public id/title to ready_contract")
+    p_ap_prepare.add_argument("--apply", action="store_true",
+                              help="Persist contracts and promote safe children to ready; omit for dry-run")
+    p_ap_prepare.add_argument("--json", action="store_true")
     p_ap_pause = ap_sub.add_parser("pause", help="Pause Autopilot for this board")
     p_ap_pause.add_argument("reason", nargs="*", default=[])
     p_ap_pause.add_argument("--json", action="store_true")
@@ -2355,6 +2365,15 @@ def _print_autopilot_result(payload: dict[str, Any], *, as_json: bool = False) -
         print(json.dumps(payload, indent=2, sort_keys=True))
         return
     state = payload.get("state") or payload
+    prepare = payload.get("prepare")
+    if prepare:
+        print("Autopilot prepare:")
+        print(f"  parent:       {prepare.get('parent_public_id') or prepare.get('parent_task_id')}")
+        print(f"  summary:      {prepare.get('summary') or {}}")
+        for item in prepare.get("children") or []:
+            reasons = ",".join(item.get("reason_codes") or []) or "-"
+            print(f"  - {item.get('public_id')} {item.get('decision')} reasons={reasons}")
+        return
     print("Autopilot:")
     print(f"  board:        {state.get('board')}")
     print(f"  enabled:      {state.get('enabled')}")
@@ -2381,6 +2400,49 @@ def _print_autopilot_result(payload: dict[str, Any], *, as_json: bool = False) -
             print("  blocked:")
             for item in report["blocked"]:
                 print(f"    - {item['public_id']} {item['title']}")
+
+
+def _load_autopilot_ready_contracts(*paths: Optional[str]) -> dict[str, Any]:
+    """Load task-ref keyed ready contracts from JSON or RALPLAN markdown.
+
+    JSON files may be either ``{"ready_contracts": {ref: contract}}`` or a raw
+    ``{ref: contract}`` mapping. Markdown/RALPLAN files may contain fenced JSON
+    objects with ``schema=kanban_ready_contract.v1`` plus one of ``task_id``,
+    ``public_id``, ``task_ref``, or ``title`` as the lookup key.
+    """
+    contracts: dict[str, Any] = {}
+    for raw_path in paths:
+        if not raw_path:
+            continue
+        path = Path(raw_path).expanduser()
+        text = path.read_text(encoding="utf-8")
+        loaded: Any = None
+        try:
+            loaded = json.loads(text)
+        except Exception:
+            loaded = None
+        if isinstance(loaded, dict):
+            source = loaded.get("ready_contracts") if isinstance(loaded.get("ready_contracts"), dict) else loaded
+            for key, value in source.items():
+                if isinstance(value, dict):
+                    contracts[str(key)] = value
+            continue
+        for match in re.finditer(r"```(?:json)?\s*\n(.*?)\n```", text, re.DOTALL | re.IGNORECASE):
+            block = match.group(1).strip()
+            try:
+                obj = json.loads(block)
+            except Exception:
+                continue
+            contract = obj.get("ready_contract") if isinstance(obj.get("ready_contract"), dict) else obj
+            if not isinstance(contract, dict) or contract.get("schema") != "kanban_ready_contract.v1":
+                continue
+            key = (
+                obj.get("task_id") or obj.get("public_id") or obj.get("task_ref")
+                or contract.get("task_id") or contract.get("public_id") or contract.get("title")
+            )
+            if key:
+                contracts[str(key)] = contract
+    return contracts
 
 
 def _cmd_autopilot(args: argparse.Namespace) -> int:
@@ -2437,6 +2499,19 @@ def _cmd_autopilot(args: argparse.Namespace) -> int:
                 payload = {"state": state}
                 if parent:
                     payload["report"] = kb.autopilot_parent_report(conn, str(parent))
+            elif action == "prepare":
+                contracts = _load_autopilot_ready_contracts(
+                    getattr(args, "from_ralplan", None),
+                    getattr(args, "contract_json", None),
+                )
+                payload = {
+                    "prepare": kb.autopilot_prepare_parent(
+                        conn,
+                        args.parent_task_id,
+                        ready_contracts=contracts,
+                        apply=bool(getattr(args, "apply", False)),
+                    )
+                }
             elif action == "pause":
                 reason = " ".join(getattr(args, "reason", [])).strip() or "paused_by_operator"
                 payload = {"state": kb.set_autopilot_paused(conn, board=board, paused=True, reason=reason)}

@@ -1946,6 +1946,146 @@ def test_autopilot_pause_resume_preserves_dry_run_mode(kanban_home):
 
 
 
+def test_autopilot_prepare_parent_promotes_contract_backed_child_to_ready(kanban_home, monkeypatch):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name in {"alice", "verifier"})
+    contract = _structured_ready_contract(
+        reviewer_loop={"required": False},
+        routing_verdict={"verdict": "direct-kanban", "assignee": "alice", "reason": "admission prepared"},
+    )
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="autopilot parent", triage=True)
+        child = kb.create_task(conn, title="Slice 1: prepared child", triage=True)
+        kb.link_tasks(conn, parent, child, relation_type="hierarchy")
+
+        dry = kb.autopilot_prepare_parent(
+            conn,
+            parent,
+            ready_contracts={child: contract},
+            apply=False,
+        )
+        before = kb.get_task(conn, child)
+        applied = kb.autopilot_prepare_parent(
+            conn,
+            parent,
+            ready_contracts={child: contract},
+            apply=True,
+        )
+        report = kb.autopilot_parent_report(conn, parent)
+        after = kb.get_task(conn, child)
+        snapshot = conn.execute("SELECT admission_snapshot FROM tasks WHERE id = ?", (child,)).fetchone()[0]
+
+    assert dry["summary"] == {"ready": 1, "blocked": 0, "unchanged": 0}
+    assert before.status == "triage"
+    assert applied["children"][0]["decision"] == "ready"
+    assert after.status == "ready"
+    assert after.assignee == "alice"
+    assert report["autopilot_ready"][0]["task_id"] == child
+    parsed = json.loads(snapshot)
+    assert parsed["ready_contract"]["schema"] == "kanban_ready_contract.v1"
+    assert parsed["autopilot_eligible"] is True
+    assert parsed["ready_gate_result"] == "accepted"
+
+
+
+def test_autopilot_prepare_parent_keeps_review_blocked_child_unready(kanban_home, monkeypatch):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="autopilot parent", triage=True)
+        child = kb.create_task(
+            conn,
+            title="review decision child",
+            assignee="alice",
+            review_phase="worker_done",
+            closeout_evidence={"existing": "review"},
+        )
+        kb.link_tasks(conn, parent, child, relation_type="hierarchy")
+
+        report = kb.autopilot_prepare_parent(
+            conn,
+            parent,
+            ready_contracts={child: _structured_ready_contract(reviewer_loop={"required": False})},
+            apply=True,
+        )
+        after = kb.get_task(conn, child)
+
+    assert report["summary"] == {"ready": 0, "blocked": 1, "unchanged": 0}
+    assert report["children"][0]["decision"] == "blocked"
+    assert "review_phase_not_empty" in report["children"][0]["reason_codes"]
+    assert after.status == "ready"
+    assert after.review_phase == "worker_done"
+
+
+
+def test_autopilot_prepare_parent_reports_non_promotable_done_child_as_blocked(kanban_home, monkeypatch):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="autopilot parent", triage=True)
+        child = kb.create_task(conn, title="already done child", assignee="alice")
+        kb.link_tasks(conn, parent, child, relation_type="hierarchy")
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (child,))
+
+        report = kb.autopilot_prepare_parent(
+            conn,
+            parent,
+            ready_contracts={child: _structured_ready_contract(reviewer_loop={"required": False})},
+            apply=True,
+        )
+        after = kb.get_task(conn, child)
+
+    assert report["summary"] == {"ready": 0, "blocked": 1, "unchanged": 0}
+    assert report["children"][0]["decision"] == "blocked"
+    assert "non_promotable_status" in report["children"][0]["reason_codes"]
+    assert after.status == "done"
+
+
+
+def test_autopilot_ready_contract_loader_parses_nested_fenced_json(tmp_path):
+    from hermes_cli.kanban import _load_autopilot_ready_contracts
+
+    contract = _structured_ready_contract(reviewer_loop={"required": False})
+    ralplan = tmp_path / "plan.md"
+    ralplan.write_text(
+        "# RALPLAN\n\n```json\n"
+        + json.dumps({"task_ref": "BO-200", "ready_contract": contract}, ensure_ascii=False)
+        + "\n```\n",
+        encoding="utf-8",
+    )
+
+    loaded = _load_autopilot_ready_contracts(str(ralplan))
+
+    assert loaded["BO-200"]["routing_verdict"]["assignee"] == "alice"
+
+
+
+def test_autopilot_parent_report_does_not_show_done_child_as_autopilot_ready(kanban_home, monkeypatch):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="autopilot parent", triage=True)
+        child = kb.create_task(conn, title="done after prepare", triage=True)
+        kb.link_tasks(conn, parent, child, relation_type="hierarchy")
+        kb.autopilot_prepare_parent(
+            conn,
+            parent,
+            ready_contracts={child: _structured_ready_contract(reviewer_loop={"required": False})},
+            apply=True,
+        )
+        assert kb.complete_task(conn, child, result="done") is True
+        report = kb.autopilot_parent_report(conn, parent)
+
+    assert report["autopilot_ready"] == []
+    assert report["autopilot_blocked"][0]["task_id"] == child
+    assert "non_dispatchable_status" in report["autopilot_blocked"][0]["ready_gate_reason_codes"]
+
+
+
 def _governed_worker_body() -> str:
     return """
 Goal: Complete a read-only smoke.
