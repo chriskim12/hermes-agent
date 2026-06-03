@@ -1565,6 +1565,36 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+CREATE TABLE IF NOT EXISTS kanban_autopilot_state (
+    board                   TEXT NOT NULL PRIMARY KEY,
+    enabled                 INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+    mode                    TEXT NOT NULL DEFAULT 'off' CHECK (mode IN ('off', 'dry_run', 'supervised', 'auto')),
+    parent_task_id          TEXT,
+    max_concurrent          INTEGER NOT NULL DEFAULT 1 CHECK (max_concurrent >= 0),
+    max_dispatches_per_tick INTEGER NOT NULL DEFAULT 1 CHECK (max_dispatches_per_tick >= 0),
+    paused_reason           TEXT,
+    owner_session           TEXT,
+    last_tick_at            INTEGER,
+    last_decision           TEXT,
+    last_error              TEXT,
+    created_at              INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at              INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE TABLE IF NOT EXISTS kanban_autopilot_tick_ledger (
+    tick_id         TEXT NOT NULL PRIMARY KEY,
+    board           TEXT NOT NULL,
+    parent_task_id  TEXT,
+    tick_at         INTEGER NOT NULL DEFAULT (unixepoch()),
+    candidate_count INTEGER NOT NULL DEFAULT 0 CHECK (candidate_count >= 0),
+    selected_task_id TEXT,
+    decision        TEXT NOT NULL DEFAULT 'skip' CHECK (decision IN ('skip', 'select', 'spawn', 'error')),
+    reason          TEXT,
+    spawned         INTEGER NOT NULL DEFAULT 0 CHECK (spawned IN (0, 1)),
+    worker_pid      INTEGER,
+    error           TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -2157,6 +2187,67 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
+    )
+
+    # Parent-scoped Autopilot control-plane migrations.  These tables are
+    # intentionally control metadata only: worker claims, verifier facts, and
+    # closeout evidence remain on the existing Kanban task/task_runs surfaces.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kanban_autopilot_state (
+            board                   TEXT NOT NULL PRIMARY KEY,
+            enabled                 INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+            mode                    TEXT NOT NULL DEFAULT 'off' CHECK (mode IN ('off', 'dry_run', 'supervised', 'auto')),
+            parent_task_id          TEXT,
+            max_concurrent          INTEGER NOT NULL DEFAULT 1 CHECK (max_concurrent >= 0),
+            max_dispatches_per_tick INTEGER NOT NULL DEFAULT 1 CHECK (max_dispatches_per_tick >= 0),
+            paused_reason           TEXT,
+            owner_session           TEXT,
+            last_tick_at            INTEGER,
+            last_decision           TEXT,
+            last_error              TEXT,
+            created_at              INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at              INTEGER NOT NULL DEFAULT (unixepoch())
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kanban_autopilot_tick_ledger (
+            tick_id         TEXT NOT NULL PRIMARY KEY,
+            board           TEXT NOT NULL,
+            parent_task_id  TEXT,
+            tick_at         INTEGER NOT NULL DEFAULT (unixepoch()),
+            candidate_count INTEGER NOT NULL DEFAULT 0 CHECK (candidate_count >= 0),
+            selected_task_id TEXT,
+            decision        TEXT NOT NULL DEFAULT 'skip' CHECK (decision IN ('skip', 'select', 'spawn', 'error')),
+            reason          TEXT,
+            spawned         INTEGER NOT NULL DEFAULT 0 CHECK (spawned IN (0, 1)),
+            worker_pid      INTEGER,
+            error           TEXT
+        )
+        """
+    )
+    autopilot_cols = {row["name"] for row in conn.execute("PRAGMA table_info(kanban_autopilot_state)")}
+    for column, ddl in (
+        ("parent_task_id", "parent_task_id TEXT"),
+        ("max_dispatches_per_tick", "max_dispatches_per_tick INTEGER NOT NULL DEFAULT 1"),
+        ("last_error", "last_error TEXT"),
+    ):
+        if column not in autopilot_cols:
+            _add_column_if_missing(conn, "kanban_autopilot_state", column, ddl)
+    ledger_cols = {row["name"] for row in conn.execute("PRAGMA table_info(kanban_autopilot_tick_ledger)")}
+    if "parent_task_id" not in ledger_cols:
+        _add_column_if_missing(
+            conn, "kanban_autopilot_tick_ledger", "parent_task_id", "parent_task_id TEXT"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_kanban_autopilot_tick_board_at "
+        "ON kanban_autopilot_tick_ledger(board, tick_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_kanban_autopilot_tick_parent "
+        "ON kanban_autopilot_tick_ledger(board, parent_task_id, tick_at DESC)"
     )
 
     link_table_exists = conn.execute(
@@ -2786,6 +2877,365 @@ def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> l
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return Task.from_row(row) if row else None
+
+
+def resolve_task_ref(conn: sqlite3.Connection, ref: str) -> Optional[str]:
+    """Resolve an internal task id or public id to the canonical task id."""
+    token = (ref or "").strip()
+    if not token:
+        return None
+    task_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "public_id" in task_cols:
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE id = ? OR public_id = ? LIMIT 1",
+            (token, token),
+        ).fetchone()
+    else:
+        row = conn.execute("SELECT id FROM tasks WHERE id = ? LIMIT 1", (token,)).fetchone()
+    return str(row["id"]) if row else None
+
+
+def _task_public_id(conn: sqlite3.Connection, task_id: Optional[str]) -> Optional[str]:
+    if not task_id:
+        return None
+    task_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "public_id" not in task_cols:
+        return task_id
+    row = conn.execute("SELECT public_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        return None
+    return row["public_id"] or task_id
+
+
+def _autopilot_state_row_to_dict(
+    conn: sqlite3.Connection, row: Optional[sqlite3.Row]
+) -> dict[str, Any]:
+    if row is None:
+        return {
+            "enabled": False,
+            "mode": "off",
+            "parent_task_id": None,
+            "parent_public_id": None,
+            "max_concurrent": 1,
+            "max_dispatches_per_tick": 1,
+            "paused_reason": None,
+            "owner_session": None,
+            "last_tick_at": None,
+            "last_decision": None,
+            "last_error": None,
+        }
+    parent_task_id = row["parent_task_id"] if "parent_task_id" in row.keys() else None
+    return {
+        "enabled": bool(row["enabled"]),
+        "mode": row["mode"],
+        "parent_task_id": parent_task_id,
+        "parent_public_id": _task_public_id(conn, parent_task_id),
+        "max_concurrent": int(row["max_concurrent"] or 0),
+        "max_dispatches_per_tick": int(row["max_dispatches_per_tick"] or 0)
+            if "max_dispatches_per_tick" in row.keys() else 1,
+        "paused_reason": row["paused_reason"],
+        "owner_session": row["owner_session"],
+        "last_tick_at": row["last_tick_at"],
+        "last_decision": row["last_decision"],
+        "last_error": row["last_error"] if "last_error" in row.keys() else None,
+    }
+
+
+def get_autopilot_state(conn: sqlite3.Connection, *, board: str = DEFAULT_BOARD) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT * FROM kanban_autopilot_state WHERE board = ?",
+        (board,),
+    ).fetchone()
+    state = _autopilot_state_row_to_dict(conn, row)
+    state["board"] = board
+    return state
+
+
+def set_autopilot_enabled(
+    conn: sqlite3.Connection,
+    *,
+    board: str = DEFAULT_BOARD,
+    parent_task_ref: str,
+    mode: str = "auto",
+    max_concurrent: int = 1,
+    max_dispatches_per_tick: int = 1,
+    owner_session: Optional[str] = None,
+) -> dict[str, Any]:
+    """Enable a durable parent-scoped Autopilot run for one board.
+
+    This stores only controller metadata.  Dispatch, worker claims, verifier
+    results, retries, and review phases continue to live on the existing Kanban
+    dispatcher/closeout tables.
+    """
+    if mode not in {"dry_run", "supervised", "auto"}:
+        raise ValueError("mode must be one of dry_run, supervised, auto")
+    parent_task_id = resolve_task_ref(conn, parent_task_ref)
+    if parent_task_id is None:
+        raise ValueError(f"no such parent task: {parent_task_ref}")
+    if max_concurrent < 1:
+        raise ValueError("max_concurrent must be >= 1")
+    if max_dispatches_per_tick < 1:
+        raise ValueError("max_dispatches_per_tick must be >= 1")
+    now = int(time.time())
+    with write_txn(conn):
+        conn.execute(
+            """
+            INSERT INTO kanban_autopilot_state (
+                board, enabled, mode, parent_task_id, max_concurrent,
+                max_dispatches_per_tick, paused_reason, owner_session,
+                last_decision, last_error, created_at, updated_at
+            ) VALUES (?, 1, ?, ?, ?, ?, NULL, ?, 'enabled', NULL, ?, ?)
+            ON CONFLICT(board) DO UPDATE SET
+                enabled=1,
+                mode=excluded.mode,
+                parent_task_id=excluded.parent_task_id,
+                max_concurrent=excluded.max_concurrent,
+                max_dispatches_per_tick=excluded.max_dispatches_per_tick,
+                paused_reason=NULL,
+                owner_session=excluded.owner_session,
+                last_decision='enabled',
+                last_error=NULL,
+                updated_at=excluded.updated_at
+            """,
+            (
+                board,
+                mode,
+                parent_task_id,
+                max_concurrent,
+                max_dispatches_per_tick,
+                owner_session,
+                now,
+                now,
+            ),
+        )
+        _append_event(
+            conn,
+            parent_task_id,
+            "autopilot_enabled",
+            {
+                "board": board,
+                "mode": mode,
+                "max_concurrent": max_concurrent,
+                "max_dispatches_per_tick": max_dispatches_per_tick,
+            },
+        )
+    return get_autopilot_state(conn, board=board)
+
+
+def set_autopilot_paused(
+    conn: sqlite3.Connection,
+    *,
+    board: str = DEFAULT_BOARD,
+    paused: bool,
+    reason: Optional[str] = None,
+) -> dict[str, Any]:
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT parent_task_id FROM kanban_autopilot_state WHERE board = ?",
+            (board,),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                """
+                INSERT INTO kanban_autopilot_state (
+                    board, enabled, mode, paused_reason, last_decision, created_at, updated_at
+                ) VALUES (?, 0, 'off', ?, ?, ?, ?)
+                """,
+                (board, reason if paused else None, "paused" if paused else "off", now, now),
+            )
+            parent_task_id = None
+        else:
+            parent_task_id = row["parent_task_id"]
+            conn.execute(
+                """
+                UPDATE kanban_autopilot_state
+                   SET enabled = ?,
+                       mode = CASE WHEN ? = 1 THEN mode ELSE CASE WHEN mode = 'off' THEN 'auto' ELSE mode END END,
+                       paused_reason = ?,
+                       last_decision = ?,
+                       updated_at = ?
+                 WHERE board = ?
+                """,
+                (
+                    0 if paused else 1,
+                    1 if paused else 0,
+                    reason if paused else None,
+                    "paused" if paused else "resumed",
+                    now,
+                    board,
+                ),
+            )
+        if parent_task_id:
+            _append_event(
+                conn,
+                parent_task_id,
+                "autopilot_paused" if paused else "autopilot_resumed",
+                {"board": board, "reason": reason},
+            )
+    return get_autopilot_state(conn, board=board)
+
+
+def disable_autopilot(conn: sqlite3.Connection, *, board: str = DEFAULT_BOARD, reason: str = "off") -> dict[str, Any]:
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT parent_task_id FROM kanban_autopilot_state WHERE board = ?",
+            (board,),
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO kanban_autopilot_state (
+                board, enabled, mode, paused_reason, last_decision, created_at, updated_at
+            ) VALUES (?, 0, 'off', ?, 'off', ?, ?)
+            ON CONFLICT(board) DO UPDATE SET
+                enabled=0,
+                mode='off',
+                paused_reason=excluded.paused_reason,
+                last_decision='off',
+                updated_at=excluded.updated_at
+            """,
+            (board, reason, now, now),
+        )
+        if row and row["parent_task_id"]:
+            _append_event(conn, row["parent_task_id"], "autopilot_disabled", {"board": board, "reason": reason})
+    return get_autopilot_state(conn, board=board)
+
+
+def autopilot_parent_report(conn: sqlite3.Connection, parent_task_id: str) -> dict[str, Any]:
+    parent = resolve_task_ref(conn, parent_task_id)
+    if parent is None:
+        raise ValueError(f"no such parent task: {parent_task_id}")
+    descendants = hierarchy_descendant_ids(conn, parent)
+    if not descendants:
+        return {"parent_task_id": parent, "children": [], "counts": {}, "review_ready": [], "blocked": []}
+    placeholders = ",".join("?" for _ in descendants)
+    task_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    public_expr = "public_id" if "public_id" in task_cols else "NULL AS public_id"
+    rows = conn.execute(
+        f"""
+        SELECT id, {public_expr}, title, status, assignee, review_phase, closeout_evidence
+          FROM tasks
+         WHERE id IN ({placeholders})
+         ORDER BY public_id, created_at, id
+        """,
+        tuple(descendants),
+    ).fetchall()
+    children: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    review_ready: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for row in rows:
+        item = {
+            "task_id": row["id"],
+            "public_id": row["public_id"] or row["id"],
+            "title": row["title"],
+            "status": row["status"],
+            "assignee": row["assignee"],
+            "review_phase": row["review_phase"],
+            "has_closeout_evidence": bool(row["closeout_evidence"]),
+        }
+        children.append(item)
+        key = row["review_phase"] or row["status"]
+        counts[key] = counts.get(key, 0) + 1
+        if row["review_phase"] == "review_ready":
+            review_ready.append(item)
+        if row["status"] == "blocked":
+            blocked.append(item)
+    return {
+        "parent_task_id": parent,
+        "parent_public_id": _task_public_id(conn, parent),
+        "children": children,
+        "counts": counts,
+        "review_ready": review_ready,
+        "blocked": blocked,
+    }
+
+
+def autopilot_tick(
+    conn: sqlite3.Connection,
+    *,
+    board: str = DEFAULT_BOARD,
+    dry_run: bool = False,
+    failure_limit: int = 2,
+    default_assignee: Optional[str] = None,
+    max_in_progress_per_profile: Optional[int] = None,
+) -> Optional[DispatchResult]:
+    """Run one durable Autopilot controller tick using the existing dispatcher."""
+    state = get_autopilot_state(conn, board=board)
+    if not state.get("enabled") or not state.get("parent_task_id"):
+        return None
+    mode = str(state.get("mode") or "off")
+    effective_dry_run = dry_run or mode == "dry_run"
+    parent_task_id = str(state["parent_task_id"])
+    max_dispatches = max(1, int(state.get("max_dispatches_per_tick") or 1))
+    max_concurrent = max(1, int(state.get("max_concurrent") or 1))
+    tick_id = f"ap_{int(time.time())}_{secrets.token_hex(4)}"
+    now = int(time.time())
+    try:
+        res = dispatch_once(
+            conn,
+            dry_run=effective_dry_run,
+            max_spawn=max_dispatches,
+            max_in_progress=max_concurrent,
+            failure_limit=failure_limit,
+            default_assignee=default_assignee,
+            max_in_progress_per_profile=max_in_progress_per_profile,
+            parent_task_id=parent_task_id,
+            board=board,
+        )
+        selected_task_id = res.spawned[0][0] if res.spawned else None
+        decision = "spawn" if res.spawned and not effective_dry_run else "select" if res.spawned else "skip"
+        reason = "spawned" if res.spawned and not effective_dry_run else "dry_run_selected" if res.spawned else "no_eligible_child"
+        with write_txn(conn):
+            conn.execute(
+                """
+                INSERT INTO kanban_autopilot_tick_ledger (
+                    tick_id, board, parent_task_id, tick_at, candidate_count,
+                    selected_task_id, decision, reason, spawned, worker_pid, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    tick_id,
+                    board,
+                    parent_task_id,
+                    now,
+                    len(res.spawned),
+                    selected_task_id,
+                    decision,
+                    reason,
+                    1 if res.spawned and not effective_dry_run else 0,
+                    None,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE kanban_autopilot_state
+                   SET last_tick_at = ?, last_decision = ?, last_error = NULL, updated_at = ?
+                 WHERE board = ?
+                """,
+                (now, reason, now, board),
+            )
+        return res
+    except Exception as exc:
+        with write_txn(conn):
+            conn.execute(
+                """
+                INSERT INTO kanban_autopilot_tick_ledger (
+                    tick_id, board, parent_task_id, tick_at, decision, reason, error
+                ) VALUES (?, ?, ?, ?, 'error', 'dispatch_error', ?)
+                """,
+                (tick_id, board, parent_task_id, now, str(exc)),
+            )
+            conn.execute(
+                """
+                UPDATE kanban_autopilot_state
+                   SET last_tick_at = ?, last_decision = 'error', last_error = ?, updated_at = ?
+                 WHERE board = ?
+                """,
+                (now, str(exc), now, board),
+            )
+        raise
 
 
 # Canonical sort-order mappings for ``hermes kanban list --sort``.

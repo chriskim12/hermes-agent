@@ -171,7 +171,7 @@ async def test_autopilot_slash_dispatches_parent_scoped_kanban(monkeypatch):
     result = await runner._handle_message(_make_event("/autopilot on t_parent --dry-run"))
 
     assert result == "Spawned:      1"
-    assert seen["text"] == "dispatch --parent t_parent --dry-run"
+    assert seen["text"] == "autopilot on t_parent --dry-run"
     runner._run_agent.assert_not_called()
 
 

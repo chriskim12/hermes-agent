@@ -1878,6 +1878,73 @@ def test_dispatch_parent_scope_only_spawns_descendant_ready_tasks(kanban_home, m
     assert out_of_scope_task.status == "ready"
 
 
+def test_autopilot_state_persists_parent_scope_and_dry_run_tick(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_STRICT_READY_GATE", "true")
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name in {"alice", "verifier"})
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="autopilot parent", triage=True)
+        child = kb.create_task(
+            conn,
+            title="autopilot child",
+            body="structured child",
+            assignee="alice",
+            goal_mode=True,
+        )
+        sibling = kb.create_task(
+            conn,
+            title="outside child",
+            body="structured sibling",
+            assignee="alice",
+            goal_mode=True,
+        )
+        conn.execute(
+            "UPDATE tasks SET admission_snapshot = ? WHERE id IN (?, ?)",
+            (json.dumps({"ready_contract": _structured_ready_contract()}), child, sibling),
+        )
+        kb.link_tasks(conn, parent, child, relation_type="hierarchy")
+        state = kb.set_autopilot_enabled(
+            conn,
+            parent_task_ref=parent,
+            mode="dry_run",
+            max_concurrent=1,
+            max_dispatches_per_tick=1,
+        )
+        res = kb.autopilot_tick(conn)
+        refreshed = kb.get_autopilot_state(conn)
+        report = kb.autopilot_parent_report(conn, parent)
+        ledger = conn.execute(
+            "SELECT parent_task_id, decision, spawned FROM kanban_autopilot_tick_ledger ORDER BY tick_at DESC LIMIT 1"
+        ).fetchone()
+        child_task = kb.get_task(conn, child)
+        sibling_task = kb.get_task(conn, sibling)
+
+    assert state["enabled"] is True
+    assert state["parent_task_id"] == parent
+    assert refreshed["last_decision"] == "dry_run_selected"
+    assert [item[0] for item in res.spawned] == [child]
+    assert ledger["parent_task_id"] == parent
+    assert ledger["decision"] == "select"
+    assert ledger["spawned"] == 0
+    assert report["counts"]["ready"] == 1
+    assert child_task.status == "ready"
+    assert sibling_task.status == "ready"
+
+
+def test_autopilot_pause_resume_preserves_dry_run_mode(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="autopilot parent", triage=True)
+        kb.set_autopilot_enabled(conn, parent_task_ref=parent, mode="dry_run")
+        paused = kb.set_autopilot_paused(conn, paused=True, reason="operator pause")
+        resumed = kb.set_autopilot_paused(conn, paused=False)
+
+    assert paused["enabled"] is False
+    assert paused["mode"] == "dry_run"
+    assert resumed["enabled"] is True
+    assert resumed["mode"] == "dry_run"
+
+
 
 def _governed_worker_body() -> str:
     return """

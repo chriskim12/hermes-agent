@@ -5646,6 +5646,15 @@ class GatewayRunner:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
+                state = _kb.get_autopilot_state(conn, board=slug)
+                if state.get("enabled") and state.get("parent_task_id"):
+                    return _kb.autopilot_tick(
+                        conn,
+                        board=slug,
+                        failure_limit=failure_limit,
+                        default_assignee=default_assignee,
+                        max_in_progress_per_profile=max_in_progress_per_profile,
+                    )
                 return _kb.dispatch_once(
                     conn,
                     board=slug,
@@ -9972,15 +9981,11 @@ class GatewayRunner:
         raw = (event.get_command_args() or "").strip()
         tokens = shlex.split(raw) if raw else []
         if not tokens or tokens[0] in {"help", "-h", "--help"}:
-            return "Usage: /autopilot on <parent-task-id> [--dry-run] [--max N]"
-        action = tokens.pop(0).lower()
-        if action not in {"on", "once", "run"}:
-            return "Usage: /autopilot on <parent-task-id> [--dry-run] [--max N]"
-        if not tokens:
-            return "Usage: /autopilot on <parent-task-id> [--dry-run] [--max N]"
-        parent_id = tokens.pop(0)
-        passthrough = " ".join(shlex.quote(tok) for tok in tokens)
-        command = f"dispatch --parent {shlex.quote(parent_id)} {passthrough}".strip()
+            return "Usage: /autopilot [on|status|pause|resume|recover|off] <parent-task-id> [--dry-run] [--max-concurrent N]"
+        # Delegate to the Kanban-native Autopilot control plane.  This is not
+        # an LLM rewrite: the command stores/reuses durable state and hands
+        # ticks to the existing dispatcher substrate.
+        command = "autopilot " + " ".join(shlex.quote(tok) for tok in tokens)
         try:
             output = await asyncio.to_thread(run_slash, command)
         except Exception as exc:  # pragma: no cover - defensive

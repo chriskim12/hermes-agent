@@ -679,6 +679,34 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                              f"(spawn_failed, timed_out, or crashed; default: {kb.DEFAULT_SPAWN_FAILURE_LIMIT})")
     p_disp.add_argument("--json", action="store_true")
 
+    # --- autopilot ---
+    p_ap = sub.add_parser(
+        "autopilot",
+        help="Durable parent-scoped Autopilot control plane",
+    )
+    ap_sub = p_ap.add_subparsers(dest="autopilot_action")
+    p_ap_on = ap_sub.add_parser("on", help="Enable parent-scoped Autopilot and run one bounded tick")
+    p_ap_on.add_argument("parent_task_id")
+    p_ap_on.add_argument("--mode", choices=("dry_run", "supervised", "auto"), default="auto")
+    p_ap_on.add_argument("--max-concurrent", type=int, default=1)
+    p_ap_on.add_argument("--max-dispatches-per-tick", type=int, default=1)
+    p_ap_on.add_argument("--dry-run", action="store_true", help="Store dry-run mode and run a side-effect-free tick")
+    p_ap_on.add_argument("--json", action="store_true")
+    p_ap_status = ap_sub.add_parser("status", help="Show durable Autopilot state and grouped parent report")
+    p_ap_status.add_argument("parent_task_id", nargs="?", default=None)
+    p_ap_status.add_argument("--json", action="store_true")
+    p_ap_pause = ap_sub.add_parser("pause", help="Pause Autopilot for this board")
+    p_ap_pause.add_argument("reason", nargs="*", default=[])
+    p_ap_pause.add_argument("--json", action="store_true")
+    p_ap_resume = ap_sub.add_parser("resume", help="Resume the last parent-scoped Autopilot run")
+    p_ap_resume.add_argument("--json", action="store_true")
+    p_ap_recover = ap_sub.add_parser("recover", help="Recover by running one bounded tick from durable state")
+    p_ap_recover.add_argument("--dry-run", action="store_true")
+    p_ap_recover.add_argument("--json", action="store_true")
+    p_ap_off = ap_sub.add_parser("off", help="Disable Autopilot for this board")
+    p_ap_off.add_argument("reason", nargs="*", default=[])
+    p_ap_off.add_argument("--json", action="store_true")
+
     # --- daemon (deprecated) ---
     p_daemon = sub.add_parser(
         "daemon",
@@ -1002,6 +1030,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "archive":  _cmd_archive,
         "tail":     _cmd_tail,
         "dispatch": _cmd_dispatch,
+        "autopilot": _cmd_autopilot,
         "daemon":   _cmd_daemon,
         "watch":    _cmd_watch,
         "stats":    _cmd_stats,
@@ -2318,6 +2347,140 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    return 0
+
+
+def _print_autopilot_result(payload: dict[str, Any], *, as_json: bool = False) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    state = payload.get("state") or payload
+    print("Autopilot:")
+    print(f"  board:        {state.get('board')}")
+    print(f"  enabled:      {state.get('enabled')}")
+    print(f"  mode:         {state.get('mode')}")
+    print(f"  parent:       {state.get('parent_public_id') or state.get('parent_task_id') or '-'}")
+    print(f"  max:          concurrent={state.get('max_concurrent')} dispatches/tick={state.get('max_dispatches_per_tick')}")
+    if state.get("paused_reason"):
+        print(f"  paused:       {state.get('paused_reason')}")
+    if state.get("last_decision"):
+        print(f"  last:         {state.get('last_decision')} @ {state.get('last_tick_at') or '-'}")
+    if state.get("last_error"):
+        print(f"  error:        {state.get('last_error')}")
+    tick = payload.get("tick")
+    if tick:
+        print(f"  tick:         spawned={tick.get('spawned')} selected={tick.get('selected') or '-'}")
+    report = payload.get("report")
+    if report:
+        print(f"  children:     {len(report.get('children') or [])} total; counts={report.get('counts') or {}}")
+        if report.get("review_ready"):
+            print("  review_ready:")
+            for item in report["review_ready"]:
+                print(f"    - {item['public_id']} {item['title']}")
+        if report.get("blocked"):
+            print("  blocked:")
+            for item in report["blocked"]:
+                print(f"    - {item['public_id']} {item['title']}")
+
+
+def _cmd_autopilot(args: argparse.Namespace) -> int:
+    action = getattr(args, "autopilot_action", None)
+    if not action:
+        print("Usage: hermes kanban autopilot [on|status|pause|resume|recover|off]", file=sys.stderr)
+        return 2
+    board = getattr(args, "board", None) or kb.get_current_board()
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        default_assignee = (kanban_cfg.get("default_assignee") or "").strip() or None
+        failure_limit = int(kanban_cfg.get("failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT) or kb.DEFAULT_SPAWN_FAILURE_LIMIT)
+        per_profile = kanban_cfg.get("max_in_progress_per_profile")
+        max_in_progress_per_profile = int(per_profile) if per_profile else None
+    except Exception:
+        default_assignee = None
+        failure_limit = kb.DEFAULT_SPAWN_FAILURE_LIMIT
+        max_in_progress_per_profile = None
+    with kb.connect_closing(board=board) as conn:
+        try:
+            if action == "on":
+                mode = "dry_run" if getattr(args, "dry_run", False) else getattr(args, "mode", "auto")
+                state = kb.set_autopilot_enabled(
+                    conn,
+                    board=board,
+                    parent_task_ref=args.parent_task_id,
+                    mode=mode,
+                    max_concurrent=getattr(args, "max_concurrent", 1),
+                    max_dispatches_per_tick=getattr(args, "max_dispatches_per_tick", 1),
+                    owner_session=os.environ.get("HERMES_SESSION_ID"),
+                )
+                res = kb.autopilot_tick(
+                    conn,
+                    board=board,
+                    dry_run=getattr(args, "dry_run", False),
+                    failure_limit=failure_limit,
+                    default_assignee=default_assignee,
+                    max_in_progress_per_profile=max_in_progress_per_profile,
+                )
+                report = kb.autopilot_parent_report(conn, state["parent_task_id"])
+                payload = {
+                    "state": kb.get_autopilot_state(conn, board=board),
+                    "tick": {
+                        "spawned": len(res.spawned) if res else 0,
+                        "selected": res.spawned[0][0] if res and res.spawned else None,
+                    },
+                    "report": report,
+                }
+            elif action == "status":
+                state = kb.get_autopilot_state(conn, board=board)
+                parent = getattr(args, "parent_task_id", None) or state.get("parent_task_id")
+                payload = {"state": state}
+                if parent:
+                    payload["report"] = kb.autopilot_parent_report(conn, str(parent))
+            elif action == "pause":
+                reason = " ".join(getattr(args, "reason", [])).strip() or "paused_by_operator"
+                payload = {"state": kb.set_autopilot_paused(conn, board=board, paused=True, reason=reason)}
+            elif action == "resume":
+                state = kb.set_autopilot_paused(conn, board=board, paused=False, reason=None)
+                res = kb.autopilot_tick(
+                    conn,
+                    board=board,
+                    failure_limit=failure_limit,
+                    default_assignee=default_assignee,
+                    max_in_progress_per_profile=max_in_progress_per_profile,
+                )
+                payload = {
+                    "state": kb.get_autopilot_state(conn, board=board),
+                    "tick": {"spawned": len(res.spawned) if res else 0, "selected": res.spawned[0][0] if res and res.spawned else None},
+                }
+                if state.get("parent_task_id"):
+                    payload["report"] = kb.autopilot_parent_report(conn, state["parent_task_id"])
+            elif action == "recover":
+                res = kb.autopilot_tick(
+                    conn,
+                    board=board,
+                    dry_run=getattr(args, "dry_run", False),
+                    failure_limit=failure_limit,
+                    default_assignee=default_assignee,
+                    max_in_progress_per_profile=max_in_progress_per_profile,
+                )
+                state = kb.get_autopilot_state(conn, board=board)
+                payload = {
+                    "state": state,
+                    "tick": {"spawned": len(res.spawned) if res else 0, "selected": res.spawned[0][0] if res and res.spawned else None},
+                }
+                if state.get("parent_task_id"):
+                    payload["report"] = kb.autopilot_parent_report(conn, state["parent_task_id"])
+            elif action == "off":
+                reason = " ".join(getattr(args, "reason", [])).strip() or "off_by_operator"
+                payload = {"state": kb.disable_autopilot(conn, board=board, reason=reason)}
+            else:
+                print(f"unknown autopilot action {action!r}", file=sys.stderr)
+                return 2
+        except ValueError as exc:
+            print(f"autopilot: {exc}", file=sys.stderr)
+            return 1
+    _print_autopilot_result(payload, as_json=getattr(args, "json", False))
     return 0
 
 
