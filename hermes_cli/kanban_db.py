@@ -1394,12 +1394,23 @@ def _block_for_ready_gate_failure(conn: sqlite3.Connection, row: sqlite3.Row, ga
         "to_status": "blocked",
         "reason": reason,
         "ready_gate": gate,
+        "blocked_by": "ready_gate",
+        "original_assignee": row["assignee"] if "assignee" in row.keys() else None,
     }
+    snapshot = None
+    if "admission_snapshot" in row.keys() and row["admission_snapshot"]:
+        snapshot = _json_loads_maybe(row["admission_snapshot"])
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    snapshot["blocked_by"] = "ready_gate"
+    snapshot["ready_gate"] = gate
+    snapshot["ready_gate_reason_codes"] = reason_codes
+    snapshot["original_assignee"] = row["assignee"] if "assignee" in row.keys() else None
     conn.execute(
-        "UPDATE tasks SET status = 'blocked', assignee = NULL, claim_lock = NULL, "
+        "UPDATE tasks SET status = 'blocked', admission_snapshot = ?, claim_lock = NULL, "
         "claim_expires = NULL, worker_pid = NULL, consecutive_failures = 0, "
         "last_failure_error = NULL WHERE id = ?",
-        (task_id,),
+        (json.dumps(snapshot), task_id),
     )
     _append_event(conn, task_id, "ready_gate_blocked", payload)
     _append_event(conn, task_id, "blocked", payload)
@@ -3453,7 +3464,7 @@ def admit_ready_task(
     if row is None:
         raise ValueError(f"no such task: {task_id}")
     from hermes_cli import profiles
-    from hermes_cli.kanban_ready_contract import validate_ready_contract
+    from hermes_cli.kanban_ready_contract import render_ready_contract_markdown, validate_ready_contract
 
     validation = validate_ready_contract(
         ready_contract,
@@ -3477,11 +3488,17 @@ def admit_ready_task(
         snapshot = {}
     if validation.ready_contract:
         snapshot["ready_contract"] = validation.ready_contract
+        routing = validation.ready_contract.get("routing_verdict")
+        if isinstance(routing, Mapping):
+            snapshot["routing_verdict"] = dict(routing)
     snapshot["autopilot_eligible"] = accepted
     snapshot["ready_gate_result"] = "accepted" if accepted else "blocked"
     snapshot["ready_gate_reason_codes"] = reason_codes
     snapshot["ready_gate_source"] = "kanban_admit_ready"
     assignee = _contract_assignee(validation.ready_contract or {})
+    rendered_body = None
+    if validation.ready_contract:
+        rendered_body = render_ready_contract_markdown(validation.ready_contract)
     if apply:
         with write_txn(conn):
             if accepted:
@@ -3490,6 +3507,7 @@ def admit_ready_task(
                     UPDATE tasks
                        SET status = 'ready',
                            assignee = COALESCE(NULLIF(assignee, ''), ?),
+                           body = COALESCE(?, body),
                            admission_snapshot = ?,
                            claim_lock = NULL,
                            claim_expires = NULL,
@@ -3498,7 +3516,7 @@ def admit_ready_task(
                        AND status IN ('triage', 'todo', 'blocked', 'ready')
                        AND (review_phase IS NULL OR review_phase = '')
                     """,
-                    (assignee, json.dumps(snapshot), task),
+                    (assignee, rendered_body, json.dumps(snapshot), task),
                 )
             else:
                 conn.execute("UPDATE tasks SET admission_snapshot = ? WHERE id = ?", (json.dumps(snapshot), task))

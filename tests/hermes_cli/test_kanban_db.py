@@ -374,7 +374,9 @@ def test_recompute_ready_strict_gate_blocks_incomplete_dependency_wakeup(kanban_
         events = kb.list_events(conn, c)
 
     assert child.status == "blocked"
-    assert child.assignee is None
+    assert child.assignee == "alice"
+    assert child.admission_snapshot["blocked_by"] == "ready_gate"
+    assert child.admission_snapshot["original_assignee"] == "alice"
     assert "ready_gate_blocked" in [event.kind for event in events]
 
 
@@ -1668,7 +1670,9 @@ def test_dispatch_strict_ready_gate_blocks_raw_ready_before_spawn(kanban_home, m
     assert t in res.auto_blocked
     assert not res.spawned
     assert task.status == "blocked"
-    assert task.assignee is None
+    assert task.assignee == "alice"
+    assert task.admission_snapshot["blocked_by"] == "ready_gate"
+    assert task.admission_snapshot["original_assignee"] == "alice"
     assert "ready_gate_blocked" in [event.kind for event in events]
 
 
@@ -1726,7 +1730,9 @@ def test_admit_ready_task_persists_contract_and_promotes(kanban_home, monkeypatc
     assert result["decision"] == "ready"
     assert task.status == "ready"
     assert task.admission_snapshot["ready_contract"]["schema"] == "kanban_ready_contract.v1"
+    assert task.admission_snapshot["routing_verdict"]["assignee"] == "alice"
     assert task.admission_snapshot["ready_gate_source"] == "kanban_admit_ready"
+    assert "kanban_ready_contract.v1" in (task.body or "")
     assert any(event.kind == "kanban_admit_ready" for event in events)
 
 
