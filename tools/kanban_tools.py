@@ -306,6 +306,53 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     return None
 
 
+def _task_lifecycle_fields(task) -> dict[str, Any]:
+    """Derive lifecycle display fields from a Task object.
+
+    These fields expose lifecycle truth that raw ``status`` alone does not —
+    e.g. ``status=blocked, review_phase=review_ready`` means the task is
+    actually in the ``review_ready`` lifecycle state, not a generic failure.
+    Both ``kanban_show`` and ``kanban_list`` use this same helper so agents
+    and operators see a consistent surface.
+    """
+    review_phase = getattr(task, "review_phase", None)
+    goal_mode = bool(getattr(task, "goal_mode", False))
+    goal_max_turns = getattr(task, "goal_max_turns", None)
+    status = getattr(task, "status", None)
+
+    # ---- lifecycle_state ----
+    # blocked + review_phase signals a structured lifecycle stop, not failure.
+    if status == "blocked" and review_phase == "worker_done":
+        lifecycle_state = "worker_done"
+    elif status == "blocked" and review_phase == "review_ready":
+        lifecycle_state = "review_ready"
+    else:
+        lifecycle_state = status
+
+    # ---- closeout_evidence_keys ----
+    ce = getattr(task, "closeout_evidence", None)
+    if isinstance(ce, dict):
+        closeout_evidence_keys = sorted(ce.keys())
+    else:
+        closeout_evidence_keys = []
+
+    # ---- ready_contract_present ----
+    admission = getattr(task, "admission_snapshot", None)
+    ready_contract_present = (
+        isinstance(admission, dict)
+        and "ready_contract" in admission
+    )
+
+    return {
+        "review_phase": review_phase,
+        "goal_mode": goal_mode,
+        "goal_max_turns": goal_max_turns,
+        "lifecycle_state": lifecycle_state,
+        "closeout_evidence_keys": closeout_evidence_keys,
+        "ready_contract_present": ready_contract_present,
+    }
+
+
 def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     """Compact task shape for board-listing tools."""
     parents = kb.parent_ids(conn, task.id)
@@ -329,6 +376,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "children": children,
         "parent_count": len(parents),
         "child_count": len(children),
+        **_task_lifecycle_fields(task),
     }
 
 
@@ -537,6 +585,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "result": t.result,
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
+                    **_task_lifecycle_fields(t),
                 }
 
             def _run_dict(r):

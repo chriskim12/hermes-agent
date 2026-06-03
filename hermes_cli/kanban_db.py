@@ -747,6 +747,7 @@ class Task:
     session_id: Optional[str] = None
     review_phase: Optional[str] = None
     closeout_evidence: Optional[dict] = None
+    admission_snapshot: Optional[dict] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -763,6 +764,9 @@ class Task:
         closeout_evidence = None
         if "closeout_evidence" in keys and row["closeout_evidence"]:
             closeout_evidence = _json_loads_maybe(row["closeout_evidence"])
+        admission_snapshot = None
+        if "admission_snapshot" in keys and row["admission_snapshot"]:
+            admission_snapshot = _json_loads_maybe(row["admission_snapshot"])
         return cls(
             id=row["id"],
             title=row["title"],
@@ -829,6 +833,7 @@ class Task:
                 row["review_phase"] if "review_phase" in keys else None
             ),
             closeout_evidence=closeout_evidence,
+            admission_snapshot=admission_snapshot,
         )
 
 
