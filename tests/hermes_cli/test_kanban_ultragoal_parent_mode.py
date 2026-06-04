@@ -127,7 +127,7 @@ def test_parent_ultragoal_terminal_report_summarizes_child_evidence(tmp_path):
     authority = _authority(children=[{"id": "BO-204", "relationType": "hierarchy"}])
     store = KanbanUltragoalStore(tmp_path)
     store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
-    store.record_worker_done("BO-203", authority=authority, evidence={"commandsRun": ["pytest"], "childEvidence": {"BO-204": "ok"}})
+    store.record_worker_done("BO-203", authority=authority, evidence={"commandsRun": ["pytest"], "childEvidence": {"BO-204": {"status": "satisfied", "summary": "ok", "artifact_refs": ["pytest"]}}})
     store.record_verifier_result("BO-203", authority=authority, result={"passed": True, "doneCriteriaEvidence": [{"criterionId": "DC-1", "evidence": "pytest"}]})
     store.record_reviewer_result("BO-203", authority=authority, result=_reviewer_approve(quality_gate=_quality_gate()))
     store.record_pr_created("BO-203", authority=authority, pr={"url": "https://github.com/chriskim12/hermes-agent/pull/1", "number": 1, "headSha": "abc"})
@@ -186,7 +186,7 @@ def test_build_closeout_evidence_materializes_governed_schema(tmp_path, monkeypa
     authority = _authority(children=[{"id": "BO-204", "relationType": "hierarchy", "title": "child"}])
     store = KanbanUltragoalStore(target_repo)
     store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
-    store.record_worker_done("BO-203", authority=authority, evidence={"summary": "implemented", "childEvidence": {"BO-204": {"summary": "ok"}}})
+    store.record_worker_done("BO-203", authority=authority, evidence={"summary": "implemented", "childEvidence": {"BO-204": {"status": "satisfied", "summary": "ok", "artifact_refs": ["pytest"]}}})
     store.record_verifier_result("BO-203", authority=authority, result={"passed": True, "perCriterion": {"dc-1": "ok"}})
     store.record_reviewer_result("BO-203", authority=authority, result=_reviewer_approve(quality_gate=_quality_gate()))
     store.record_pr_created("BO-203", authority=authority, pr={"url": "https://github.com/o/r/pull/1", "number": 1, "headSha": "abc"})
@@ -217,7 +217,7 @@ def test_build_closeout_evidence_blocks_missing_quality_gate_matrix(tmp_path, mo
     authority = _authority(children=[{"id": "BO-204", "relationType": "hierarchy", "title": "child"}])
     store = KanbanUltragoalStore(target_repo)
     store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
-    store.record_worker_done("BO-203", authority=authority, evidence={"summary": "implemented", "childEvidence": {"BO-204": {"summary": "ok"}}})
+    store.record_worker_done("BO-203", authority=authority, evidence={"summary": "implemented", "childEvidence": {"BO-204": {"status": "satisfied", "summary": "ok", "artifact_refs": ["pytest"]}}})
     store.record_verifier_result("BO-203", authority=authority, result={"passed": True, "perCriterion": {"dc-1": "ok"}})
     store.record_reviewer_result("BO-203", authority=authority, result=_reviewer_approve())
     store.record_pr_created("BO-203", authority=authority, pr={"url": "https://github.com/o/r/pull/1", "number": 1, "headSha": "abc"})
@@ -238,8 +238,12 @@ def test_parent_closeout_blocks_missing_child_evidence_matrix(tmp_path, monkeypa
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     authority = _authority(children=[{"id": "BO-204", "relationType": "hierarchy", "title": "child"}])
     store = KanbanUltragoalStore(target_repo)
-    store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
-    store.record_worker_done("BO-203", authority=authority, evidence={"summary": "implemented", "childEvidence": {}})
+    run = store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
+    # Preserve the late closeout gate with a legacy/corrupt worker artifact that
+    # predates the record_worker_done-time parent coverage gate.
+    store._write_json(store.root("BO-203") / "evidence" / "worker.json", {"summary": "implemented", "childEvidence": {}})
+    run.state = "worker_done"
+    store.save_run(run)
     store.record_verifier_result("BO-203", authority=authority, result={"passed": True, "perCriterion": {"dc-1": "ok"}})
     store.record_reviewer_result("BO-203", authority=authority, result=_reviewer_approve(quality_gate=_quality_gate()))
     store.record_pr_created("BO-203", authority=authority, pr={"url": "https://github.com/o/r/pull/1", "number": 1, "headSha": "abc"})
@@ -261,7 +265,7 @@ def test_parent_closeout_blocks_missing_child_cleanup_matrix(tmp_path, monkeypat
     authority = _authority(children=[{"id": "BO-204", "relationType": "hierarchy", "title": "child"}])
     store = KanbanUltragoalStore(target_repo)
     store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
-    store.record_worker_done("BO-203", authority=authority, evidence={"summary": "implemented", "childEvidence": {"BO-204": {"summary": "ok"}}})
+    store.record_worker_done("BO-203", authority=authority, evidence={"summary": "implemented", "childEvidence": {"BO-204": {"status": "satisfied", "summary": "ok", "artifact_refs": ["pytest"]}}})
     store.record_verifier_result("BO-203", authority=authority, result={"passed": True, "perCriterion": {"dc-1": "ok"}})
     store.record_reviewer_result("BO-203", authority=authority, result=_reviewer_approve(quality_gate=_quality_gate()))
     store.record_pr_created("BO-203", authority=authority, pr={"url": "https://github.com/o/r/pull/1", "number": 1, "headSha": "abc"})
@@ -283,7 +287,7 @@ def test_closeout_review_ready_applies_children_before_parent(tmp_path, monkeypa
     authority = _authority(children=[{"id": "BO-204", "relationType": "hierarchy"}, {"id": "BO-205", "relationType": "hierarchy"}])
     store = KanbanUltragoalStore(target_repo)
     store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
-    store.record_worker_done("BO-203", authority=authority, evidence={"summary": "implemented", "childEvidence": {"BO-204": "ok", "BO-205": "ok"}})
+    store.record_worker_done("BO-203", authority=authority, evidence={"summary": "implemented", "childEvidence": {"BO-204": {"status": "satisfied", "summary": "ok", "artifact_refs": ["pytest"]}, "BO-205": {"status": "satisfied", "summary": "ok", "artifact_refs": ["pytest"]}}})
     store.record_verifier_result("BO-203", authority=authority, result={"passed": True})
     store.record_reviewer_result("BO-203", authority=authority, result=_reviewer_approve(quality_gate=_quality_gate()))
     store.record_pr_created("BO-203", authority=authority, pr={"url": "https://github.com/o/r/pull/1", "number": 1, "headSha": "abc"})
@@ -323,7 +327,7 @@ def test_cli_build_closeout_evidence_json(tmp_path, monkeypatch, capsys):
     authority = _authority(children=[{"id": "BO-204", "relationType": "hierarchy"}])
     store = KanbanUltragoalStore(target_repo)
     store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
-    store.record_worker_done("BO-203", authority=authority, evidence={"summary": "implemented", "childEvidence": {"BO-204": {"summary": "ok"}}})
+    store.record_worker_done("BO-203", authority=authority, evidence={"summary": "implemented", "childEvidence": {"BO-204": {"status": "satisfied", "summary": "ok", "artifact_refs": ["pytest"]}}})
     store.record_verifier_result("BO-203", authority=authority, result={"passed": True})
     store.record_reviewer_result("BO-203", authority=authority, result=_reviewer_approve(quality_gate=_quality_gate()))
     store.record_pr_created("BO-203", authority=authority, pr={"url": "https://github.com/o/r/pull/1", "number": 1, "headSha": "abc"})
@@ -348,3 +352,165 @@ def test_cli_build_closeout_evidence_json(tmp_path, monkeypatch, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["schema"] == "kanban_closeout_evidence.v1"
     assert out["worker_evidence"]["schema"] == "kanban_worker_evidence.v1"
+
+
+# ── Slice 1: RED tests for parent record_worker_done child coverage gate ──
+
+
+def test_parent_worker_done_blocks_missing_child_coverage(tmp_path):
+    from hermes_cli.kanban_ultragoal import KanbanUltragoalStore
+
+    authority = _authority(children=[
+        {"id": "BO-204", "relationType": "hierarchy", "title": "first child"},
+        {"id": "BO-205", "relationType": "hierarchy", "title": "second child"},
+    ])
+    store = KanbanUltragoalStore(tmp_path)
+    store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
+
+    # evidence covers only BO-204, missing BO-205
+    evidence = {
+        "commandsRun": ["pytest"],
+        "childEvidence": {
+            "BO-204": {"status": "satisfied", "summary": "done", "artifact_refs": ["pr"]},
+        },
+    }
+
+    with pytest.raises(ValueError, match="childEvidence"):
+        store.record_worker_done("BO-203", authority=authority, evidence=evidence)
+
+
+def test_parent_worker_done_accepts_satisfied_and_gated_children(tmp_path):
+    from hermes_cli.kanban_ultragoal import KanbanUltragoalStore
+
+    authority = _authority(children=[
+        {"id": "BO-204", "relationType": "hierarchy", "title": "first child"},
+        {"id": "BO-205", "relationType": "hierarchy", "title": "second child"},
+    ])
+    store = KanbanUltragoalStore(tmp_path)
+    store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
+
+    evidence = {
+        "commandsRun": ["pytest"],
+        "childEvidence": {
+            "BO-204": {"status": "satisfied", "summary": "done", "artifact_refs": ["pr"]},
+            "BO-205": {
+                "status": "gated_by_forbidden_side_effect",
+                "reason": "needs production access",
+                "next_gate": "BO-230",
+            },
+        },
+    }
+
+    run = store.record_worker_done("BO-203", authority=authority, evidence=evidence)
+    assert run.state == "worker_done"
+
+
+def test_parent_worker_done_rejects_vague_deferred_child(tmp_path):
+    from hermes_cli.kanban_ultragoal import KanbanUltragoalStore
+
+    authority = _authority(children=[
+        {"id": "BO-204", "relationType": "hierarchy", "title": "only child"},
+    ])
+    store = KanbanUltragoalStore(tmp_path)
+    store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
+
+    evidence = {
+        "childEvidence": {
+            "BO-204": {"status": "deferred", "summary": "will do later"},
+        },
+    }
+
+    with pytest.raises(ValueError, match="deferred"):
+        store.record_worker_done("BO-203", authority=authority, evidence=evidence)
+
+
+def test_parent_worker_done_rejects_descoped_without_chris_approval(tmp_path):
+    from hermes_cli.kanban_ultragoal import KanbanUltragoalStore
+
+    authority = _authority(children=[
+        {"id": "BO-204", "relationType": "hierarchy", "title": "only child"},
+    ])
+    store = KanbanUltragoalStore(tmp_path)
+    store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
+
+    evidence = {
+        "childEvidence": {
+            "BO-204": {
+                "status": "explicitly_descoped_by_chris",
+                "reason": "not needed",
+                # missing approval.text / approvalText
+            },
+        },
+    }
+
+    with pytest.raises(ValueError, match="explicitly_descoped_by_chris"):
+        store.record_worker_done("BO-203", authority=authority, evidence=evidence)
+
+
+def test_parent_status_reports_incomplete_child_matrix(tmp_path):
+    from hermes_cli.kanban_ultragoal import KanbanUltragoalStore
+
+    authority = _authority(children=[
+        {"id": "BO-204", "relationType": "hierarchy", "title": "first child"},
+        {"id": "BO-205", "relationType": "hierarchy", "title": "second child"},
+    ])
+    store = KanbanUltragoalStore(tmp_path)
+    store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
+
+    payload = store.status_payload("BO-203")
+
+    matrix = payload["parentChildMatrix"]
+    assert matrix["parentScopeComplete"] is False
+    assert matrix["missingChildEvidence"] == ["BO-204", "BO-205"]
+    assert matrix["missingChildCleanup"] == ["BO-204", "BO-205"]
+    assert matrix["nextRequiredChild"] == "BO-204"
+    assert matrix["cannotFinalCloseoutParent"] is True
+
+
+def test_parent_worker_done_rejects_unknown_child_as_coverage(tmp_path):
+    from hermes_cli.kanban_ultragoal import KanbanUltragoalStore
+
+    authority = _authority(children=[{"id": "BO-204", "relationType": "hierarchy", "title": "only child"}])
+    store = KanbanUltragoalStore(tmp_path)
+    store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
+
+    with pytest.raises(ValueError, match="missing childEvidence for BO-204"):
+        store.record_worker_done("BO-203", authority=authority, evidence={
+            "childEvidence": {"BO-999": {"status": "satisfied", "summary": "wrong child", "artifact_refs": ["pytest"]}}
+        })
+
+
+def test_parent_worker_done_rejects_non_dict_child_evidence(tmp_path):
+    from hermes_cli.kanban_ultragoal import KanbanUltragoalStore
+
+    authority = _authority(children=[{"id": "BO-204", "relationType": "hierarchy", "title": "only child"}])
+    store = KanbanUltragoalStore(tmp_path)
+    store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
+
+    with pytest.raises(ValueError, match="childEvidence:not_dict"):
+        store.record_worker_done("BO-203", authority=authority, evidence={"childEvidence": ["BO-204"]})
+
+
+def test_parent_worker_done_rejects_non_dict_child_row(tmp_path):
+    from hermes_cli.kanban_ultragoal import KanbanUltragoalStore
+
+    authority = _authority(children=[{"id": "BO-204", "relationType": "hierarchy", "title": "only child"}])
+    store = KanbanUltragoalStore(tmp_path)
+    store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
+
+    with pytest.raises(ValueError, match="childEvidence_row:not_dict"):
+        store.record_worker_done("BO-203", authority=authority, evidence={"childEvidence": {"BO-204": "ok"}})
+
+
+def test_parent_worker_done_rejects_missing_status_or_reason_summary(tmp_path):
+    from hermes_cli.kanban_ultragoal import KanbanUltragoalStore
+
+    authority = _authority(children=[{"id": "BO-204", "relationType": "hierarchy", "title": "only child"}])
+    store = KanbanUltragoalStore(tmp_path)
+    store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
+
+    with pytest.raises(ValueError, match="status:missing"):
+        store.record_worker_done("BO-203", authority=authority, evidence={"childEvidence": {"BO-204": {"summary": "no status", "artifact_refs": ["pytest"]}}})
+
+    with pytest.raises(ValueError, match="summary_or_reason_required"):
+        store.record_worker_done("BO-203", authority=authority, evidence={"childEvidence": {"BO-204": {"status": "satisfied", "artifact_refs": ["pytest"]}}})

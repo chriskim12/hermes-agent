@@ -120,6 +120,30 @@ def _row_get(row: Any, key: str, default: Any = None) -> Any:
     return row[key] if key in row.keys() else default
 
 
+
+PARENT_CHILD_WORKER_STATUSES = {
+    "satisfied",
+    "blocked",
+    "gated_by_forbidden_side_effect",
+    "explicitly_descoped_by_chris",
+    "not_applicable",
+}
+
+
+def _non_empty_text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _non_empty_list(value: Any) -> bool:
+    return isinstance(value, list) and bool(value)
+
+
+def _has_descoping_approval(row: dict[str, Any]) -> bool:
+    approval = row.get("approval")
+    if isinstance(approval, dict):
+        return any(_non_empty_text(approval.get(key)) for key in ("text", "source", "approvalText", "approvedBy"))
+    return any(_non_empty_text(row.get(key)) for key in ("approval_text", "approvalText", "approval_source", "approvalSource"))
+
 def build_authority_snapshot(task_ref: str) -> dict[str, Any]:
     """Read a canonical Kanban authority snapshot for ``task_ref``.
 
@@ -461,6 +485,7 @@ class KanbanUltragoalStore:
         self._require_current_authority(run, authority)
         if run.state not in {"admitted", "running", "verification_failed", "review_failed", "ci_failed"}:
             raise ValueError(f"worker_done transition is not allowed from {run.state}")
+        self._require_parent_child_worker_coverage(run, evidence)
         run.state = "worker_done"
         run.resumable = False
         self._write_json(self.root(run_id) / "evidence" / "worker.json", evidence)
@@ -663,6 +688,117 @@ class KanbanUltragoalStore:
         if blockers:
             raise ValueError("quality_gate blocked review_ready: " + ", ".join(blockers))
         return dict(quality_gate)
+
+    def _parent_child_worker_coverage_status(self, run: KanbanUltragoalRun, worker_raw: dict[str, Any]) -> dict[str, Any]:
+        child_ids = [str(c) for c in (run.scope or {}).get("childTaskIds", [])]
+        if run.target_mode != "parent" or not child_ids:
+            return {"complete": True, "missingChildEvidence": [], "unknownChildEvidence": [], "blockers": [], "children": []}
+        if "childEvidence" in worker_raw:
+            raw = worker_raw.get("childEvidence")
+        else:
+            raw = worker_raw.get("child_evidence")
+        blockers: list[str] = []
+        matrix: list[dict[str, Any]] = []
+        if not isinstance(raw, dict):
+            return {
+                "complete": False,
+                "missingChildEvidence": child_ids,
+                "unknownChildEvidence": [],
+                "blockers": ["childEvidence:not_dict"],
+                "children": [{"taskId": child_id, "hasChildEvidence": False, "valid": False, "blockers": ["missing_childEvidence"]} for child_id in child_ids],
+            }
+        child_set = set(child_ids)
+        unknown = sorted(str(key) for key in raw.keys() if str(key) not in child_set)
+        missing: list[str] = []
+        for child_id in child_ids:
+            row = raw.get(child_id)
+            row_blockers: list[str] = []
+            status = None
+            if not isinstance(row, dict):
+                if row is None:
+                    missing.append(child_id)
+                    row_blockers.append("missing_childEvidence")
+                else:
+                    row_blockers.append("childEvidence_row:not_dict")
+            else:
+                status = str(row.get("status") or "").strip()
+                if status not in PARENT_CHILD_WORKER_STATUSES:
+                    row_blockers.append(f"status:{status or 'missing'}")
+                if not (_non_empty_text(row.get("summary")) or _non_empty_text(row.get("reason"))):
+                    row_blockers.append("summary_or_reason_required")
+                if status == "satisfied" and not _non_empty_list(row.get("artifact_refs")):
+                    row_blockers.append("artifact_refs_required")
+                if status == "blocked" and not (_non_empty_text(row.get("next_gate")) or _non_empty_list(row.get("artifact_refs"))):
+                    row_blockers.append("next_gate_or_artifact_refs_required")
+                if status == "gated_by_forbidden_side_effect" and not _non_empty_text(row.get("next_gate")):
+                    row_blockers.append("next_gate_required")
+                if status == "explicitly_descoped_by_chris" and not _has_descoping_approval(row):
+                    row_blockers.append("explicitly_descoped_by_chris_approval_required")
+                if status == "not_applicable" and not (_non_empty_text(row.get("reason")) or _non_empty_list(row.get("artifact_refs"))):
+                    row_blockers.append("not_applicable_reason_or_artifact_refs_required")
+            if row_blockers:
+                blockers.extend(f"{child_id}:{blocker}" for blocker in row_blockers)
+            matrix.append({
+                "taskId": child_id,
+                "hasChildEvidence": child_id not in missing and row is not None,
+                "valid": not row_blockers,
+                "status": status,
+                "blockers": row_blockers,
+            })
+        if missing:
+            blockers.insert(0, "missing childEvidence for " + ", ".join(missing))
+        return {
+            "complete": not blockers and not missing,
+            "missingChildEvidence": missing,
+            "unknownChildEvidence": unknown,
+            "blockers": list(dict.fromkeys(blockers)),
+            "children": matrix,
+        }
+
+    def _require_parent_child_worker_coverage(self, run: KanbanUltragoalRun, worker_raw: dict[str, Any]) -> dict[str, Any]:
+        status = self._parent_child_worker_coverage_status(run, worker_raw)
+        if not status.get("complete"):
+            missing = status.get("missingChildEvidence") or []
+            prefix = "parent worker_done blocked"
+            if missing:
+                prefix += ": missing childEvidence for " + ", ".join(missing)
+            blockers = status.get("blockers") or []
+            detail = "; ".join(str(item) for item in blockers if item)
+            raise ValueError(prefix + ("; " + detail if detail else ""))
+        return status
+
+    def _parent_child_matrix_status(self, run: KanbanUltragoalRun, worker_raw: dict[str, Any] | None = None, cleanup_raw: dict[str, Any] | None = None) -> dict[str, Any]:
+        worker_raw = worker_raw or {}
+        cleanup_raw = cleanup_raw or {}
+        child_ids = [str(c) for c in (run.scope or {}).get("childTaskIds", [])]
+        if run.target_mode != "parent" or not child_ids:
+            return {"parentScopeComplete": True, "missingChildEvidence": [], "missingChildCleanup": [], "nextRequiredChild": None, "cannotFinalCloseoutParent": False}
+        coverage = self._parent_child_worker_coverage_status(run, worker_raw)
+        cleanup = cleanup_raw.get("childCleanup") or cleanup_raw.get("child_cleanup") or {}
+        if not isinstance(cleanup, dict):
+            cleanup = {}
+        missing_cleanup = [child_id for child_id in child_ids if not cleanup.get(child_id)]
+        missing_evidence = list(coverage.get("missingChildEvidence") or [])
+        invalid_evidence = [row["taskId"] for row in coverage.get("children") or [] if not row.get("valid") and row.get("taskId") not in missing_evidence]
+        evidence_gaps = list(dict.fromkeys(missing_evidence + invalid_evidence))
+        next_required = (evidence_gaps or missing_cleanup or [None])[0]
+        complete = not evidence_gaps and not missing_cleanup
+        return {
+            "parentScopeComplete": complete,
+            "missingChildEvidence": evidence_gaps,
+            "missingChildCleanup": missing_cleanup,
+            "nextRequiredChild": next_required,
+            "cannotFinalCloseoutParent": not complete,
+            "workerCoverage": coverage,
+        }
+
+    def status_payload(self, run_id: str) -> dict[str, Any]:
+        run = self.load_run(run_id)
+        payload = run.to_dict()
+        worker_raw = self._load_optional_json(run_id, "evidence/worker.json")
+        cleanup_raw = self._load_optional_json(run_id, "cleanup.json")
+        payload["parentChildMatrix"] = self._parent_child_matrix_status(run, worker_raw, cleanup_raw)
+        return payload
 
     def _require_parent_child_closeout_matrix(self, run: KanbanUltragoalRun, worker_raw: dict[str, Any], cleanup_raw: dict[str, Any]) -> dict[str, Any]:
         child_ids = [str(c) for c in (run.scope or {}).get("childTaskIds", [])]
@@ -981,7 +1117,9 @@ def kanban_ultragoal_command(args: argparse.Namespace) -> int:
             run = store.start(args.run_id, authority=authority, root_objective=args.root_objective, force=args.force, target_mode=args.mode)
             run = store.tick(args.run_id, authority=authority)
     elif cmd == "status":
-        run = store.load_run(args.run_id)
+        data = store.status_payload(args.run_id)
+        _emit_data(data, json_output=bool(args.json))
+        return 0
     elif cmd == "tick":
         run = store.tick(args.run_id, authority=_load_json_arg(args.authority_json) or {}, budget_remaining=args.budget_remaining)
     elif cmd == "resume":
