@@ -104,6 +104,24 @@ def mock_is_under_or_equal_true():
 class TestProtectedCwdCommand:
     """DC1: mutator/ambiguous commands blocked from protected cwd."""
 
+    def test_configured_protected_root_blocks_terminal_mutator(self, tmp_path):
+        """Terminal guard uses protected_checkouts config, not only defaults."""
+        configured_root = tmp_path / "configured-canonical"
+        configured_root.mkdir()
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={
+                "protected_checkouts": {
+                    "canonical_roots": [str(configured_root)],
+                    "allowed_worktree_prefixes": [str(tmp_path / "worktrees")],
+                }
+            },
+        ):
+            result = _check_protected_cwd_command("touch file.txt", str(configured_root))
+        assert result is not None
+        assert result["approved"] is False
+        assert "[PROTECTED-CWD]" in result["message"]
+
     def test_non_protected_cwd_allows_all(
         self, non_protected_cwd, mock_protected_root_blocked
     ):

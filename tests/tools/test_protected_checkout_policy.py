@@ -21,6 +21,7 @@ from tools.protected_checkout_policy import (
     PROTECTED_CANONICAL_ROOTS,
     ProtectedCheckoutDecision,
     check_path_mutation,
+    effective_protected_checkout_registry,
 )
 
 
@@ -270,6 +271,41 @@ class TestCheckPathMutation:
             other = tmp_path / "dailychingu-other"
             other.mkdir()
             result = check_path_mutation(str(other / "file.txt"))
+            assert result.allowed is True
+            assert result.reason_code == "ALLOWED_NON_PROTECTED"
+
+    def test_configured_registry_overrides_defaults(self, tmp_path):
+        """protected_checkouts config is the executable SSOT when present."""
+        protected = tmp_path / "canonical"
+        allowed = tmp_path / "allowed-worktrees"
+        protected.mkdir()
+        allowed.mkdir()
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={
+                "protected_checkouts": {
+                    "canonical_roots": [str(protected)],
+                    "allowed_worktree_prefixes": [str(allowed)],
+                }
+            },
+        ):
+            registry = effective_protected_checkout_registry()
+            assert registry["canonical_roots"] == [str(protected)]
+            assert registry["allowed_worktree_prefixes"] == [str(allowed)]
+            result = check_path_mutation(str(allowed / "bo-239" / "file.py"))
+            assert result.allowed is True
+            assert result.reason_code == "ALLOWED_WORKTREE"
+
+    def test_malformed_config_falls_back_to_defaults(self, tmp_path):
+        """Malformed config must not globally break the guard."""
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"protected_checkouts": "bad-shape"},
+        ):
+            registry = effective_protected_checkout_registry()
+            assert registry["canonical_roots"] == PROTECTED_CANONICAL_ROOTS
+            assert registry["allowed_worktree_prefixes"] == ALLOWED_WORKTREE_PREFIXES
+            result = check_path_mutation(str(tmp_path / "ordinary" / "file.py"))
             assert result.allowed is True
             assert result.reason_code == "ALLOWED_NON_PROTECTED"
 

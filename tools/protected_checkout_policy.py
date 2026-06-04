@@ -15,7 +15,7 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import Any, List
 
 
 # ---------------------------------------------------------------------------
@@ -29,6 +29,56 @@ PROTECTED_CANONICAL_ROOTS: List[str] = [
 ALLOWED_WORKTREE_PREFIXES: List[str] = [
     "/home/ubuntu/.hermes/hermes-agent/.worktrees",
 ]
+
+def _string_list(value: Any) -> list[str]:
+    """Return a cleaned list of strings from a config value."""
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+
+def _load_configured_registry() -> tuple[list[str], list[str]]:
+    """Load protected checkout roots/prefixes from config.yaml.
+
+    Supported shape:
+
+    protected_checkouts:
+      canonical_roots:
+        - /home/ubuntu/repos/dailychingu
+      allowed_worktree_prefixes:
+        - /home/ubuntu/.hermes/hermes-agent/.worktrees
+
+    Missing or malformed config falls back to module defaults. That avoids
+    globally breaking file/terminal tools while keeping one executable SSOT:
+    callers ask this module for the effective registry instead of relying on
+    SOUL, skills, docs, or comments.
+    """
+    roots = list(PROTECTED_CANONICAL_ROOTS)
+    prefixes = list(ALLOWED_WORKTREE_PREFIXES)
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+    except Exception:
+        return roots, prefixes
+
+    section = cfg.get("protected_checkouts")
+    if not isinstance(section, dict):
+        return roots, prefixes
+
+    configured_roots = _string_list(section.get("canonical_roots"))
+    configured_prefixes = _string_list(section.get("allowed_worktree_prefixes"))
+    return configured_roots or roots, configured_prefixes or prefixes
+
+
+def effective_protected_checkout_registry() -> dict[str, list[str]]:
+    """Return the executable protected-checkout registry used by guards."""
+    roots, prefixes = _load_configured_registry()
+    return {
+        "canonical_roots": list(roots),
+        "allowed_worktree_prefixes": list(prefixes),
+    }
+
 
 # ---------------------------------------------------------------------------
 # Output type
@@ -74,15 +124,17 @@ def check_path_mutation(target_path: str) -> ProtectedCheckoutDecision:
     resolved = Path(target_path).resolve()
     resolved_str = str(resolved)
 
+    protected_roots, allowed_prefixes = _load_configured_registry()
+
     # 1. Check against protected canonical roots
-    for root in PROTECTED_CANONICAL_ROOTS:
+    for root in protected_roots:
         root_path = Path(root).resolve()
         root_str = str(root_path)
         if _is_under_or_equal(resolved_str, root_str):
             return _check_protected_root(target_path, root_str)
 
     # 2. Check allowed worktree prefixes
-    for prefix in ALLOWED_WORKTREE_PREFIXES:
+    for prefix in allowed_prefixes:
         prefix_path = Path(prefix).resolve()
         prefix_str = str(prefix_path)
         if _is_under(resolved_str, prefix_str):

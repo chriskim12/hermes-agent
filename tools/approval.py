@@ -1241,13 +1241,13 @@ def _check_protected_cwd_command(command: str, cwd: str) -> Optional[dict]:
     resolved_cwd_str = str(resolved_cwd)
 
     from tools.protected_checkout_policy import (
-        PROTECTED_CANONICAL_ROOTS,
+        effective_protected_checkout_registry,
         _is_under_or_equal,
         _check_protected_root,
     )
 
     matched_root = None
-    for root in PROTECTED_CANONICAL_ROOTS:
+    for root in effective_protected_checkout_registry()["canonical_roots"]:
         root_path = Path(root).resolve()
         root_str = str(root_path)
         if _is_under_or_equal(resolved_cwd_str, root_str):
