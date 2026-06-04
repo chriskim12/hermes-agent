@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 from unittest.mock import patch
 
@@ -31,12 +32,40 @@ def non_protected_dir():
 
 
 @pytest.fixture
-def allowed_worktree_dir():
-    """A dir mimicking an allowed worktree prefix."""
-    # Build a path under the allowed prefix
-    worktree_root = "/home/ubuntu/.hermes/hermes-agent/.worktrees"
-    with tempfile.TemporaryDirectory(dir=worktree_root, prefix="bo-237-test-") as d:
-        yield d
+def allowed_worktree_dir(tmp_path):
+    """A dir mimicking a configured allowed worktree prefix."""
+    worktree_root = tmp_path / "worktrees"
+    worktree_root.mkdir()
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={
+            "protected_checkouts": {
+                "canonical_roots": [str(tmp_path / "canonical")],
+                "allowed_worktree_prefixes": [str(worktree_root)],
+            }
+        },
+    ):
+        with tempfile.TemporaryDirectory(dir=worktree_root, prefix="bo-237-test-") as d:
+            yield d
+
+
+@pytest.fixture
+def protected_canonical_dir(tmp_path):
+    """A fake protected canonical checkout on a non-task branch."""
+    root = tmp_path / "canonical"
+    root.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+    (root / "package.json").write_text('{"name": "dailychingu"}\n')
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={
+            "protected_checkouts": {
+                "canonical_roots": [str(root)],
+                "allowed_worktree_prefixes": [str(tmp_path / "worktrees")],
+            }
+        },
+    ):
+        yield str(root)
 
 
 # ---------------------------------------------------------------------------
@@ -63,9 +92,9 @@ class TestWriteFileProtectedCheckout:
         assert "error" not in parsed
         assert os.path.isfile(path)
 
-    def test_protected_canonical_blocked(self):
+    def test_protected_canonical_blocked(self, protected_canonical_dir):
         """write_file to a protected canonical path is BLOCKED before creation."""
-        target = "/home/ubuntu/repos/dailychingu/some_file.txt"
+        target = os.path.join(protected_canonical_dir, "some_file.txt")
         # Ensure file doesn't exist
         assert not os.path.exists(target)
         pre_hash = _file_hash(target)
@@ -111,9 +140,9 @@ class TestPatchReplaceProtectedCheckout:
         with open(path) as f:
             assert "replaced" in f.read()
 
-    def test_protected_canonical_blocked(self):
+    def test_protected_canonical_blocked(self, protected_canonical_dir):
         """patch replace on protected canonical is BLOCKED, file unchanged."""
-        target = "/home/ubuntu/repos/dailychingu/package.json"
+        target = os.path.join(protected_canonical_dir, "package.json")
         # Ensure file exists and read current content
         assert os.path.isfile(target)
         with open(target) as f:
@@ -168,11 +197,12 @@ class TestPatchV4AProtectedCheckout:
         if "error" in parsed:
             assert "BLOCKED" not in parsed["error"]
 
-    def test_any_protected_target_blocks_entire_patch(self):
+    def test_any_protected_target_blocks_entire_patch(self, protected_canonical_dir):
         """V4A patch with any protected target blocks the whole patch BEFORE any apply."""
         # Use a legitimate non-protected target first, then a protected one
         with tempfile.TemporaryDirectory() as tmp:
             allowed_path = os.path.join(tmp, "allowed.txt")
+            protected_path = os.path.join(protected_canonical_dir, "some_file.txt")
             with open(allowed_path, "w") as f:
                 f.write("AAA\n")
             pre_hash = _hash_str("AAA\n")
@@ -185,7 +215,7 @@ class TestPatchV4AProtectedCheckout:
                 f"+OK\n"
                 f"*** End Patch\n"
                 f"*** Begin Patch\n"
-                f"*** Update File: /home/ubuntu/repos/dailychingu/some_file.txt\n"
+                f"*** Update File: {protected_path}\n"
                 f"@@ -\n"
                 f"-old\n"
                 f"+hacked\n"

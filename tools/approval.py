@@ -1418,8 +1418,11 @@ def check_all_command_guards(command: str, env_type: str,
     # check so even yolo/smart approval/mode=off cannot bypass it.
     is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command)
     if is_sudo_guess:
-        logger.warning("Sudo stdin guard block: %s",
-                       sudo_guess_desc, command[:200])
+        logger.warning(
+            "Sudo stdin guard block: %s (command: %s)",
+            sudo_guess_desc,
+            command[:200],
+        )
         return _sudo_stdin_block_result(sudo_guess_desc)
 
     # == Protected cwd guard ==

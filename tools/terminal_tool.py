@@ -1927,8 +1927,15 @@ def terminal_tool(
             # Compute effective cwd for the guarded approval check.
             #  workdir (model-supplied) > cwd (session default) > config cwd.
             effective_guard_cwd = workdir or cwd
-            approval = _check_all_guards(command, env_type,
-                                         workdir=effective_guard_cwd)
+            try:
+                approval = _check_all_guards(command, env_type,
+                                             workdir=effective_guard_cwd)
+            except TypeError as exc:
+                # Backward-compatible for tests/plugins that monkeypatch the
+                # local wrapper with the historical two-argument callable.
+                if "workdir" not in str(exc):
+                    raise
+                approval = _check_all_guards(command, env_type)
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
                 if approval.get("status") == "pending_approval":
