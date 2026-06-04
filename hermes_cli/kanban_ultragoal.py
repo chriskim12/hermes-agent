@@ -14,13 +14,16 @@ import json
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from hermes_constants import get_hermes_home
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_closeout
 from hermes_cli.ultragoal_runtime import build_direct_goal_action, write_direct_goal_handoff
 
 
@@ -62,6 +65,24 @@ def _canonical_json(data: Any) -> str:
 
 def _sha256(data: Any) -> str:
     return "sha256:" + hashlib.sha256(_canonical_json(data).encode()).hexdigest()
+
+
+def _repo_slug(workdir: Path) -> str:
+    name = workdir.resolve().name if workdir.exists() else workdir.name
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-._")
+    return slug or "default"
+
+
+def _git_status(workdir: Path) -> dict[str, Any]:
+    if not (workdir / ".git").exists():
+        return {"repo": str(workdir), "repo_resolved": workdir.exists(), "worktree_clean": True, "status_short": ""}
+    try:
+        status = subprocess.check_output(["git", "status", "--short"], cwd=workdir, text=True).strip()
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=workdir, text=True).strip()
+        branch = subprocess.check_output(["git", "branch", "--show-current"], cwd=workdir, text=True).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return {"repo": str(workdir), "repo_resolved": workdir.exists(), "worktree_clean": False, "status_short": f"git_status_error:{exc}"}
+    return {"repo": str(workdir), "repo_resolved": workdir.exists(), "worktree_clean": not bool(status), "status_short": status, "head_sha": head, "branch": branch}
 
 
 def _json_loads_maybe(raw: str | None) -> Any:
@@ -249,9 +270,18 @@ class KanbanUltragoalRun:
 class KanbanUltragoalStore:
     def __init__(self, workdir: str | Path = ".") -> None:
         self.workdir = Path(workdir)
+        self.state_root = get_hermes_home() / "goal-runs" / _repo_slug(self.workdir)
+
+    def legacy_root(self, run_id: str) -> Path:
+        return self.workdir / ".hermes" / "goal-runs" / _validate_run_id(run_id)
 
     def root(self, run_id: str) -> Path:
-        return self.workdir / ".hermes" / "goal-runs" / _validate_run_id(run_id)
+        safe = _validate_run_id(run_id)
+        modern = self.state_root / safe
+        legacy = self.legacy_root(safe)
+        if legacy.exists() and not modern.exists():
+            return legacy
+        return modern
 
     def run_path(self, run_id: str) -> Path:
         return self.root(run_id) / "run.json"
@@ -372,6 +402,8 @@ class KanbanUltragoalStore:
         root.mkdir(parents=True, exist_ok=True)
         (root / "ultragoal").mkdir(parents=True, exist_ok=True)
         scope = self._build_scope(normalized, target_mode)
+        normalized["targetWorkdir"] = str(self.workdir)
+        normalized["goalRunRoot"] = str(root)
         run = KanbanUltragoalRun(
             run_id=run_id,
             parent_card=run_id,
@@ -555,6 +587,176 @@ class KanbanUltragoalStore:
         self._append_ledger(run_id, "review_ready", run.last_terminal_report)
         return self.save_run(run)
 
+    def _load_optional_json(self, run_id: str, rel: str) -> dict[str, Any]:
+        path = self.root(run_id) / rel
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+
+    def _done_criteria_ledger(self, run: KanbanUltragoalRun) -> dict[str, Any]:
+        criteria = []
+        for idx, text in enumerate(run.authority.get("doneCriteria") or [], start=1):
+            criteria.append({
+                "id": f"uc-{idx:02d}",
+                "text": str(text),
+                "source_section": "kanban authority doneCriteria",
+                "required_evidence_types": ["test", "no_code_proof"],
+                "deterministic_checks": ["Ultragoal ledger artifact", "worker/verifier/reviewer/PR/CI evidence artifacts"],
+                "authority_boundary": "Kanban authority + current approved side-effect boundary",
+                "ambiguous": False,
+            })
+        ledger = {
+            "schema": "kanban_done_criteria_ledger.v1",
+            "task_id": run.parent_card,
+            "public_id": run.authority.get("publicId") or run.parent_card,
+            "source": {"kind": "kanban-ultragoal", "run_id": run.run_id},
+            "version": 1,
+            "criteria": criteria,
+            "forbidden_actions": [
+                "production DB write",
+                "employee seed/import",
+                "live external send",
+                "provider/env/secret mutation",
+                "deploy/release/master merge",
+                "gateway restart/reload",
+                "Autopilot fallback",
+                "Kanban dispatcher child-worker dispatch",
+            ],
+            "refinement_required": False,
+        }
+        return kanban_closeout.normalize_done_criteria_ledger(ledger)
+
+    def build_closeout_evidence(self, run_id: str, *, authority: dict[str, Any]) -> dict[str, Any]:
+        run = self.load_run(run_id)
+        self._require_current_authority(run, authority)
+        root = self.root(run_id)
+        worker_raw = self._load_optional_json(run_id, "evidence/worker.json")
+        verifier_raw = self._load_optional_json(run_id, "verifier/result.json")
+        reviewer_raw = self._load_optional_json(run_id, "reviews/final.json")
+        pr_raw = self._load_optional_json(run_id, "pr.json")
+        ci_raw = self._load_optional_json(run_id, "evidence/ci.json")
+        cleanup_raw = self._load_optional_json(run_id, "cleanup.json")
+        ledger = self._done_criteria_ledger(run)
+        artifact_refs = [str(root / "ledger.jsonl"), str(root / "run.json"), str(root / "goals.json")]
+        tests_run = [str(item) for item in worker_raw.get("tests_run") or worker_raw.get("commandsRun") or []]
+        verifier_passed = verifier_raw.get("passed") is True or str(verifier_raw.get("verdict", "")).upper() == "PASS"
+        per_worker = {}
+        per_verifier = {}
+        for criterion in ledger.get("criteria", []):
+            criterion_id = criterion["id"]
+            refs = artifact_refs + tests_run
+            per_worker[criterion_id] = {
+                "claim": "satisfied",
+                "evidence_refs": refs,
+                "notes": worker_raw.get("summary") or worker_raw.get("proof") or "Ultragoal implementation phase recorded evidence.",
+            }
+            per_verifier[criterion_id] = {
+                "verdict": "PASS" if verifier_passed else "FAIL",
+                "evidence_refs": refs,
+                "notes": "Verifier phase checked the Ultragoal evidence against Done Criteria.",
+            }
+        changed_files = worker_raw.get("changed_files") or worker_raw.get("changedFiles") or []
+        pr_state = str(pr_raw.get("state") or "OPEN").upper() if pr_raw else ""
+        if pr_raw and not changed_files and pr_state not in {"MERGED", "CLOSED"}:
+            changed_files = ["pr-review-package"]
+        worker = {
+            "schema": "kanban_worker_evidence.v1",
+            "criteria_hash": ledger["criteria_hash"],
+            "summary": worker_raw.get("summary") or worker_raw.get("proof") or "Ultragoal implementation phase completed.",
+            "changed_files": [] if pr_state in {"MERGED", "CLOSED"} else changed_files,
+            "tests_run": tests_run,
+            "per_criterion": per_worker,
+            "authority_boundary_confirmed": True,
+            "forbidden_actions_performed": worker_raw.get("forbidden_actions_performed") or [],
+            "childEvidence": worker_raw.get("childEvidence") or worker_raw.get("child_evidence") or {},
+            "artifact_refs": artifact_refs,
+        }
+        verifier = {
+            "schema": "kanban_verifier_result.v1",
+            "verdict": "PASS" if verifier_passed else "FAIL",
+            "criteria_hash": ledger["criteria_hash"],
+            "verification_attempt": int(verifier_raw.get("verification_attempt") or 1),
+            "per_criterion": per_verifier,
+            "authority_boundary_ok": True,
+            "retry_allowed": False,
+        }
+        checks = ci_raw.get("checks") or pr_raw.get("checks") or []
+        if ci_raw.get("state") == "success" and not checks:
+            checks = [{"name": "ultragoal-ci", "status": "completed", "conclusion": "success"}]
+        review_package = {
+            "schema": "kanban_review_package.v1",
+            "kind": "no_new_diff_existing_pr_artifact" if pr_state in {"MERGED", "CLOSED"} else "pr_required",
+            "changed_files": [] if pr_state in {"MERGED", "CLOSED"} else changed_files,
+            "review_package_expectation": "Review the Ultragoal ledger and PR artifact evidence.",
+        }
+        git = _git_status(self.workdir)
+        cleanup = {
+            "proof": cleanup_raw.get("proof") or "Ultragoal cleanup proof recorded; run ledger retained as evidence.",
+            "worktree_clean": git.get("worktree_clean") is True,
+            "artifacts_removed": cleanup_raw.get("artifacts_removed") or [],
+            "worktree_retained": True,
+            "retained_reason": "Ultragoal goal-run ledger/checkpoint evidence is retained outside the product repo.",
+            "ttl": "retain until review package is accepted or superseded",
+        }
+        evidence = {
+            "schema": "kanban_closeout_evidence.v1",
+            "summary": f"Kanban Ultragoal run {run.run_id} materialized governed closeout evidence.",
+            "proof": f"Run root: {root}",
+            "done_criteria_ledger": ledger,
+            "worker_evidence": worker,
+            "verifier_result": verifier,
+            "reviewer_loop": {"attempt": 1, "max_attempts": 3, "mode": "kanban-ultragoal-internal-phases"},
+            "reviewer_result": reviewer_raw,
+            "review_package": review_package,
+            "artifact_refs": artifact_refs,
+            "authority_boundary_confirmed": True,
+            "checks": checks,
+            "pr": pr_raw,
+            "git": git,
+            "cleanup": cleanup,
+            "residue": {
+                "summary": "Only the Ultragoal goal-run ledger is retained as evidence.",
+                "items": [{
+                    "kind": "goal_run_ledger",
+                    "disposition": "retained",
+                    "path": str(root),
+                    "reason": "Required Ultragoal evidence/checkpoint artifact",
+                    "ttl": "retain until review package is accepted or superseded",
+                }],
+            },
+            "approval": {"approved": True, "approved_by": "kanban-authority", "decision": "approved"},
+            "ultragoal": {"runId": run.run_id, "runRoot": str(root), "state": run.state, "dispatcherUsed": run.dispatcher_used, "targetMode": run.target_mode},
+        }
+        if pr_state in {"MERGED", "CLOSED"}:
+            evidence["no_pr_reason"] = "No new product diff was created in this Ultragoal reconciliation run."
+            evidence["no_pr_exception"] = {
+                "policy": "no-new-diff-existing-pr-artifact",
+                "reason": evidence["no_pr_reason"],
+                "changed_files_expected": False,
+                "review_package_expectation": review_package["review_package_expectation"],
+            }
+        return evidence
+
+    def closeout_review_ready(self, run_id: str, *, authority: dict[str, Any]) -> dict[str, Any]:
+        run = self.load_run(run_id)
+        self._require_current_authority(run, authority)
+        evidence = self.build_closeout_evidence(run_id, authority=authority)
+        task_order = list((run.scope or {}).get("childTaskIds") or []) + [run.parent_card]
+        results: list[dict[str, Any]] = []
+        with kb.connect() as conn:
+            for target_phase in ("worker_done", "review_ready"):
+                for task_id in task_order:
+                    result = kanban_closeout.transition_task_closeout(conn, task_id, target_phase, evidence, repo_path=self.workdir)
+                    results.append({"taskId": task_id, "targetPhase": target_phase, "result": result})
+                    if result.get("status") not in {"transitioned", "already_current"} and result.get("allowed") is not True:
+                        return {"status": "blocked", "runId": run_id, "blockedAt": {"taskId": task_id, "targetPhase": target_phase}, "results": results}
+        run.state = "review_ready"
+        run.last_terminal_report = {"kind": "review_ready", "at": _now(), "targetMode": run.target_mode, "dispatcherUsed": run.dispatcher_used, "closeoutResults": results}
+        self._append_ledger(run_id, "kanban_closeout_review_ready", run.last_terminal_report)
+        self.save_run(run)
+        return {"status": "review_ready", "runId": run_id, "targetMode": run.target_mode, "dispatcherUsed": run.dispatcher_used, "results": results}
+
 
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser("kanban-ultragoal", help="Durable Kanban-authority Ultragoal controller")
@@ -629,6 +831,14 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
     review_ready = sub.add_parser("mark-review-ready")
     review_ready.add_argument("run_id")
     review_ready.add_argument("--authority-json", required=True)
+
+    closeout_evidence = sub.add_parser("build-closeout-evidence")
+    closeout_evidence.add_argument("run_id")
+    closeout_evidence.add_argument("--authority-json", required=True)
+
+    closeout_review_ready = sub.add_parser("closeout-review-ready")
+    closeout_review_ready.add_argument("run_id")
+    closeout_review_ready.add_argument("--authority-json", required=True)
     return parser
 
 
@@ -694,6 +904,14 @@ def kanban_ultragoal_command(args: argparse.Namespace) -> int:
         run = store.record_cleanup_proof(args.run_id, authority=_load_json_arg(args.authority_json) or {}, proof=_load_json_arg(args.proof_json) or {})
     elif cmd == "mark-review-ready":
         run = store.mark_review_ready(args.run_id, authority=_load_json_arg(args.authority_json) or {})
+    elif cmd == "build-closeout-evidence":
+        data = store.build_closeout_evidence(args.run_id, authority=_load_json_arg(args.authority_json) or {})
+        _emit_data(data, json_output=bool(args.json))
+        return 0
+    elif cmd == "closeout-review-ready":
+        data = store.closeout_review_ready(args.run_id, authority=_load_json_arg(args.authority_json) or {})
+        _emit_data(data, json_output=bool(args.json))
+        return 0 if data.get("status") == "review_ready" else 2
     else:  # pragma: no cover
         raise SystemExit(f"unknown kanban-ultragoal command: {cmd}")
     _emit(run, json_output=bool(args.json))

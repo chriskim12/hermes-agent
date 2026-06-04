@@ -31,7 +31,7 @@ def test_start_creates_canonical_run_root_with_subordinate_ultragoal_root(tmp_pa
     store = KanbanUltragoalStore(tmp_path)
     run = store.start("BO-203", authority=_authority(), root_objective="Bring one reviewed PR")
 
-    root = tmp_path / ".hermes" / "goal-runs" / "BO-203"
+    root = store.root("BO-203")
     assert run.run_id == "BO-203"
     assert (root / "run.json").exists()
     assert (root / "authority.json").exists()
@@ -164,7 +164,7 @@ def test_pr_ready_requires_complete_artifact_package(tmp_path):
     store.record_cleanup_proof("BO-203", authority=_authority(), proof={"status": "passed", "retained": []})
     run = store.mark_review_ready("BO-203", authority=_authority())
     assert run.state == "review_ready"
-    package = json.loads((tmp_path / ".hermes" / "goal-runs" / "BO-203" / "pr.json").read_text())
+    package = json.loads((store.root("BO-203") / "pr.json").read_text())
     assert package["url"].endswith("/1")
 
 
@@ -173,7 +173,7 @@ def test_force_start_clears_stale_ledger_and_evidence(tmp_path):
 
     store = KanbanUltragoalStore(tmp_path)
     store.start("BO-203", authority=_authority(), root_objective="first")
-    stale = tmp_path / ".hermes" / "goal-runs" / "BO-203" / "evidence" / "old.json"
+    stale = store.root("BO-203") / "evidence" / "old.json"
     stale.parent.mkdir(parents=True)
     stale.write_text("{}")
     store.record_worker_done("BO-203", authority=_authority(), evidence={"commandsRun": []})

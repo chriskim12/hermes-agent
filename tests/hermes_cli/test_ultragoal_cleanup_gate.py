@@ -54,7 +54,7 @@ def test_ultragoal_records_retained_worktree_reason_and_ttl(tmp_path):
         },
     )
 
-    cleanup = json.loads((tmp_path / ".hermes" / "goal-runs" / "BO-203" / "cleanup.json").read_text())
+    cleanup = json.loads((store.root("BO-203") / "cleanup.json").read_text())
     assert cleanup["readOnlyProof"] is True
     assert cleanup["retained"][0]["reason"] == "PR review iteration"
     assert cleanup["retained"][0]["ttl"] == "after PR merge/close"
@@ -105,7 +105,7 @@ def test_ultragoal_parent_terminal_report_includes_child_cleanup_matrix(tmp_path
     store = KanbanUltragoalStore(tmp_path)
     store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
     store.record_cleanup_proof("BO-203", authority=authority, proof={"status": "passed", "childCleanup": {"BO-204": {"status": "retained", "ttl": "after PR"}}})
-    cleanup = json.loads((tmp_path / ".hermes" / "goal-runs" / "BO-203" / "cleanup.json").read_text())
+    cleanup = json.loads((store.root("BO-203") / "cleanup.json").read_text())
     assert cleanup["childCleanup"]["BO-204"]["status"] == "retained"
 
 
