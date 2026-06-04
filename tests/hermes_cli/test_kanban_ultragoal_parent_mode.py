@@ -38,7 +38,7 @@ def test_parent_ultragoal_never_calls_kanban_dispatcher(tmp_path, monkeypatch):
     )
     run = store.tick("BO-203", authority=_authority(children=[{"id": "BO-204", "relationType": "hierarchy"}]))
 
-    run_json = json.loads((tmp_path / ".hermes" / "goal-runs" / "BO-203" / "run.json").read_text())
+    run_json = json.loads((store.root("BO-203") / "run.json").read_text())
     assert run_json["dispatcherUsed"] is False
     assert run.pending_action["executor"] == "hermes-direct-goal-loop"
 
@@ -56,7 +56,7 @@ def test_parent_ultragoal_uses_hierarchy_children_as_subgoals(tmp_path):
     store = KanbanUltragoalStore(tmp_path)
     store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
 
-    goals = json.loads((tmp_path / ".hermes" / "goal-runs" / "BO-203" / "goals.json").read_text())
+    goals = json.loads((store.root("BO-203") / "goals.json").read_text())
     assert goals["targetMode"] == "parent"
     assert [g["sourceTaskId"] for g in goals["goals"]] == ["BO-204", "BO-206"]
     assert "BO-205" not in [g["sourceTaskId"] for g in goals["goals"]]
@@ -117,3 +117,135 @@ def test_parent_child_snapshot_hashes_pair_ids_with_their_own_child_rows(tmp_pat
 
     assert run.scope["childTaskIds"] == ["BO-204"]
     assert run.scope["childSnapshotHashes"] == {"BO-204": _sha256(child)}
+
+
+def test_goal_runs_are_stored_outside_target_workdir(tmp_path, monkeypatch):
+    from hermes_cli.kanban_ultragoal import KanbanUltragoalStore
+
+    hermes_home = tmp_path / "hermes-home"
+    target_repo = tmp_path / "product-repo"
+    hermes_home.mkdir()
+    target_repo.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    store = KanbanUltragoalStore(target_repo)
+    run = store.start(
+        "BO-203",
+        authority=_authority(children=[{"id": "BO-204", "relationType": "hierarchy"}]),
+        root_objective="Complete parent",
+        target_mode="parent",
+    )
+
+    assert run.run_id == "BO-203"
+    assert not (target_repo / ".hermes" / "goal-runs" / "BO-203").exists()
+    assert store.root("BO-203") == hermes_home / "goal-runs" / "product-repo" / "BO-203"
+    assert (hermes_home / "goal-runs" / "product-repo" / "BO-203" / "ledger.jsonl").exists()
+
+
+def test_build_closeout_evidence_materializes_governed_schema(tmp_path, monkeypatch):
+    from hermes_cli.kanban_ultragoal import KanbanUltragoalStore
+
+    hermes_home = tmp_path / "hermes-home"
+    target_repo = tmp_path / "product-repo"
+    hermes_home.mkdir()
+    target_repo.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    authority = _authority(children=[{"id": "BO-204", "relationType": "hierarchy", "title": "child"}])
+    store = KanbanUltragoalStore(target_repo)
+    store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
+    store.record_worker_done("BO-203", authority=authority, evidence={"summary": "implemented", "childEvidence": {"BO-204": {"summary": "ok"}}})
+    store.record_verifier_result("BO-203", authority=authority, result={"passed": True, "perCriterion": {"dc-1": "ok"}})
+    store.record_reviewer_result("BO-203", authority=authority, result={"recommendation": "APPROVE", "securityConcerns": [], "logicErrors": []})
+    store.record_pr_created("BO-203", authority=authority, pr={"url": "https://github.com/o/r/pull/1", "number": 1, "headSha": "abc"})
+    store.record_ci_result("BO-203", authority=authority, ci={"state": "success", "headSha": "abc", "checks": [{"name": "ci", "status": "completed", "conclusion": "success"}]})
+    store.record_cleanup_proof("BO-203", authority=authority, proof={"status": "passed", "retained": []})
+
+    evidence = store.build_closeout_evidence("BO-203", authority=authority)
+
+    assert evidence["done_criteria_ledger"]["schema"] == "kanban_done_criteria_ledger.v1"
+    assert evidence["worker_evidence"]["schema"] == "kanban_worker_evidence.v1"
+    assert evidence["verifier_result"]["schema"] == "kanban_verifier_result.v1"
+    assert evidence["worker_evidence"]["criteria_hash"] == evidence["done_criteria_ledger"]["criteria_hash"]
+    assert evidence["verifier_result"]["criteria_hash"] == evidence["done_criteria_ledger"]["criteria_hash"]
+    assert evidence["authority_boundary_confirmed"] is True
+    assert evidence["git"]["status_short"] == ""
+    assert evidence["residue"]["items"][0]["disposition"] == "retained"
+    assert evidence["review_package"]["kind"] == "pr_required"
+
+
+def test_closeout_review_ready_applies_children_before_parent(tmp_path, monkeypatch):
+    from hermes_cli.kanban_ultragoal import KanbanUltragoalStore
+
+    hermes_home = tmp_path / "hermes-home"
+    target_repo = tmp_path / "product-repo"
+    hermes_home.mkdir()
+    target_repo.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    authority = _authority(children=[{"id": "BO-204", "relationType": "hierarchy"}, {"id": "BO-205", "relationType": "hierarchy"}])
+    store = KanbanUltragoalStore(target_repo)
+    store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
+    store.record_worker_done("BO-203", authority=authority, evidence={"summary": "implemented", "childEvidence": {"BO-204": "ok", "BO-205": "ok"}})
+    store.record_verifier_result("BO-203", authority=authority, result={"passed": True})
+    store.record_reviewer_result("BO-203", authority=authority, result={"recommendation": "APPROVE", "securityConcerns": [], "logicErrors": []})
+    store.record_pr_created("BO-203", authority=authority, pr={"url": "https://github.com/o/r/pull/1", "number": 1, "headSha": "abc"})
+    store.record_ci_result("BO-203", authority=authority, ci={"state": "success", "headSha": "abc", "checks": [{"name": "ci", "status": "completed", "conclusion": "success"}]})
+    store.record_cleanup_proof("BO-203", authority=authority, proof={"status": "passed", "retained": []})
+
+    calls = []
+
+    def fake_transition(conn, task_id, target_phase, evidence=None, **kwargs):
+        calls.append((task_id, target_phase))
+        return {"status": "transitioned", "verification": {"allowed": True, "blockers": []}}
+
+    monkeypatch.setattr("hermes_cli.kanban_ultragoal.kanban_closeout.transition_task_closeout", fake_transition)
+
+    result = store.closeout_review_ready("BO-203", authority=authority)
+
+    assert result["status"] == "review_ready"
+    assert calls == [
+        ("BO-204", "worker_done"),
+        ("BO-205", "worker_done"),
+        ("BO-203", "worker_done"),
+        ("BO-204", "review_ready"),
+        ("BO-205", "review_ready"),
+        ("BO-203", "review_ready"),
+    ]
+
+
+def test_cli_build_closeout_evidence_json(tmp_path, monkeypatch, capsys):
+    import argparse
+    from hermes_cli.kanban_ultragoal import KanbanUltragoalStore, build_parser, kanban_ultragoal_command
+
+    hermes_home = tmp_path / "hermes-home"
+    target_repo = tmp_path / "product-repo"
+    hermes_home.mkdir()
+    target_repo.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    authority = _authority(children=[{"id": "BO-204", "relationType": "hierarchy"}])
+    store = KanbanUltragoalStore(target_repo)
+    store.start("BO-203", authority=authority, root_objective="Complete parent", target_mode="parent")
+    store.record_worker_done("BO-203", authority=authority, evidence={"summary": "implemented"})
+    store.record_verifier_result("BO-203", authority=authority, result={"passed": True})
+    store.record_reviewer_result("BO-203", authority=authority, result={"recommendation": "APPROVE", "securityConcerns": [], "logicErrors": []})
+    store.record_pr_created("BO-203", authority=authority, pr={"url": "https://github.com/o/r/pull/1", "number": 1, "headSha": "abc"})
+    store.record_ci_result("BO-203", authority=authority, ci={"state": "success", "headSha": "abc"})
+    store.record_cleanup_proof("BO-203", authority=authority, proof={"status": "passed", "retained": []})
+
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd")
+    build_parser(sub)
+    args = parser.parse_args([
+        "kanban-ultragoal",
+        "--workdir",
+        str(target_repo),
+        "--json",
+        "build-closeout-evidence",
+        "BO-203",
+        "--authority-json",
+        json.dumps(authority),
+    ])
+
+    assert kanban_ultragoal_command(args) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["schema"] == "kanban_closeout_evidence.v1"
+    assert out["worker_evidence"]["schema"] == "kanban_worker_evidence.v1"
