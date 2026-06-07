@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_closeout
+from hermes_cli import kanban_relation_drift
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.profiles import get_active_profile_name, get_profile_dir, seed_profile_skills
 
@@ -772,6 +773,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_stats.add_argument("--json", action="store_true")
 
+    # --- relation-drift ---
+    kanban_relation_drift.add_parser(sub)
+
     # --- notify subscribe / list / remove ---
     p_nsub = sub.add_parser(
         "notify-subscribe",
@@ -1058,6 +1062,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "daemon":   _cmd_daemon,
         "watch":    _cmd_watch,
         "stats":    _cmd_stats,
+        "relation-drift": kanban_relation_drift.run_cli,
         "log":      _cmd_log,
         "runs":     _cmd_runs,
         "heartbeat": _cmd_heartbeat,
