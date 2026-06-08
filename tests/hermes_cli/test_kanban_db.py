@@ -2306,6 +2306,27 @@ def test_autopilot_parent_rollup_rejects_done_child_without_verifier_pass(kanban
     assert parent_task.review_phase is None
 
 
+def test_autopilot_parent_report_rejects_done_child_without_verifier_pass(kanban_home):
+    with kb.connect() as conn:
+        # Given: a legacy child is marked done without the verifier PASS required by parent closeout.
+        parent = kb.create_task(conn, title="autopilot parent", triage=True)
+        child = kb.create_task(conn, title="legacy done child", assignee="alice")
+        kb.link_tasks(conn, parent, child, relation_type="hierarchy")
+        assert kb.complete_task(conn, child, result="legacy done without verifier") is True
+
+        # When: Autopilot builds the parent report.
+        report = kb.autopilot_parent_report(conn, parent)
+
+    # Then: the report agrees with parent closeout and does not call the parent complete.
+    matrix_child = report["parent_child_matrix"]["children"][0]
+    assert report["parentScopeComplete"] is False
+    assert report["parentRollupState"] == "review_blocked"
+    assert report["remainingChildren"] == [child]
+    assert report["cannotFinalCloseoutParent"] is True
+    assert matrix_child["rollup_state"] == "review_blocked"
+    assert matrix_child["reason"] == "child_missing_verifier_pass"
+
+
 def test_autopilot_parent_report_exposes_incomplete_child_matrix_and_next_child(kanban_home, monkeypatch):
     from hermes_cli import profiles
 
@@ -2334,6 +2355,84 @@ def test_autopilot_parent_report_exposes_incomplete_child_matrix_and_next_child(
     assert matrix["nextRequiredChild"] == second
     assert matrix["remainingChildren"] == [second]
     assert {row["task_id"] for row in matrix["children"]} == {first, second}
+
+
+def test_autopilot_parent_report_names_parent_rollup_state_for_mixed_child_scope(kanban_home, monkeypatch):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name in {"alice", "verifier"})
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="autopilot parent", triage=True)
+        complete_child = kb.create_task(conn, title="finished child", assignee="alice")
+        partial_child = kb.create_task(conn, title="ready child", assignee="alice", goal_mode=True)
+        review_blocked_child = kb.create_task(conn, title="worker done child", assignee="alice")
+        decision_child = kb.create_task(conn, title="decision child", triage=True)
+        for child in (complete_child, partial_child, review_blocked_child, decision_child):
+            kb.link_tasks(conn, parent, child, relation_type="hierarchy")
+        assert kb.apply_closeout_transition(
+            conn,
+            complete_child,
+            review_phase="review_ready",
+            closeout_evidence=_review_ready_child_evidence(complete_child),
+        ) is True
+        conn.execute(
+            "UPDATE tasks SET admission_snapshot=? WHERE id=?",
+            (json.dumps({"ready_contract": _structured_ready_contract()}), partial_child),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='blocked', review_phase='worker_done', closeout_evidence=? WHERE id=?",
+            (json.dumps({"schema": "kanban_closeout_evidence.v1", "summary": "worker only"}), review_blocked_child),
+        )
+
+        report = kb.autopilot_parent_report(conn, parent)
+
+    matrix = report["parent_child_matrix"]
+    child_states = {row["task_id"]: row["rollup_state"] for row in matrix["children"]}
+    assert matrix["parentRollupState"] == "review_blocked"
+    assert matrix["countsByRollupState"] == {
+        "complete": 1,
+        "partial": 1,
+        "review_blocked": 1,
+        "needs_user_decision": 1,
+    }
+    assert child_states == {
+        complete_child: "complete",
+        partial_child: "partial",
+        review_blocked_child: "review_blocked",
+        decision_child: "needs_user_decision",
+    }
+    assert report["parentRollupState"] == "review_blocked"
+
+
+def test_autopilot_parent_rollup_block_preserves_child_scope_state_in_package(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="autopilot parent", triage=True)
+        finished = kb.create_task(conn, title="finished child", assignee="alice")
+        pending = kb.create_task(conn, title="pending verifier child", assignee="alice")
+        kb.link_tasks(conn, parent, finished, relation_type="hierarchy")
+        kb.link_tasks(conn, parent, pending, relation_type="hierarchy")
+        assert kb.apply_closeout_transition(
+            conn,
+            finished,
+            review_phase="review_ready",
+            closeout_evidence=_review_ready_child_evidence(finished),
+        ) is True
+        conn.execute(
+            "UPDATE tasks SET status='blocked', review_phase='worker_done', closeout_evidence=? WHERE id=?",
+            (json.dumps({"schema": "kanban_closeout_evidence.v1", "summary": "worker only"}), pending),
+        )
+
+        rollup = kb.autopilot_rollup_parent_review_ready(conn, parent, apply=False)
+
+    matrix = rollup["package"]["parent_child_matrix"]
+    assert rollup["status"] == "blocked"
+    assert rollup["parentRollupState"] == "review_blocked"
+    assert matrix["parentRollupState"] == "review_blocked"
+    assert matrix["remainingChildren"] == [pending]
+    assert {row["task_id"]: row["rollup_state"] for row in matrix["children"]} == {
+        finished: "complete",
+        pending: "review_blocked",
+    }
 
 
 def test_parent_scoped_dispatch_blocks_stale_admission_only_conflict(kanban_home, monkeypatch):
@@ -2479,7 +2578,12 @@ def test_governed_goal_worker_completion_hands_off_to_worker_done(kanban_home):
                 "changed_files": [],
                 "forbidden_actions_performed": False,
                 "goal_mode_observed_by_worker": True,
-                "commands": {"dc-01-confirm-repo-exists": "test -d /tmp/repo"},
+                    "no_pr_reason": "No repository diff was produced by this verifier-loop fixture.",
+                    "proof": "Read-only worker evidence was captured for the verifier-loop fixture.",
+                    "checks": [{"name": "local verifier fixture", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+                    "residue": {"summary": "No residue remains after the verifier-loop fixture."},
+                    "cleanup": {"proof": "No external QA resources were spawned by this DB fixture.", "worktree_clean": True, "artifacts_removed": True},
+                    "commands": {"dc-01-confirm-repo-exists": "test -d /tmp/repo"},
             },
         ) is True
 
@@ -2582,7 +2686,12 @@ def test_governed_goal_worker_completion_accepts_forbidden_side_effects_alias(ka
                 "forbidden_side_effects": False,
                 "read_only": True,
                 "goal_mode_observed_by_worker": True,
-                "commands": {"dc-01-confirm-repo-exists": "test -d /tmp/repo"},
+                    "no_pr_reason": "No repository diff was produced by this verifier-loop fixture.",
+                    "proof": "Read-only worker evidence was captured for the verifier-loop fixture.",
+                    "checks": [{"name": "local verifier fixture", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+                    "residue": {"summary": "No residue remains after the verifier-loop fixture."},
+                    "cleanup": {"proof": "No external QA resources were spawned by this DB fixture.", "worktree_clean": True, "artifacts_removed": True},
+                    "commands": {"dc-01-confirm-repo-exists": "test -d /tmp/repo"},
             },
         ) is True
 
@@ -2637,6 +2746,120 @@ def test_review_ready_transition_closes_active_verifier_run(kanban_home):
         ).fetchone()
         assert dict(run) == {"status": "review_ready", "outcome": "completed"}
 
+def test_parent_child_verifier_fail_requeues_worker_then_pass_completes_parent(
+    kanban_home, all_assignees_spawnable
+):
+    spawned: list[tuple[str, str]] = []
+    contexts: list[str] = []
+
+    def fake_spawn(task, workspace):
+        spawned.append((task.id, task.assignee or ""))
+        with kb.connect() as context_conn:
+            contexts.append(kb.build_worker_context(context_conn, task.id))
+
+    def worker_metadata() -> dict[str, object]:
+        return {
+            "changed_files": [],
+            "forbidden_actions_performed": False,
+            "goal_mode_observed_by_worker": True,
+            "no_pr_reason": "No repository diff was produced by this verifier-loop fixture.",
+            "proof": "Read-only worker evidence was captured for the verifier-loop fixture.",
+            "checks": [
+                {
+                    "name": "local verifier fixture",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                }
+            ],
+            "residue": {"summary": "No residue remains after the verifier-loop fixture."},
+            "cleanup": {
+                "proof": "No external QA resources were spawned by this DB fixture.",
+                "worktree_clean": True,
+                "artifacts_removed": True,
+            },
+            "commands": {"dc-01-confirm-repo-exists": "test -d /tmp/repo"},
+        }
+
+    def verifier_result(evidence: dict, verdict: str) -> dict:
+        ledger = evidence["done_criteria_ledger"]
+        criteria = ledger["criteria"]
+        per_criterion = {
+            item["id"]: {
+                "verdict": verdict,
+                "evidence": "worker evidence reviewed",
+            }
+            for item in criteria
+        }
+        return {
+            "schema": "kanban_verifier_result.v1",
+            "criteria_hash": ledger["criteria_hash"],
+            "verdict": verdict,
+            "per_criterion": per_criterion,
+            "authority_boundary_ok": True,
+            "retry_allowed": verdict == "fail",
+            "remediation_goal": "Repair failed verifier criterion in the existing child task.",
+            "verification_attempt": evidence["reviewer_loop"].get("attempt", 1),
+        }
+
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="autopilot parent", triage=True)
+        child = kb.create_task(
+            conn,
+            title="child governed by verifier loop",
+            body=_governed_worker_body(),
+            assignee="alice",
+            goal_mode=True,
+        )
+        kb.link_tasks(conn, parent, child, relation_type="hierarchy")
+
+        assert kb.complete_task(
+            conn,
+            child,
+            summary="first worker evidence",
+            metadata=worker_metadata(),
+        ) is True
+        handoff = kb.get_task(conn, child)
+        assert handoff.status == "blocked"
+        assert handoff.review_phase == "worker_done"
+
+        verifier_tick = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        assert (child, "verifier") in [(item[0], item[1]) for item in verifier_tick.spawned]
+
+        fail_evidence = dict(kb.get_task(conn, child).closeout_evidence)
+        fail_evidence["verifier_result"] = verifier_result(fail_evidence, "fail")
+        fail_result = kc.transition_task_closeout(conn, child, "review_ready", fail_evidence)
+
+        assert fail_result["status"] == "remediation_requested", fail_result
+        retry_child = kb.get_task(conn, child)
+        assert retry_child.status == "ready"
+        assert retry_child.review_phase is None
+        assert retry_child.assignee == "alice"
+        assert retry_child.closeout_evidence["remediation_request"]["kind"] == "verifier_fail"
+        assert kb.autopilot_parent_report(conn, parent)["parentScopeComplete"] is False
+
+        spawned.clear()
+        contexts.clear()
+        worker_tick = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        assert (child, "alice") in [(item[0], item[1]) for item in worker_tick.spawned]
+        assert any(
+            "Closeout remediation mode" in context and "verifier_fail" in context
+            for context in contexts
+        ), contexts
+
+        assert kb.complete_task(
+            conn,
+            child,
+            summary="fixed worker evidence",
+            metadata=worker_metadata(),
+        ) is True
+        pass_evidence = dict(kb.get_task(conn, child).closeout_evidence)
+        pass_evidence["verifier_result"] = verifier_result(pass_evidence, "pass")
+        pass_result = kc.transition_task_closeout(conn, child, "review_ready", pass_evidence)
+        parent_report = kb.autopilot_parent_report(conn, parent)
+
+    assert pass_result["status"] == "transitioned"
+    assert parent_report["parentScopeComplete"] is True
+    assert parent_report["parentRollupState"] == "complete"
 
 def test_legacy_worker_completion_without_reviewer_loop_still_finalizes(kanban_home):
     with kb.connect() as conn:

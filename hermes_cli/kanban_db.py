@@ -998,17 +998,34 @@ def _slugify_for_ready_gate(text: str) -> str:
     return slug or "criterion"
 
 
+def _extract_body_field(body: str, field_name: str) -> str:
+    prefix = field_name.strip().lower()
+    for raw_line in str(body or "").splitlines():
+        stripped = raw_line.strip()
+        if not stripped or ":" not in stripped:
+            continue
+        label, value = stripped.split(":", 1)
+        if label.strip().lower() == prefix:
+            return value.strip()
+    return ""
+
+
+def _extract_body_forbidden_actions(body: str) -> list[str]:
+    risk_flags = _extract_body_field(body, "Risk flags")
+    if not risk_flags:
+        return []
+    lowered = risk_flags.lower()
+    marker = " are forbidden"
+    if marker in lowered:
+        risk_flags = risk_flags[: lowered.index(marker)]
+    risk_flags = risk_flags.replace(" and ", ",")
+    return _string_list(part.strip(" .") for part in risk_flags.split(","))
+
+
 def _extract_body_done_criteria(body: str) -> list[dict[str, Any]]:
-    """Extract a simple done-criteria ledger from card markdown.
-
-    Creation-time cards often have human-authored ``Done criteria:`` sections
-    rather than a structured ledger yet.  The strict ready gate only needs a
-    deterministic ledger candidate; the closeout path later enforces the full
-    evidence/verifier contracts.
-    """
-
     criteria: list[dict[str, Any]] = []
     collecting = False
+    authority_boundary = _extract_body_field(body, "Authority boundary")
     for raw_line in str(body or "").splitlines():
         stripped = raw_line.strip()
         if not stripped:
@@ -1023,6 +1040,7 @@ def _extract_body_done_criteria(body: str) -> list[dict[str, Any]]:
                         "id": f"dc-{len(criteria) + 1:02d}-{_slugify_for_ready_gate(inline)}",
                         "text": inline,
                         "source_section": "Done criteria",
+                        "authority_boundary": authority_boundary,
                     }
                 )
             continue
@@ -1038,6 +1056,7 @@ def _extract_body_done_criteria(body: str) -> list[dict[str, Any]]:
                     "id": f"dc-{len(criteria) + 1:02d}-{_slugify_for_ready_gate(text)}",
                     "text": text,
                     "source_section": "Done criteria",
+                    "authority_boundary": authority_boundary,
                 }
             )
         elif criteria:
@@ -1186,7 +1205,7 @@ def _worker_completion_closeout_evidence(
             "public_id": row["public_id"] if "public_id" in row.keys() else None,
             "source": {"kind": "task_body", "section": "Done criteria"},
             "criteria": _extract_body_done_criteria(body),
-            "forbidden_actions": _string_list(md.get("forbidden_actions")),
+            "forbidden_actions": _string_list(md.get("forbidden_actions")) or _extract_body_forbidden_actions(body),
         }
     )
     criteria = ledger.get("criteria") or []
@@ -1251,9 +1270,19 @@ def _worker_completion_closeout_evidence(
                 "kind": "no_pr_evidence" if not md.get("pr") else "pr_evidence",
                 "changed_files": md.get("changed_files", []),
             },
+            "authority_boundary_confirmed": authority_ok,
+            "evidence": {
+                "changed_files": md.get("changed_files", []),
+                "artifact_refs": evidence_refs,
+                "proof": md.get("proof") or summary,
+            },
             "metadata": md,
         }
     )
+    for optional_key in ("no_pr_reason", "checks", "residue", "cleanup"):
+        optional_value = md.get(optional_key)
+        if optional_value:
+            closeout[optional_key] = optional_value
     return closeout
 
 
@@ -3129,7 +3158,7 @@ def set_autopilot_enabled(
 def _autopilot_subscription_targets(conn: sqlite3.Connection, parent_task_id: str) -> list[str]:
     """Return parent + hierarchy descendants for parent Autopilot notifications."""
     task_ids = [parent_task_id]
-    for child_id in sorted(hierarchy_descendant_ids(conn, parent_task_id)):
+    for child_id in hierarchy_descendant_ids(conn, parent_task_id):
         if child_id not in task_ids:
             task_ids.append(child_id)
     return task_ids
@@ -3241,19 +3270,66 @@ def disable_autopilot(conn: sqlite3.Connection, *, board: str = DEFAULT_BOARD, r
     return get_autopilot_state(conn, board=board)
 
 
+def _autopilot_child_rollup_state(item: Mapping[str, Any]) -> str:
+    review_phase = str(item.get("review_phase") or "")
+    status = str(item.get("status") or "")
+    if review_phase in {"review_ready", "closed"} or status in {"done", "archived"}:
+        verifier_verdict = str(item.get("verifier_verdict") or "").strip().lower()
+        if verifier_verdict == "pass" and item.get("verification_allowed") is not False:
+            return "complete"
+        return "review_blocked"
+    if review_phase or status == "blocked":
+        return "review_blocked"
+    if item.get("autopilot_eligible") is True or status in {"ready", "running"}:
+        return "partial"
+    return "needs_user_decision"
+
+
+def _autopilot_child_block_reason(item: Mapping[str, Any], rollup_state: str) -> str | None:
+    if rollup_state == "complete":
+        return None
+    if rollup_state == "partial":
+        return "child_scope_incomplete"
+    if rollup_state == "needs_user_decision":
+        return "child_needs_user_decision"
+    review_phase = str(item.get("review_phase") or "")
+    status = str(item.get("status") or "")
+    if review_phase in {"review_ready", "closed"} or status in {"done", "archived"}:
+        if item.get("verification_allowed") is False:
+            return "child_verification_blocked"
+        verifier_verdict = str(item.get("verifier_verdict") or "").strip().lower()
+        if verifier_verdict != "pass":
+            return "child_missing_verifier_pass"
+    return "child_review_blocked"
+
+
+def _autopilot_parent_rollup_state(child_states: Mapping[str, int]) -> str:
+    if not child_states or set(child_states) == {"complete"}:
+        return "complete"
+    if child_states.get("review_blocked", 0) > 0:
+        return "review_blocked"
+    if child_states.get("needs_user_decision", 0) > 0:
+        return "needs_user_decision"
+    return "partial"
+
+
 def _autopilot_parent_child_matrix(children: list[dict[str, Any]]) -> dict[str, Any]:
     matrix_children: list[dict[str, Any]] = []
     remaining: list[str] = []
     ready_remaining: list[str] = []
+    counts_by_rollup_state: dict[str, int] = {}
     for item in children:
         task_id = str(item.get("task_id") or "")
         review_phase = str(item.get("review_phase") or "")
         status = str(item.get("status") or "")
-        terminal = review_phase in {"review_ready", "closed"}
+        rollup_state = _autopilot_child_rollup_state(item)
+        terminal = rollup_state == "complete"
+        counts_by_rollup_state[rollup_state] = counts_by_rollup_state.get(rollup_state, 0) + 1
         if not terminal:
             remaining.append(task_id)
             if item.get("autopilot_eligible") is True:
                 ready_remaining.append(task_id)
+        reason = _autopilot_child_block_reason(item, rollup_state)
         matrix_children.append(
             {
                 "task_id": task_id,
@@ -3263,13 +3339,17 @@ def _autopilot_parent_child_matrix(children: list[dict[str, Any]]) -> dict[str, 
                 "review_phase": review_phase or None,
                 "autopilot_eligible": item.get("autopilot_eligible") is True,
                 "complete": terminal,
-                "reason": None if terminal else "child_not_review_ready",
+                "rollup_state": rollup_state,
+                "reason": reason,
             }
         )
     next_required = (ready_remaining or remaining or [None])[0]
     complete = not remaining
+    parent_rollup_state = _autopilot_parent_rollup_state(counts_by_rollup_state)
     return {
         "parentScopeComplete": complete,
+        "parentRollupState": parent_rollup_state,
+        "countsByRollupState": counts_by_rollup_state,
         "remainingChildren": remaining,
         "nextRequiredChild": next_required,
         "cannotFinalCloseoutParent": not complete,
@@ -3292,10 +3372,12 @@ def autopilot_parent_report(conn: sqlite3.Connection, parent_task_id: str) -> di
         SELECT id, {public_expr}, title, status, assignee, review_phase, closeout_evidence, admission_snapshot
           FROM tasks
          WHERE id IN ({placeholders})
-         ORDER BY public_id, created_at, id
+         ORDER BY created_at ASC, id ASC
         """,
         tuple(descendants),
     ).fetchall()
+    descendant_order = {task_id: idx for idx, task_id in enumerate(descendants)}
+    rows = sorted(rows, key=lambda row: descendant_order.get(row["id"], len(descendant_order)))
     children: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
     review_ready: list[dict[str, Any]] = []
@@ -3322,6 +3404,11 @@ def autopilot_parent_report(conn: sqlite3.Connection, parent_task_id: str) -> di
             if row["review_phase"]:
                 ready_reason_codes.append("review_phase_not_empty")
             ready_reason_codes = list(dict.fromkeys(ready_reason_codes))
+        evidence = _json_loads_maybe(row["closeout_evidence"]) or {}
+        if not isinstance(evidence, dict):
+            evidence = {}
+        verifier = evidence.get("verifier_result") if isinstance(evidence.get("verifier_result"), Mapping) else {}
+        verification = evidence.get("verification") if isinstance(evidence.get("verification"), Mapping) else {}
         item = {
             "task_id": row["id"],
             "public_id": row["public_id"] or row["id"],
@@ -3333,6 +3420,8 @@ def autopilot_parent_report(conn: sqlite3.Connection, parent_task_id: str) -> di
             "autopilot_eligible": report_autopilot_eligible,
             "ready_gate_result": admission_snapshot.get("ready_gate_result"),
             "ready_gate_reason_codes": ready_reason_codes,
+            "verifier_verdict": verifier.get("verdict"),
+            "verification_allowed": verification.get("allowed"),
         }
         children.append(item)
         key = row["review_phase"] or row["status"]
@@ -3357,6 +3446,8 @@ def autopilot_parent_report(conn: sqlite3.Connection, parent_task_id: str) -> di
         "autopilot_blocked": autopilot_blocked,
         "parent_child_matrix": parent_child_matrix,
         "parentScopeComplete": parent_child_matrix["parentScopeComplete"],
+        "parentRollupState": parent_child_matrix["parentRollupState"],
+        "countsByRollupState": parent_child_matrix["countsByRollupState"],
         "remainingChildren": parent_child_matrix["remainingChildren"],
         "nextRequiredChild": parent_child_matrix["nextRequiredChild"],
         "cannotFinalCloseoutParent": parent_child_matrix["cannotFinalCloseoutParent"],
@@ -3415,10 +3506,12 @@ def autopilot_rollup_parent_review_ready(
         SELECT id, {public_expr}, title, status, review_phase, closeout_evidence
           FROM tasks
          WHERE id IN ({placeholders})
-         ORDER BY public_id, created_at, id
+         ORDER BY created_at ASC, id ASC
         """,
         tuple(descendants),
     ).fetchall()
+    descendant_order = {task_id: idx for idx, task_id in enumerate(descendants)}
+    rows = sorted(rows, key=lambda row: descendant_order.get(row["id"], len(descendant_order)))
     children: list[dict[str, Any]] = []
     blockers: list[str] = []
     for row in rows:
@@ -3429,12 +3522,18 @@ def autopilot_rollup_parent_review_ready(
         verification = evidence.get("verification") if isinstance(evidence.get("verification"), Mapping) else {}
         review_phase = str(row["review_phase"] or "")
         status = str(row["status"] or "")
-        child_ok = (
-            review_phase in {"review_ready", "closed"}
-            or status in {"done", "archived"}
-        )
-        if not child_ok:
-            if review_phase == "worker_done":
+        rollup_state = _autopilot_child_rollup_state(item)
+        if rollup_state == "complete":
+            if str(verifier.get("verdict") or "").strip().lower() != "pass":
+                blockers.append("child_missing_verifier_pass")
+            if verification.get("allowed") is False:
+                blockers.append("child_verification_blocked")
+            continue
+        if rollup_state == "review_blocked":
+            reason = _autopilot_child_block_reason(item, rollup_state)
+            if reason in {"child_missing_verifier_pass", "child_verification_blocked"}:
+                blockers.append(reason)
+            elif review_phase == "worker_done":
                 blockers.append("child_waiting_for_verifier")
             elif status == "running":
                 blockers.append("child_running")
@@ -3443,16 +3542,20 @@ def autopilot_rollup_parent_review_ready(
             else:
                 blockers.append("child_not_review_ready")
             continue
-        if str(verifier.get("verdict") or "").strip().lower() != "pass":
-            blockers.append("child_missing_verifier_pass")
-        if verification.get("allowed") is False:
-            blockers.append("child_verification_blocked")
+        if rollup_state == "partial":
+            blockers.append("child_scope_incomplete")
+            continue
+        blockers.append("child_needs_user_decision")
     blockers = list(dict.fromkeys(blockers))
+    parent_child_matrix = _autopilot_parent_child_matrix(children)
     package = {
         "schema": "kanban_parent_review_package.v1",
         "parent_task_id": parent,
         "parent_public_id": _task_public_id(conn, parent),
         "children": children,
+        "parent_child_matrix": parent_child_matrix,
+        "parentRollupState": parent_child_matrix["parentRollupState"],
+        "countsByRollupState": parent_child_matrix["countsByRollupState"],
         "review_package": {
             "schema": "kanban_parent_review_package.v1",
             "kind": "grouped_parent_evidence",
@@ -3476,6 +3579,7 @@ def autopilot_rollup_parent_review_ready(
             "reason": "children_not_review_ready",
             "parent_task_id": parent,
             "blockers": blockers,
+            "parentRollupState": parent_child_matrix["parentRollupState"],
             "package": package,
             "applied": False,
         }
@@ -3489,6 +3593,7 @@ def autopilot_rollup_parent_review_ready(
             "reason": "parent_already_review_ready",
             "parent_task_id": parent,
             "blockers": [],
+            "parentRollupState": parent_child_matrix["parentRollupState"],
             "package": package,
             "applied": False,
         }
@@ -3518,6 +3623,7 @@ def autopilot_rollup_parent_review_ready(
                     "reason": "parent_review_ready_write_failed",
                     "parent_task_id": parent,
                     "blockers": ["parent_review_ready_write_failed"],
+                    "parentRollupState": parent_child_matrix["parentRollupState"],
                     "package": package,
                     "applied": False,
                 }
@@ -3537,6 +3643,7 @@ def autopilot_rollup_parent_review_ready(
         "reason": "parent_review_ready_grouped_package",
         "parent_task_id": parent,
         "blockers": [],
+        "parentRollupState": parent_child_matrix["parentRollupState"],
         "package": package,
         "applied": bool(apply),
     }
@@ -3733,7 +3840,7 @@ def autopilot_prepare_parent(
         SELECT id, {public_expr}, title, status, assignee, goal_mode, review_phase, admission_snapshot
           FROM tasks
          WHERE id IN ({placeholders})
-         ORDER BY public_id, created_at, id
+         ORDER BY created_at ASC, id ASC
         """,
         tuple(descendants),
     ).fetchall()
@@ -4367,7 +4474,7 @@ def unlink_tasks(
 
 def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     rows = conn.execute(
-        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY rowid",
         (task_id,),
     ).fetchall()
     return [r["parent_id"] for r in rows]
@@ -4375,13 +4482,13 @@ def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
 
 def child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     rows = conn.execute(
-        "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+        "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY rowid",
         (task_id,),
     ).fetchall()
     return [r["child_id"] for r in rows]
 
 
-def hierarchy_descendant_ids(conn: sqlite3.Connection, task_id: str) -> set[str]:
+def hierarchy_descendant_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     """Return all hierarchy descendants for an umbrella/parent task.
 
     Parent-scoped Autopilot should operate on the approved child hierarchy,
@@ -4390,21 +4497,21 @@ def hierarchy_descendant_ids(conn: sqlite3.Connection, task_id: str) -> set[str]
     """
     rows = conn.execute(
         """
-        WITH RECURSIVE descendants(id) AS (
-            SELECT child_id
+        WITH RECURSIVE descendants(id, path) AS (
+            SELECT child_id, printf('%012d', rowid)
               FROM task_links
              WHERE parent_id = ? AND relation_type = 'hierarchy'
-            UNION
-            SELECT l.child_id
+            UNION ALL
+            SELECT l.child_id, d.path || '.' || printf('%012d', l.rowid)
               FROM task_links l
               JOIN descendants d ON l.parent_id = d.id
              WHERE l.relation_type = 'hierarchy'
         )
-        SELECT id FROM descendants ORDER BY id
+        SELECT id FROM descendants ORDER BY path
         """,
         (task_id,),
     ).fetchall()
-    return {str(r["id"]) for r in rows}
+    return list(dict.fromkeys(str(r["id"]) for r in rows))
 
 
 def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Optional[str]]]:
@@ -8260,7 +8367,7 @@ def dispatch_once(
     # dependency edges into scope membership; they remain scheduling gates.
     parent_scope_ids: Optional[set[str]] = None
     if parent_task_id:
-        parent_scope_ids = hierarchy_descendant_ids(conn, str(parent_task_id))
+        parent_scope_ids = set(hierarchy_descendant_ids(conn, str(parent_task_id)))
 
     ready_rows = conn.execute(
         "SELECT * FROM tasks "
