@@ -3241,19 +3241,52 @@ def disable_autopilot(conn: sqlite3.Connection, *, board: str = DEFAULT_BOARD, r
     return get_autopilot_state(conn, board=board)
 
 
+def _autopilot_child_rollup_state(item: Mapping[str, Any]) -> str:
+    review_phase = str(item.get("review_phase") or "")
+    status = str(item.get("status") or "")
+    if review_phase in {"review_ready", "closed"}:
+        return "complete"
+    if review_phase or status == "blocked":
+        return "review_blocked"
+    if item.get("autopilot_eligible") is True or status in {"ready", "running"}:
+        return "partial"
+    return "needs_user_decision"
+
+
+def _autopilot_parent_rollup_state(child_states: Mapping[str, int]) -> str:
+    if not child_states or set(child_states) == {"complete"}:
+        return "complete"
+    if child_states.get("review_blocked", 0) > 0:
+        return "review_blocked"
+    if child_states.get("needs_user_decision", 0) > 0:
+        return "needs_user_decision"
+    return "partial"
+
+
 def _autopilot_parent_child_matrix(children: list[dict[str, Any]]) -> dict[str, Any]:
     matrix_children: list[dict[str, Any]] = []
     remaining: list[str] = []
     ready_remaining: list[str] = []
+    counts_by_rollup_state: dict[str, int] = {}
     for item in children:
         task_id = str(item.get("task_id") or "")
         review_phase = str(item.get("review_phase") or "")
         status = str(item.get("status") or "")
-        terminal = review_phase in {"review_ready", "closed"}
+        rollup_state = _autopilot_child_rollup_state(item)
+        terminal = rollup_state == "complete"
+        counts_by_rollup_state[rollup_state] = counts_by_rollup_state.get(rollup_state, 0) + 1
         if not terminal:
             remaining.append(task_id)
             if item.get("autopilot_eligible") is True:
                 ready_remaining.append(task_id)
+        if terminal:
+            reason = None
+        elif rollup_state == "review_blocked":
+            reason = "child_review_blocked"
+        elif rollup_state == "partial":
+            reason = "child_scope_incomplete"
+        else:
+            reason = "child_needs_user_decision"
         matrix_children.append(
             {
                 "task_id": task_id,
@@ -3263,13 +3296,17 @@ def _autopilot_parent_child_matrix(children: list[dict[str, Any]]) -> dict[str, 
                 "review_phase": review_phase or None,
                 "autopilot_eligible": item.get("autopilot_eligible") is True,
                 "complete": terminal,
-                "reason": None if terminal else "child_not_review_ready",
+                "rollup_state": rollup_state,
+                "reason": reason,
             }
         )
     next_required = (ready_remaining or remaining or [None])[0]
     complete = not remaining
+    parent_rollup_state = _autopilot_parent_rollup_state(counts_by_rollup_state)
     return {
         "parentScopeComplete": complete,
+        "parentRollupState": parent_rollup_state,
+        "countsByRollupState": counts_by_rollup_state,
         "remainingChildren": remaining,
         "nextRequiredChild": next_required,
         "cannotFinalCloseoutParent": not complete,
@@ -3292,7 +3329,7 @@ def autopilot_parent_report(conn: sqlite3.Connection, parent_task_id: str) -> di
         SELECT id, {public_expr}, title, status, assignee, review_phase, closeout_evidence, admission_snapshot
           FROM tasks
          WHERE id IN ({placeholders})
-         ORDER BY public_id, created_at, id
+         ORDER BY created_at ASC, id ASC
         """,
         tuple(descendants),
     ).fetchall()
@@ -3357,6 +3394,8 @@ def autopilot_parent_report(conn: sqlite3.Connection, parent_task_id: str) -> di
         "autopilot_blocked": autopilot_blocked,
         "parent_child_matrix": parent_child_matrix,
         "parentScopeComplete": parent_child_matrix["parentScopeComplete"],
+        "parentRollupState": parent_child_matrix["parentRollupState"],
+        "countsByRollupState": parent_child_matrix["countsByRollupState"],
         "remainingChildren": parent_child_matrix["remainingChildren"],
         "nextRequiredChild": parent_child_matrix["nextRequiredChild"],
         "cannotFinalCloseoutParent": parent_child_matrix["cannotFinalCloseoutParent"],
@@ -3415,7 +3454,7 @@ def autopilot_rollup_parent_review_ready(
         SELECT id, {public_expr}, title, status, review_phase, closeout_evidence
           FROM tasks
          WHERE id IN ({placeholders})
-         ORDER BY public_id, created_at, id
+         ORDER BY created_at ASC, id ASC
         """,
         tuple(descendants),
     ).fetchall()
@@ -3448,11 +3487,15 @@ def autopilot_rollup_parent_review_ready(
         if verification.get("allowed") is False:
             blockers.append("child_verification_blocked")
     blockers = list(dict.fromkeys(blockers))
+    parent_child_matrix = _autopilot_parent_child_matrix(children)
     package = {
         "schema": "kanban_parent_review_package.v1",
         "parent_task_id": parent,
         "parent_public_id": _task_public_id(conn, parent),
         "children": children,
+        "parent_child_matrix": parent_child_matrix,
+        "parentRollupState": parent_child_matrix["parentRollupState"],
+        "countsByRollupState": parent_child_matrix["countsByRollupState"],
         "review_package": {
             "schema": "kanban_parent_review_package.v1",
             "kind": "grouped_parent_evidence",
@@ -3476,6 +3519,7 @@ def autopilot_rollup_parent_review_ready(
             "reason": "children_not_review_ready",
             "parent_task_id": parent,
             "blockers": blockers,
+            "parentRollupState": parent_child_matrix["parentRollupState"],
             "package": package,
             "applied": False,
         }
@@ -3489,6 +3533,7 @@ def autopilot_rollup_parent_review_ready(
             "reason": "parent_already_review_ready",
             "parent_task_id": parent,
             "blockers": [],
+            "parentRollupState": parent_child_matrix["parentRollupState"],
             "package": package,
             "applied": False,
         }
@@ -3518,6 +3563,7 @@ def autopilot_rollup_parent_review_ready(
                     "reason": "parent_review_ready_write_failed",
                     "parent_task_id": parent,
                     "blockers": ["parent_review_ready_write_failed"],
+                    "parentRollupState": parent_child_matrix["parentRollupState"],
                     "package": package,
                     "applied": False,
                 }
@@ -3537,6 +3583,7 @@ def autopilot_rollup_parent_review_ready(
         "reason": "parent_review_ready_grouped_package",
         "parent_task_id": parent,
         "blockers": [],
+        "parentRollupState": parent_child_matrix["parentRollupState"],
         "package": package,
         "applied": bool(apply),
     }
@@ -3733,7 +3780,7 @@ def autopilot_prepare_parent(
         SELECT id, {public_expr}, title, status, assignee, goal_mode, review_phase, admission_snapshot
           FROM tasks
          WHERE id IN ({placeholders})
-         ORDER BY public_id, created_at, id
+         ORDER BY created_at ASC, id ASC
         """,
         tuple(descendants),
     ).fetchall()

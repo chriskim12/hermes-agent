@@ -2336,6 +2336,84 @@ def test_autopilot_parent_report_exposes_incomplete_child_matrix_and_next_child(
     assert {row["task_id"] for row in matrix["children"]} == {first, second}
 
 
+def test_autopilot_parent_report_names_parent_rollup_state_for_mixed_child_scope(kanban_home, monkeypatch):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name in {"alice", "verifier"})
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="autopilot parent", triage=True)
+        complete_child = kb.create_task(conn, title="finished child", assignee="alice")
+        partial_child = kb.create_task(conn, title="ready child", assignee="alice", goal_mode=True)
+        review_blocked_child = kb.create_task(conn, title="worker done child", assignee="alice")
+        decision_child = kb.create_task(conn, title="decision child", triage=True)
+        for child in (complete_child, partial_child, review_blocked_child, decision_child):
+            kb.link_tasks(conn, parent, child, relation_type="hierarchy")
+        assert kb.apply_closeout_transition(
+            conn,
+            complete_child,
+            review_phase="review_ready",
+            closeout_evidence=_review_ready_child_evidence(complete_child),
+        ) is True
+        conn.execute(
+            "UPDATE tasks SET admission_snapshot=? WHERE id=?",
+            (json.dumps({"ready_contract": _structured_ready_contract()}), partial_child),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='blocked', review_phase='worker_done', closeout_evidence=? WHERE id=?",
+            (json.dumps({"schema": "kanban_closeout_evidence.v1", "summary": "worker only"}), review_blocked_child),
+        )
+
+        report = kb.autopilot_parent_report(conn, parent)
+
+    matrix = report["parent_child_matrix"]
+    child_states = {row["task_id"]: row["rollup_state"] for row in matrix["children"]}
+    assert matrix["parentRollupState"] == "review_blocked"
+    assert matrix["countsByRollupState"] == {
+        "complete": 1,
+        "partial": 1,
+        "review_blocked": 1,
+        "needs_user_decision": 1,
+    }
+    assert child_states == {
+        complete_child: "complete",
+        partial_child: "partial",
+        review_blocked_child: "review_blocked",
+        decision_child: "needs_user_decision",
+    }
+    assert report["parentRollupState"] == "review_blocked"
+
+
+def test_autopilot_parent_rollup_block_preserves_child_scope_state_in_package(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="autopilot parent", triage=True)
+        finished = kb.create_task(conn, title="finished child", assignee="alice")
+        pending = kb.create_task(conn, title="pending verifier child", assignee="alice")
+        kb.link_tasks(conn, parent, finished, relation_type="hierarchy")
+        kb.link_tasks(conn, parent, pending, relation_type="hierarchy")
+        assert kb.apply_closeout_transition(
+            conn,
+            finished,
+            review_phase="review_ready",
+            closeout_evidence=_review_ready_child_evidence(finished),
+        ) is True
+        conn.execute(
+            "UPDATE tasks SET status='blocked', review_phase='worker_done', closeout_evidence=? WHERE id=?",
+            (json.dumps({"schema": "kanban_closeout_evidence.v1", "summary": "worker only"}), pending),
+        )
+
+        rollup = kb.autopilot_rollup_parent_review_ready(conn, parent, apply=False)
+
+    matrix = rollup["package"]["parent_child_matrix"]
+    assert rollup["status"] == "blocked"
+    assert rollup["parentRollupState"] == "review_blocked"
+    assert matrix["parentRollupState"] == "review_blocked"
+    assert matrix["remainingChildren"] == [pending]
+    assert {row["task_id"]: row["rollup_state"] for row in matrix["children"]} == {
+        finished: "complete",
+        pending: "review_blocked",
+    }
+
+
 def test_parent_scoped_dispatch_blocks_stale_admission_only_conflict(kanban_home, monkeypatch):
     from hermes_cli import profiles
 
