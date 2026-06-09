@@ -1562,3 +1562,55 @@ def test_reviewer_fail_remediation_request_is_idempotent(kanban_home, git_repo):
     assert second["status"] == "remediation_requested"
     assert second["reason"] == "reviewer_fail_remediation_already_queued"
     assert len(events) == 1
+
+
+def test_get_task_resolves_public_id_and_closeout_accepts_public_id(kanban_home):
+    with kb.connect() as conn:
+        task_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+        if "public_id" not in task_cols:
+            pytest.skip("legacy test schema has no public_id column")
+        task_id = kb.create_task(conn, title="public id task")
+        conn.execute("UPDATE tasks SET public_id = ? WHERE id = ?", ("DC-098", task_id))
+        conn.commit()
+
+        task = kb.get_task(conn, "DC-098")
+
+    assert task is not None
+    assert task.id == task_id
+
+
+def test_review_package_uses_merged_pr_evidence_even_without_changed_files(git_repo):
+    head = _head(git_repo)
+    evidence = _review_ready_evidence(
+        git_repo,
+        pr={
+            "number": 208,
+            "state": "MERGED",
+            "is_draft": False,
+            "head_sha": "feature-sha",
+            "merge_commit_sha": head,
+            "live": True,
+        },
+        evidence={"proof": "develop landing proof"},
+        changed_files=[],
+        git={"head_sha": head, "merge_commit_contained_in_origin_develop": True},
+    )
+
+    blockers = closeout._review_package_blockers(evidence)
+
+    assert "missing_no_pr_reason" not in blockers
+    assert "missing_no_pr_artifact_or_proof" not in blockers
+    assert "stale_pr" not in blockers
+    assert evidence["review_package"]["kind"] == "pr_evidence"
+
+
+def test_authority_boundary_accepts_structured_develop_landing_ledger():
+    assert closeout._authority_boundary_confirmed(
+        {
+            "boundaries_confirmed": {
+                "develop_landing_authorized": True,
+                "production_deploy_authorized": False,
+            },
+            "forbidden_actions_performed": [],
+        }
+    ) is True

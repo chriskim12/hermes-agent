@@ -316,6 +316,10 @@ def _has_worker_evidence(evidence: Mapping[str, Any]) -> bool:
 def _cleanup_proven(evidence: Mapping[str, Any]) -> tuple[bool, str | None]:
     cleanup = _as_mapping(evidence.get("cleanup"))
     proof = _text(cleanup.get("proof")) or _text(evidence.get("cleanup_proof"))
+    if not proof and cleanup.get("proof") is not None:
+        proof = json.dumps(cleanup.get("proof"), sort_keys=True, default=str)
+    if not proof and cleanup.get("structured") is True:
+        proof = "structured cleanup evidence present"
     if not proof:
         return False, "missing_cleanup_proof"
 
@@ -471,9 +475,14 @@ def _check_closed_pr(evidence: Mapping[str, Any]) -> list[str]:
     if not merge_commit:
         merge_commit = _text(_as_mapping(pr.get("mergeCommit")).get("oid"))
     git_head = _text(_as_mapping(evidence.get("git")).get("head_sha"))
+    contained = (
+        evidence.get("merge_commit_contained_in_origin_develop") is True
+        or _as_mapping(evidence.get("git")).get("merge_commit_contained_in_origin_develop") is True
+        or _as_mapping(evidence.get("git")).get("pr_head_contained_in_origin_develop") is True
+    )
     if not pr_head:
         blockers.append("missing_pr_head_sha")
-    elif git_head and pr_head != git_head and merge_commit != git_head:
+    elif git_head and pr_head != git_head and merge_commit != git_head and not contained:
         blockers.append("stale_pr")
     return blockers
 
@@ -631,7 +640,9 @@ def _validate_verifier_result_contract(evidence: Mapping[str, Any], ledger: Mapp
         item = _as_mapping(per_criterion.get(cid))
         if not item or _lower(item.get("verdict")) != "pass":
             blockers.append("criterion_verifier_not_pass")
-    if result.get("authority_boundary_ok") is not True:
+    if result.get("authority_boundary_ok") is False:
+        blockers.append("verifier_authority_boundary_failed")
+    elif result.get("authority_boundary_ok") is not True and not _authority_boundary_confirmed(evidence):
         blockers.append("verifier_authority_boundary_failed")
     return list(dict.fromkeys(blockers))
 
@@ -805,9 +816,22 @@ def _has_no_pr_artifact_or_proof(evidence: Mapping[str, Any]) -> bool:
 
 def _authority_boundary_confirmed(evidence: Mapping[str, Any]) -> bool:
     value = evidence.get("authority_boundary_confirmed")
+    if value is True:
+        return True
     if value is None:
         value = evidence.get("boundaries_confirmed")
-    return value is True
+    if value is True:
+        return True
+    if isinstance(value, Mapping):
+        # Develop-landing evidence often records the boundary as a ledger of
+        # allowed/non-allowed side effects. Treat it as confirmed when it has at
+        # least one explicit allowed scope and no positive forbidden-action flag.
+        if value.get("forbidden_actions_performed") is True:
+            return False
+        if evidence.get("forbidden_actions_performed") not in (None, False, []):
+            return False
+        return any(v is True for v in value.values())
+    return False
 
 
 def _review_package_blockers(evidence: Mapping[str, Any]) -> list[str]:
@@ -820,13 +844,34 @@ def _review_package_blockers(evidence: Mapping[str, Any]) -> list[str]:
 
     blockers: list[str] = []
     changed_files = _review_package_changed_files(evidence)
+    pr_candidates = [
+        pr for pr in _extract_pr_candidates(evidence)
+        if any(_text(pr.get(key)) for key in ("number", "url", "state", "head_sha", "headRefOid", "merge_commit_sha"))
+    ]
     if changed_files:
-        blockers.extend(_check_pr(evidence))
+        pr_candidates_for_diff = pr_candidates
+        if pr_candidates_for_diff and _lower(pr_candidates_for_diff[0].get("state")) in {"merged", "closed"}:
+            blockers.extend(_check_closed_pr(evidence))
+        else:
+            blockers.extend(_check_pr(evidence))
         if isinstance(evidence, dict):
             mutable_evidence = cast(MutableMapping[str, Any], evidence)
             mutable_evidence.setdefault(
                 "review_package",
                 {"schema": "kanban_review_package.v1", "kind": "pr_required", "changed_files": changed_files},
+            )
+    elif pr_candidates:
+        # Post-develop reconciliation may have no changed_files array in the
+        # evidence object because the PR is already merged. A live PR object is
+        # still a PR-backed review package, not a no-PR exception path.
+        pr = pr_candidates[0]
+        state = _lower(pr.get("state"))
+        blockers.extend(_check_closed_pr(evidence) if state in {"merged", "closed"} else _check_pr(evidence))
+        if isinstance(evidence, dict):
+            mutable_evidence = cast(MutableMapping[str, Any], evidence)
+            mutable_evidence.setdefault(
+                "review_package",
+                {"schema": "kanban_review_package.v1", "kind": "pr_evidence", "changed_files": changed_files},
             )
     else:
         if not _no_pr_reason(evidence):

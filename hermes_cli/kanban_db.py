@@ -2982,24 +2982,37 @@ def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> l
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
-    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    resolved = resolve_task_ref(conn, task_id) or task_id
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (resolved,)).fetchone()
     return Task.from_row(row) if row else None
 
 
 def resolve_task_ref(conn: sqlite3.Connection, ref: str) -> Optional[str]:
-    """Resolve an internal task id or public id to the canonical task id."""
+    """Resolve an internal task id, public id, or alias to the canonical task id.
+
+    Ambiguous refs fail closed by returning ``None``. Operators commonly speak in
+    public ids such as ``DC-098``; closeout/show paths must not require internal
+    ``t_*`` ids or the Kanban ledger drifts from the human-facing SSOT.
+    """
     token = (ref or "").strip()
     if not token:
         return None
     task_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    candidates: list[str] = []
+    row = conn.execute("SELECT id FROM tasks WHERE id = ? LIMIT 1", (token,)).fetchone()
+    if row:
+        candidates.append(str(row["id"]))
     if "public_id" in task_cols:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE id = ? OR public_id = ? LIMIT 1",
-            (token, token),
-        ).fetchone()
-    else:
-        row = conn.execute("SELECT id FROM tasks WHERE id = ? LIMIT 1", (token,)).fetchone()
-    return str(row["id"]) if row else None
+        rows = conn.execute("SELECT id FROM tasks WHERE public_id = ?", (token,)).fetchall()
+        candidates.extend(str(row["id"]) for row in rows)
+    alias_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_aliases)")}
+    if {"task_id", "alias"}.issubset(alias_cols):
+        rows = conn.execute("SELECT task_id FROM task_aliases WHERE alias = ?", (token,)).fetchall()
+        candidates.extend(str(row["task_id"]) for row in rows)
+    unique = list(dict.fromkeys(candidates))
+    if len(unique) != 1:
+        return None
+    return unique[0]
 
 
 def _task_public_id(conn: sqlite3.Connection, task_id: Optional[str]) -> Optional[str]:
