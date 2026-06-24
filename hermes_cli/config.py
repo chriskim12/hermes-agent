@@ -863,6 +863,33 @@ DEFAULT_CONFIG = {
         "backend": "",           # shared fallback — applies to both search and extract
         "search_backend": "",    # per-capability override for web_search (e.g. "searxng")
         "extract_backend": "",   # per-capability override for web_extract (e.g. "native")
+        "public_route_resolver": {
+            "enabled": False,
+            "phase0_before_primary": False,
+            "fallback_after_primary": True,
+            "provider_failure_triggers": [
+                "empty_content",
+                "blocked",
+                "challenge",
+                "suspect_ok",
+                "inaccessible",
+            ],
+            "timeout_s": 20,
+            "allow_learning": True,
+            "learned_store": "",
+            "include_diagnostics": False,
+            "browser_recon": {
+                "enabled": False,
+                "mode": "structured_escalation",
+                "max_candidate_urls": 10,
+            },
+            "public_only": {
+                "enforce": True,
+                "allow_private_urls": False,
+                "allow_credentials": False,
+                "stop_on_auth_or_paywall": True,
+            },
+        },
     },
 
     "browser": {

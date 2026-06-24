@@ -1,0 +1,5 @@
+name: web-insane-search
+version: 0.1.0
+description: "Vendored insane-search public retrieval engine for staged Hermes integration."
+author: NousResearch
+kind: backend

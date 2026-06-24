@@ -192,6 +192,98 @@ def _get_capability_backend(capability: str) -> str:
     return _get_backend()
 
 
+def _public_route_resolver_config() -> Dict[str, Any]:
+    cfg = _load_web_config().get("public_route_resolver") or {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _public_route_resolver_enabled() -> bool:
+    cfg = _public_route_resolver_config()
+    return bool(cfg.get("enabled") and cfg.get("fallback_after_primary", True))
+
+
+def _provider_result_needs_public_resolver(
+    result: Dict[str, Any],
+    cfg: Dict[str, Any],
+) -> bool:
+    triggers = set(cfg.get("provider_failure_triggers") or [])
+    content = (result.get("content") or result.get("raw_content") or "").strip()
+    error = str(result.get("error") or "").lower()
+    verdict = str(result.get("verdict") or "").lower()
+    if "empty_content" in triggers and not content and not result.get("error"):
+        return True
+    if "inaccessible" in triggers and result.get("error"):
+        return True
+    if "blocked" in triggers and ("blocked" in error or verdict == "blocked"):
+        return True
+    if "challenge" in triggers and ("challenge" in error or verdict == "challenge"):
+        return True
+    if "suspect_ok" in triggers and verdict == "suspect_ok":
+        return True
+    return False
+
+
+def _public_route_result_to_extract_item(result: Any, original: Dict[str, Any]) -> Dict[str, Any]:
+    payload = result.to_dict()
+    item: Dict[str, Any] = {
+        "url": original.get("url", "") or payload.get("url") or payload.get("final_url") or "",
+        "title": payload.get("title") or original.get("title", ""),
+        "content": payload.get("content") or "",
+        "raw_content": payload.get("raw_content") or payload.get("content") or "",
+    }
+    if payload.get("final_url"):
+        item["final_url"] = payload["final_url"]
+    if not payload.get("success"):
+        item["error"] = payload.get("public_boundary", {}).get("stop_reason") or payload.get("verdict") or "public_route_resolver_failed"
+    return item
+
+
+async def _maybe_apply_public_route_resolver(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not _public_route_resolver_enabled():
+        return results
+    cfg = _public_route_resolver_config()
+    include_diagnostics = bool(cfg.get("include_diagnostics"))
+    resolved: List[Dict[str, Any]] = []
+    from plugins.web.insane_search.adapter import resolve_public_url
+
+    for result in results:
+        url = str(result.get("url") or "")
+        if not url or not _provider_result_needs_public_resolver(result, cfg):
+            resolved.append(result)
+            continue
+        try:
+            mapped = await asyncio.to_thread(
+                resolve_public_url,
+                url,
+                include_diagnostics=include_diagnostics,
+                timeout=int(cfg.get("timeout_s") or 20),
+                enable_phase0=bool(cfg.get("phase0_before_primary", False)),
+                enable_learning=bool(cfg.get("allow_learning", True)),
+            )
+        except Exception as exc:
+            if include_diagnostics:
+                result = {
+                    **result,
+                    "public_route_resolver": {
+                        "success": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                }
+            resolved.append(result)
+            continue
+        payload = mapped.to_dict()
+        if payload.get("success") or payload.get("source_type") == "policy_stop":
+            item = _public_route_result_to_extract_item(mapped, result)
+            if include_diagnostics:
+                item["public_route_resolver"] = payload
+            resolved.append(item)
+        else:
+            if include_diagnostics:
+                result = {**result, "public_route_resolver": payload}
+            resolved.append(result)
+    return resolved
+
+
 def _is_backend_available(backend: str) -> bool:
     """Return True when the selected backend is currently usable."""
     if backend == "exa":
@@ -1011,6 +1103,7 @@ async def web_extract_tool(
                 results = await asyncio.to_thread(
                     provider.extract, safe_urls, format=format
                 )
+            results = await _maybe_apply_public_route_resolver(results)
 
         # Merge any SSRF-blocked results back in
         if ssrf_blocked:
@@ -1115,6 +1208,7 @@ async def web_extract_tool(
                 "title": r.get("title", ""),
                 "content": r.get("content", ""),
                 "error": r.get("error"),
+                **({"final_url": r["final_url"]} if "final_url" in r else {}),
                 **({  "blocked_by_policy": r["blocked_by_policy"]} if "blocked_by_policy" in r else {}),
             }
             for r in response.get("results", [])
@@ -1149,6 +1243,68 @@ async def web_extract_tool(
         _debug.save()
         
         return tool_error(error_msg)
+
+
+def _candidate_confidence(candidate: Dict[str, Any]) -> float:
+    for key in ("confidence", "score", "source_confidence"):
+        value = candidate.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    return 0.0
+
+
+async def extract_search_candidates(
+    candidates: List[Dict[str, Any]],
+    *,
+    format: str = None,
+    use_llm_processing: bool = False,
+) -> Dict[str, Any]:
+    """Extract explicitly supplied search candidates without changing web_search_tool.
+
+    Callers must opt in by passing candidate dicts that contain URLs. Results
+    are deduped by final URL and annotated with the highest source confidence
+    seen for that final URL.
+    """
+    by_url: Dict[str, Dict[str, Any]] = {}
+    for candidate in candidates:
+        url = str(candidate.get("url") or "").strip()
+        if not url:
+            continue
+        current = by_url.get(url)
+        if current is None or _candidate_confidence(candidate) > _candidate_confidence(current):
+            by_url[url] = candidate
+
+    if not by_url:
+        return {"success": True, "results": []}
+
+    ordered_urls = list(by_url)
+    extracted_raw = await web_extract_tool(
+        ordered_urls,
+        format=format,
+        use_llm_processing=use_llm_processing,
+    )
+    extracted = json.loads(extracted_raw)
+    results = extracted.get("results", []) if isinstance(extracted, dict) else []
+    deduped: Dict[str, Dict[str, Any]] = {}
+    for index, result in enumerate(results):
+        if not isinstance(result, dict):
+            continue
+        original_url = str(result.get("url") or "")
+        final_url = str(result.get("final_url") or original_url)
+        key = final_url or original_url
+        candidate = by_url.get(original_url)
+        if candidate is None and index < len(ordered_urls):
+            candidate = by_url.get(ordered_urls[index], {})
+        confidence = _candidate_confidence(candidate or {})
+        enriched = {
+            **result,
+            "final_url": final_url,
+            "source_confidence": confidence,
+        }
+        existing = deduped.get(key)
+        if existing is None or confidence > float(existing.get("source_confidence") or 0.0):
+            deduped[key] = enriched
+    return {"success": True, "results": list(deduped.values())}
 
 
 # Convenience function to check Firecrawl credentials
