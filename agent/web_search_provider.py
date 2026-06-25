@@ -113,6 +113,15 @@ class WebSearchProvider(abc.ABC):
         """
         return False
 
+    def auto_selectable(self) -> bool:
+        """Return False for providers that must never become the implicit default.
+
+        Explicit config still wins. This only affects fallback resolution when
+        ``web.search_backend`` / ``web.extract_backend`` / ``web.backend`` are
+        all empty.
+        """
+        return True
+
     def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
         """Execute a web search.
 
