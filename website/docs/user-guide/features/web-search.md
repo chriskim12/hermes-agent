@@ -26,8 +26,9 @@ Both are configured through a single backend selection. Providers are chosen via
 | **Exa** | `EXA_API_KEY` | ✔ | ✔ | 1 000 searches/mo |
 | **Parallel** | `PARALLEL_API_KEY` | ✔ | ✔ | Paid |
 | **xAI (Grok)** | `XAI_API_KEY` or `hermes auth login xai-oauth` | ✔ | — | Paid (SuperGrok or per-token) |
+| **Insane Search** | — (no key) | ✔ | — | ✔ Free (explicit opt-in) |
 
-Brave Search, DDGS, and xAI are **search-only** — pair any of them with Firecrawl/Tavily/Exa/Parallel when you also need `web_extract`. DDGS uses the [`ddgs` Python package](https://pypi.org/project/ddgs/) under the hood; if it isn't already installed, run `pip install ddgs` (or let Hermes lazy-install it on first use). xAI runs Grok's server-side `web_search` tool on the Responses API — results are LLM-generated rather than index-backed, so titles, descriptions, and URL choice are all model output (see the [trust-model caveat](#xai-grok) below).
+Brave Search, DDGS, xAI, and Insane Search are **search-only** — pair any of them with Firecrawl/Tavily/Exa/Parallel when you also need `web_extract`. DDGS uses the [`ddgs` Python package](https://pypi.org/project/ddgs/) under the hood; if it isn't already installed, run `pip install ddgs` (or let Hermes lazy-install it on first use). xAI runs Grok's server-side `web_search` tool on the Responses API — results are LLM-generated rather than index-backed, so titles, descriptions, and URL choice are all model output (see the [trust-model caveat](#xai-grok) below). Insane Search enriches only safe public routes and is never auto-selected.
 
 **Per-capability split:** you can use different providers for search and extract independently — for example SearXNG (free) for search and Firecrawl for extract. See [Per-capability configuration](#per-capability-configuration) below.
 
@@ -290,6 +291,21 @@ Get access at [parallel.ai](https://parallel.ai).
 
 ---
 
+### Insane Search
+
+Keyless, explicit-only `web_search` provider for safe public routes on Reddit, X/Twitter, YouTube, and Hacker News. It does not use browser automation, cookies, credentialed APIs, TLS impersonation, paywall bypasses, or private/internal URLs.
+
+```yaml
+# ~/.hermes/config.yaml
+web:
+  search_backend: "insane"
+  extract_backend: "firecrawl"   # or tavily, exa, parallel
+```
+
+It is **search-only** and opt-in. Unsupported, private/internal, credential-bearing, auth/login, paywall, CAPTCHA, challenge, and blocked routes fail closed instead of falling back to browser/cookies or raw extraction.
+
+---
+
 ### xAI (Grok) {#xai-grok}
 
 Routes `web_search` through Grok's server-side [web_search tool](https://docs.x.ai/developers/tools/web-search) on the Responses API. Grok runs the actual searching and returns the top results as structured JSON.
@@ -346,7 +362,7 @@ Set one provider for all web capabilities:
 ```yaml
 # ~/.hermes/config.yaml
 web:
-  backend: "searxng"   # firecrawl | searxng | brave-free | ddgs | tavily | exa | parallel | xai
+  backend: "searxng"   # firecrawl | searxng | brave-free | ddgs | tavily | exa | parallel | xai | insane
 ```
 
 ### Per-capability configuration
@@ -356,11 +372,11 @@ Use different providers for search vs extract. This lets you combine free search
 ```yaml
 # ~/.hermes/config.yaml
 web:
-  search_backend: "searxng"     # used by web_search
+  search_backend: "insane"       # used by web_search
   extract_backend: "firecrawl"  # used by web_extract
 ```
 
-When per-capability keys are empty, both fall through to `web.backend`. When `web.backend` is also empty, the backend is auto-detected from whichever API key/URL is present.
+When per-capability keys are empty, both fall through to `web.backend`. When `web.backend` is also empty, the backend is auto-detected from whichever API key/URL is present. Providers can opt out of auto-selection; `insane` is explicit-only despite being keyless.
 
 **Priority order (per capability):**
 1. `web.search_backend` / `web.extract_backend` (explicit per-capability)
@@ -379,7 +395,7 @@ If no backend is explicitly configured, Hermes picks the first available one bas
 | `EXA_API_KEY` | exa |
 | `SEARXNG_URL` | searxng |
 
-xAI Web Search is **not** in the auto-detection chain — having `XAI_API_KEY` set (or being signed in via xAI Grok OAuth) does not automatically route web traffic through xAI, since those credentials are also used for inference / TTS / image gen and the user may want a different backend for web. Opt in explicitly with `web.backend: "xai"`.
+xAI Web Search and Insane Search are **not** in the auto-detection chain. Having `XAI_API_KEY` set (or being signed in via xAI Grok OAuth) does not automatically route web traffic through xAI, since those credentials are also used for inference / TTS / image gen and the user may want a different backend for web. Insane Search is keyless but still explicit-only so a fresh install does not silently change web-search behavior. Opt in explicitly with `web.backend: "xai"` or `web.search_backend: "insane"`.
 
 ---
 
