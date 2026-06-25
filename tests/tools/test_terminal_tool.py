@@ -202,6 +202,69 @@ def test_validate_workdir_blocks_shell_metacharacters_in_windows_paths():
     assert terminal_tool._validate_workdir("C:\\Users\\Alice\\project\nwhoami")
 
 
+def test_resolve_command_cwd_prefers_live_env_cwd_without_workdir():
+    class Env:
+        cwd = "/home/ubuntu/.hermes/hermes-agent"
+
+    assert (
+        terminal_tool._resolve_command_cwd(
+            workdir=None,
+            env=Env(),
+            default_cwd="/tmp/original",
+        )
+        == "/home/ubuntu/.hermes/hermes-agent"
+    )
+
+
+def test_resolve_command_cwd_keeps_explicit_workdir_precedence():
+    class Env:
+        cwd = "/home/ubuntu/.hermes/hermes-agent"
+
+    assert (
+        terminal_tool._resolve_command_cwd(
+            workdir="/tmp/explicit",
+            env=Env(),
+            default_cwd="/tmp/original",
+        )
+        == "/tmp/explicit"
+    )
+
+
+def test_container_host_mount_guard_uses_host_cwd(monkeypatch):
+    calls = []
+
+    def fake_check(command, env_type, workdir=None):
+        calls.append((command, env_type, workdir))
+        return {"approved": False, "status": "blocked", "message": "blocked"}
+
+    monkeypatch.setattr(terminal_tool, "_check_all_guards", fake_check)
+
+    result = terminal_tool._check_container_host_mount_guard(
+        "rm package.json",
+        "docker",
+        {"host_cwd": "/home/ubuntu/.hermes/hermes-agent"},
+    )
+
+    assert result == {"approved": False, "status": "blocked", "message": "blocked"}
+    assert calls == [
+        ("rm package.json", "local", "/home/ubuntu/.hermes/hermes-agent")
+    ]
+
+
+def test_container_host_mount_guard_ignores_unmounted_container(monkeypatch):
+    def fail_check(*_args, **_kwargs):
+        raise AssertionError("guard should not run without a host_cwd mount")
+
+    monkeypatch.setattr(terminal_tool, "_check_all_guards", fail_check)
+
+    assert (
+        terminal_tool._check_container_host_mount_guard(
+            "rm package.json", "docker", {}
+        )
+        is None
+    )
+
+
 def test_get_env_config_ignores_bad_docker_json_for_local_backend(monkeypatch):
     """Docker-only JSON env vars must not break the default local backend."""
     monkeypatch.setenv("TERMINAL_ENV", "local")

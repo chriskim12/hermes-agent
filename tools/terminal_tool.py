@@ -257,10 +257,24 @@ from tools.approval import (
 )
 
 
-def _check_all_guards(command: str, env_type: str) -> dict:
-    """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
+def _check_all_guards(command: str, env_type: str, workdir: str = None) -> dict:
+    """Delegate to consolidated guard (tirith + dangerous cmd + protected cwd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
-                                  approval_callback=_get_approval_callback())
+                                  approval_callback=_get_approval_callback(),
+                                  workdir=workdir)
+
+
+_CONTAINER_HOST_MOUNT_ENVS = {"docker", "singularity"}
+
+
+def _check_container_host_mount_guard(command: str, env_type: str, config: dict) -> dict | None:
+    """Apply protected-checkout guard to host paths mounted into containers."""
+    if env_type not in _CONTAINER_HOST_MOUNT_ENVS:
+        return None
+    host_cwd = str((config or {}).get("host_cwd") or "").strip()
+    if not host_cwd:
+        return None
+    return _check_all_guards(command, "local", workdir=host_cwd)
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -2129,11 +2143,37 @@ def terminal_tool(
                     "status": "error",
                 }, ensure_ascii=False)
 
-        # Pre-exec security checks (tirith + dangerous command detection)
+        # Pre-exec security checks (tirith + dangerous command detection + protected cwd)
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
         if not force:
-            approval = _check_all_guards(command, env_type)
+            # Compute effective cwd for the guarded approval check using the
+            # same cwd resolution that execution uses, including live env.cwd
+            # after a prior `cd`.
+            effective_guard_cwd = _resolve_command_cwd(
+                workdir=workdir,
+                env=env,
+                default_cwd=cwd,
+            )
+            host_mount_approval = _check_container_host_mount_guard(
+                command, env_type, config
+            )
+            if host_mount_approval and not host_mount_approval["approved"]:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": 1,
+                    "error": host_mount_approval.get("message", "command blocked"),
+                    "status": host_mount_approval.get("status", "blocked"),
+                }, ensure_ascii=False)
+            try:
+                approval = _check_all_guards(command, env_type,
+                                             workdir=effective_guard_cwd)
+            except TypeError as exc:
+                # Backward-compatible for tests/plugins that monkeypatch the
+                # local wrapper with the historical two-argument callable.
+                if "workdir" not in str(exc):
+                    raise
+                approval = _check_all_guards(command, env_type)
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
                 if approval.get("status") == "pending_approval":
