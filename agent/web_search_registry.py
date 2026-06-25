@@ -14,8 +14,8 @@ The active provider is chosen by configuration with this precedence:
 1. ``web.search_backend`` / ``web.extract_backend``
    (per-capability override).
 2. ``web.backend`` (shared fallback).
-3. If exactly one capability-eligible provider is registered AND available,
-   use it.
+3. If exactly one capability-eligible provider is registered, available, and
+   auto-selectable, use it.
 4. Legacy preference order — ``firecrawl`` → ``parallel`` → ``tavily`` →
    ``exa`` → ``searxng`` → ``brave-free`` → ``ddgs`` — filtered by
    availability. Matches the historic ``tools.web_tools._get_backend()``
@@ -170,6 +170,16 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
             return bool(p.supports_extract())
         return False
 
+    def _auto_selectable(p: WebSearchProvider) -> bool:
+        probe = getattr(p, "auto_selectable", None)
+        if callable(probe):
+            try:
+                return bool(probe())
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("provider %s.auto_selectable() raised %s", p.name, exc)
+                return False
+        return True
+
     def _is_available_safe(p: WebSearchProvider) -> bool:
         """Wrap ``is_available()`` so a buggy provider doesn't kill resolution."""
         try:
@@ -202,7 +212,7 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
     #    a fresh install with no API keys at all.
     eligible = [
         p for p in snapshot.values()
-        if _capable(p) and _is_available_safe(p)
+        if _capable(p) and _auto_selectable(p) and _is_available_safe(p)
     ]
     if len(eligible) == 1:
         return eligible[0]
@@ -212,6 +222,7 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
         if (
             provider is not None
             and _capable(provider)
+            and _auto_selectable(provider)
             and _is_available_safe(provider)
         ):
             return provider

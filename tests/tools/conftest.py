@@ -25,6 +25,7 @@ def register_all_web_providers():
     from plugins.web.exa.provider import ExaWebSearchProvider
     from plugins.web.firecrawl.provider import FirecrawlWebSearchProvider
     from plugins.web.parallel.provider import ParallelWebSearchProvider
+    from plugins.web.insane_search.provider import InsaneWebSearchProvider
     from plugins.web.searxng.provider import SearXNGWebSearchProvider
     from plugins.web.tavily.provider import TavilyWebSearchProvider
     from plugins.web.xai.provider import XAIWebSearchProvider
@@ -35,6 +36,7 @@ def register_all_web_providers():
         DDGSWebSearchProvider,
         ExaWebSearchProvider,
         FirecrawlWebSearchProvider,
+        InsaneWebSearchProvider,
         ParallelWebSearchProvider,
         SearXNGWebSearchProvider,
         TavilyWebSearchProvider,

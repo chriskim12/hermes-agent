@@ -28,7 +28,7 @@ Each plugin's `register(ctx)` function calls `ctx.register_web_search_provider(.
 | `web_extract` | `web.extract_backend` | `web.backend` |
 | Deep crawl modes inside `web_extract` | `web.extract_backend` | `web.backend` |
 
-When neither key is set, Hermes auto-detects the backend from whichever API key/URL is present in the environment. `hermes tools` walks users through selection.
+When neither key is set, Hermes auto-detects the backend from whichever API key/URL is present in the environment and only considers providers whose `auto_selectable()` returns true. `hermes tools` walks users through selection.
 
 ## Directory structure
 
@@ -39,7 +39,7 @@ plugins/web/my-backend/
 └── plugin.yaml     # Manifest with kind: backend and provides_web_providers
 ```
 
-`brave_free/` and `ddgs/` are the smallest in-tree references — `brave_free` for an API-key-gated search-only provider, `ddgs` for a no-key provider that lazy-installs its SDK.
+`brave_free/`, `ddgs/`, and `insane_search/` are the smallest in-tree references — `brave_free` for an API-key-gated search-only provider, `ddgs` for a no-key provider that lazy-installs its SDK, and `insane_search` for a keyless provider that is explicit-only.
 
 ## The WebSearchProvider ABC
 
@@ -79,6 +79,11 @@ class MyBackendWebSearchProvider(WebSearchProvider):
 
     def supports_extract(self) -> bool:
         return False
+
+    def auto_selectable(self) -> bool:
+        # Optional. Return False for keyless/high-surprise providers that must
+        # never become the implicit default when config is empty.
+        return True
 
     def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
         import httpx
@@ -215,7 +220,7 @@ web:
   extract_backend: "firecrawl"     # extract + crawl, paid quota
 ```
 
-When `web.search_backend` or `web.extract_backend` aren't set, both fall through to `web.backend`. When that's also unset, Hermes picks the first available provider that supports the requested capability based on env-var presence.
+When `web.search_backend` or `web.extract_backend` aren't set, both fall through to `web.backend`. When that's also unset, Hermes picks the first available provider that supports the requested capability and whose `auto_selectable()` returns true.
 
 If your provider only supports one capability, leave the other flags at their default (`False`) and the registry will skip it for that tool — users won't see misleading "provider X failed" errors when they're using X only for search and asking the agent to extract.
 
@@ -239,6 +244,7 @@ If your provider wraps a third-party SDK (like DDGS does with the `ddgs` package
 
 - **`plugins/web/brave_free/`** — small, API-key-gated, search-only HTTP provider. Good starting template.
 - **`plugins/web/ddgs/`** — no-key provider that lazy-installs its SDK. Useful pattern for backends that wrap a Python package.
+- **`plugins/web/insane_search/`** — keyless, explicit-only, public-route search provider. Shows how to keep a free provider opt-in with `auto_selectable() is False`.
 - **`plugins/web/firecrawl/`** — full multi-capability provider (search + extract + crawl) with multiple format modes.
 - **`plugins/web/searxng/`** — self-hosted, URL-configured backend with no auth.
 - **`plugins/web/xai/`** — LLM-backed search via Grok's server-side `web_search` tool. Shows how to reuse an existing OAuth/env-var credential surface (`tools/xai_http.py`) without adding new env vars, and how to write a cheap `is_available()` that honors the no-network contract.

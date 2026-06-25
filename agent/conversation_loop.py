@@ -58,6 +58,10 @@ from agent.model_metadata import (
 )
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
+from agent.question_first_gate import (
+    question_first_block_message,
+    should_block_question_first_tool_calls,
+)
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
     is_zai_coding_overload_error,
@@ -618,6 +622,7 @@ def run_conversation(
     # user-facing result available; it must not be confused with error or
     # recovery text produced by unrelated exit paths.
     _pending_verification_response = None
+    question_first_lock_blocks = 0
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -4433,6 +4438,42 @@ def run_conversation(
             
             # Check for tool calls
             if assistant_message.tool_calls:
+                if should_block_question_first_tool_calls(
+                    user_message,
+                    assistant_content=getattr(assistant_message, "content", ""),
+                ):
+                    question_first_lock_blocks += 1
+                    blocked_names = [tc.function.name for tc in assistant_message.tool_calls]
+                    logger.warning(
+                        "QuestionFirstLock blocked tool call(s) before answer: session=%s tools=%s",
+                        agent.session_id or "-",
+                        blocked_names,
+                    )
+                    assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                    messages.append(assistant_msg)
+                    block_content = question_first_block_message(user_message)
+                    for tc in assistant_message.tool_calls:
+                        messages.append({
+                            "role": "tool",
+                            "name": tc.function.name,
+                            "tool_call_id": tc.id,
+                            "content": block_content,
+                        })
+                    if question_first_lock_blocks >= 3:
+                        agent._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": (
+                                "QuestionFirstLock blocked repeated tool attempts because "
+                                "the latest user message was a question. Answer the "
+                                "question in text before taking action."
+                            ),
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "partial": True,
+                            "error": "QuestionFirstLock blocked repeated tool attempts",
+                        }
+                    continue
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
                 

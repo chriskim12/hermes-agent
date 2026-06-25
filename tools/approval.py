@@ -20,7 +20,8 @@ import sys
 import threading
 import time
 import unicodedata
-from typing import Optional
+from pathlib import Path
+from typing import Optional, List, Tuple
 from hermes_cli.config import cfg_get
 
 from tools.interrupt import is_interrupted
@@ -2534,9 +2535,274 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 
 
+# ---------------------------------------------------------------------------
+# Protected cwd command guard
+# ---------------------------------------------------------------------------
+
+# ── Mutator commands: alter the filesystem ────────────────────────────────
+_PROTECTED_MUTATORS: set = {
+    "rm", "mv", "cp", "touch", "truncate", "tee",
+    "mkdir", "rmdir", "chmod", "chown", "ln", "install",
+}
+
+# ── Inline mutation flags: sed -i / perl -pi ─────────────────────────────
+# These are detected via flag patterns within the full command, not just
+# the first token.
+_INLINE_MUTATION_PATTERNS = (
+    # sed -i[...]  (captures -i, -i.bak, -i '', -i.bak, --in-place, etc.)
+    re.compile(r'\bsed\s+.*(-i|--in-place)'),
+    # perl -pi[...] or perl -i[...]
+    re.compile(r'\bperl\s+.*(-p.*-i|-i.*-p)'),
+)
+
+# ── Ambiguous interpreters: dangerous from protected cwd ─────────────────
+_AMBIGUOUS_INTERPRETERS: set = {
+    "python", "python3", "python3.11", "python3.12",
+    "node", "tsx", "bash", "sh", "dash", "zsh",
+    "ruby", "perl", "php", "lua",
+    "pip", "pip3", "npm", "npx", "yarn", "pnpm",
+    "cargo", "go",
+}
+
+# ── Destructive git subcommands (mutation) ───────────────────────────────
+_GIT_MUTATION_SUBCOMMANDS: set = {
+    "restore", "reset", "clean",
+    "add", "commit", "merge", "rebase", "cherry-pick",
+    "stash", "rm", "mv",
+}
+
+# ── Read-only git subcommands ────────────────────────────────────────────
+_GIT_READONLY_SUBCOMMANDS: set = {
+    "status", "diff", "log", "rev-parse", "worktree",
+    "branch", "show", "ls-files", "ls-tree", "ls-remote",
+    "stash",  # "stash list" / "stash show" are read-only; "stash push/pop/apply/drop" are blocked
+    "config", "remote", "describe", "tag", "blame",
+    "grep", "shortlog", "reflog",
+}
+
+_COMMAND_SEGMENT_RE = re.compile(r'\s*(?:&&|\|\||[;|\n])\s*')
+_OUTPUT_REDIRECT_RE = re.compile(r'(^|\s)(?:\d?>|>>|&>)')
+
+
+def _split_command_segments(command: str) -> List[str]:
+    """Split shell command lists/pipelines into non-empty segments."""
+    cleaned = command.strip().replace('\\\n', ' ')
+    if not cleaned:
+        return []
+    return [segment.strip() for segment in _COMMAND_SEGMENT_RE.split(cleaned) if segment.strip()]
+
+
+def _has_output_redirection(segment: str) -> bool:
+    """Return True when a shell segment can write through output redirection."""
+    return bool(_OUTPUT_REDIRECT_RE.search(segment))
+
+
+def _split_tokens(command: str) -> List[str]:
+    """Split a (possibly multi-line) command string into tokens.
+
+    Returns the empty list when the command is empty or whitespace-only.
+    Pipeline / list separators (``;``, ``&&``, ``||``, ``|``) are treated
+    as token boundaries.
+    """
+    cleaned = command.strip()
+    if not cleaned:
+        return []
+    # Normalise multi-line continuations
+    cleaned = cleaned.replace('\\\n', ' ')
+    # Split on common shell separators and take the first segment
+    # (protection against ``cmd1 ; cmd2`` bypasses)
+    for sep in (';', '&&', '||', '|', '\n'):
+        cleaned = cleaned.split(sep, 1)[0]
+    tokens = cleaned.split()
+    return tokens
+
+
+def _check_protected_cwd_command(command: str, cwd: str) -> Optional[dict]:
+    """Block mutation/ambiguous commands from a protected canonical cwd.
+
+    This guard is called BEFORE yolo/mode=off so that the protected-
+    checkout policy is never silently bypassed.  Only local / ssh
+    backends reach this code — containers are already exempted in
+    ``check_all_command_guards``.
+
+    Returns a block-result ``dict`` when the command should be rejected,
+    or ``None`` when the cwd is not protected or the command is safe.
+    """
+    # 1. Resolve the cwd and check whether it's inside a protected root.
+    resolved_cwd = Path(cwd).resolve()
+    resolved_cwd_str = str(resolved_cwd)
+
+    from tools.protected_checkout_policy import (
+        effective_protected_checkout_registry,
+        _is_under_or_equal,
+        _check_protected_root,
+    )
+
+    matched_root = None
+    for root in effective_protected_checkout_registry()["canonical_roots"]:
+        root_path = Path(root).resolve()
+        root_str = str(root_path)
+        if _is_under_or_equal(resolved_cwd_str, root_str):
+            matched_root = root_str
+            break
+
+    if not matched_root:
+        # cwd is not inside any protected root — allow.
+        return None
+
+    # 2. cwd IS protected → check git branch for task worktree exemption.
+    branch_decision = _check_protected_root(resolved_cwd_str, matched_root)
+    if branch_decision.allowed:
+        # Task worktree branch (gjc/* or wt/*) — allow all commands.
+        return None
+
+    # 3. Protected canonical, non-task branch → evaluate every shell segment.
+    # A safe first segment must not let a later mutator run in the same command
+    # string (for example: ``git status; rm file``).
+    segments = _split_command_segments(command)
+    if not segments:
+        # Empty command — block (ambiguous intent from protected cwd).
+        return {
+            "approved": False,
+            "status": "blocked",
+            "message": (
+                "[PROTECTED-CWD] Empty command from protected canonical "
+                "checkout '{}' (reason: {}). "
+                "Use a task worktree instead.".format(
+                    matched_root, branch_decision.reason_detail
+                )
+            ),
+        }
+
+    for segment in segments:
+        if _has_output_redirection(segment):
+            return {
+                "approved": False,
+                "status": "blocked",
+                "message": (
+                    "[PROTECTED-CWD] Output redirection from protected canonical "
+                    "checkout '{}' is blocked (reason: {}). "
+                    "Use a task worktree instead.".format(
+                        matched_root, branch_decision.reason_detail
+                    )
+                ),
+            }
+
+        tokens = _split_tokens(segment)
+        if not tokens:
+            continue
+        first_token = tokens[0]
+
+        # 3a. git → classify by subcommand
+        if first_token == "git" and len(tokens) >= 2:
+            sub = tokens[1]
+
+            # "--" or "-p" after git: treat next non-flag token as subcommand
+            if sub.startswith('-'):
+                for t in tokens[2:]:
+                    if not t.startswith('-'):
+                        sub = t
+                        break
+
+            if sub in _GIT_READONLY_SUBCOMMANDS:
+                # "stash" is special: list/show are read-only, push/pop/apply/drop are not
+                if sub == "stash" and len(tokens) >= 3:
+                    stash_op = tokens[2]
+                    if stash_op in {"push", "pop", "apply", "drop", "clear", "branch", "save"}:
+                        return {
+                            "approved": False,
+                            "status": "blocked",
+                            "message": (
+                                "[PROTECTED-CWD] git {} {} from protected canonical "
+                                "checkout '{}' (reason: {}). "
+                                "Use a task worktree instead.".format(
+                                    sub, stash_op, matched_root,
+                                    branch_decision.reason_detail
+                                )
+                            ),
+                        }
+                # Allowed: read-only git subcommand
+                continue
+
+            if sub in _GIT_MUTATION_SUBCOMMANDS:
+                return {
+                    "approved": False,
+                    "status": "blocked",
+                    "message": (
+                        "[PROTECTED-CWD] git {} from protected canonical "
+                        "checkout '{}' (reason: {}). "
+                        "Use a task worktree instead.".format(
+                            sub, matched_root, branch_decision.reason_detail
+                        )
+                    ),
+                }
+
+            # Unknown git subcommand from protected cwd → block (ambiguous)
+            return {
+                "approved": False,
+                "status": "blocked",
+                "message": (
+                    "[PROTECTED-CWD] Unknown git subcommand '{}' from protected "
+                    "canonical checkout '{}' (reason: {}). "
+                    "Use a task worktree instead.".format(
+                        sub, matched_root, branch_decision.reason_detail
+                    )
+                ),
+            }
+
+        # 3b. mutator commands
+        if first_token in _PROTECTED_MUTATORS:
+            return {
+                "approved": False,
+                "status": "blocked",
+                "message": (
+                    "[PROTECTED-CWD] '{}' mutations are blocked from protected "
+                    "canonical checkout '{}' (reason: {}). "
+                    "Use a task worktree instead.".format(
+                        first_token, matched_root, branch_decision.reason_detail
+                    )
+                ),
+            }
+
+        # 3c. inline mutation patterns (sed -i, perl -pi)
+        for pattern in _INLINE_MUTATION_PATTERNS:
+            if pattern.search(segment):
+                return {
+                    "approved": False,
+                    "status": "blocked",
+                    "message": (
+                        "[PROTECTED-CWD] Inline mutation (sed -i / perl -pi) "
+                        "from protected canonical checkout '{}' (reason: {}). "
+                        "Use a task worktree instead.".format(
+                            matched_root, branch_decision.reason_detail
+                        )
+                    ),
+                }
+
+        # 3d. ambiguous interpreters
+        if first_token in _AMBIGUOUS_INTERPRETERS:
+            return {
+                "approved": False,
+                "status": "blocked",
+                "message": (
+                    "[PROTECTED-CWD] Interpreter '{}' is blocked from protected "
+                    "canonical checkout '{}' (reason: {}). "
+                    "Use a task worktree instead.".format(
+                        first_token, matched_root, branch_decision.reason_detail
+                    )
+                ),
+            }
+
+    # 4. Unknown/read-only commands from protected cwd → allow with note.
+    #    Only known-dangerous patterns are blocked; novel inspection commands
+    #    pass through when no segment mutates or redirects output.
+    return None
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             workdir: Optional[str] = None) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
 
     Gathers findings from tirith and dangerous-command detection, then
@@ -2569,8 +2835,11 @@ def check_all_command_guards(command: str, env_type: str,
     # check so even yolo/smart approval/mode=off cannot bypass it.
     is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command)
     if is_sudo_guess:
-        logger.warning("Sudo stdin guard block: %s (command: %s)",
-                       sudo_guess_desc, command[:200])
+        logger.warning(
+            "Sudo stdin guard block: %s (command: %s)",
+            sudo_guess_desc,
+            command[:200],
+        )
         return _sudo_stdin_block_result(sudo_guess_desc)
 
     # User-defined deny rules (approvals.deny in config.yaml): like the
@@ -2581,6 +2850,17 @@ def check_all_command_guards(command: str, env_type: str,
         logger.warning("User deny rule %r blocked command: %s",
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
+
+    # == Protected cwd guard ==
+    # Applied BEFORE yolo/mode=off so that the protected-checkout policy
+    # is never silently bypassed. This is an unconditional block for
+    # mutation commands and ambiguous interpreters issued from inside a
+    # protected canonical checkout; host-bound docker workdirs and local/ssh
+    # backends reach this point after the container fast-path above.
+    if workdir:
+        protected_block = _check_protected_cwd_command(command, workdir)
+        if protected_block:
+            return protected_block
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
