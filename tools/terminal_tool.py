@@ -46,6 +46,17 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 from utils import env_var_enabled
+from hermes_constants import get_hermes_home
+from hermes_disk_lifecycle import (
+    Decision as DiskLifecycleDecision,
+    LifecycleContext as DiskLifecycleContext,
+    Surface as DiskLifecycleSurface,
+    WorkKind as DiskLifecycleWorkKind,
+    evaluate_path_request as _evaluate_disk_lifecycle_path,
+    evaluate_root_delta as _evaluate_disk_lifecycle_root_delta,
+    parse_mountinfo as _parse_disk_lifecycle_mountinfo,
+    rollout_flags_from_env as _disk_lifecycle_rollout_flags_from_env,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -306,6 +317,88 @@ def _check_container_host_mount_guard(command: str, env_type: str, config: dict)
 # dot, hyphen, underscore, space, plus, at, equals, and comma.  Everything
 # else is rejected.
 _WORKDIR_SAFE_RE = re.compile(r'^[A-Za-z0-9/\\:_\-.~ +@=,]+$')
+
+
+def _disk_lifecycle_root_used_percent() -> float | None:
+    try:
+        stats = os.statvfs("/")
+    except OSError:
+        return None
+    total = stats.f_blocks * stats.f_frsize
+    free = stats.f_bavail * stats.f_frsize
+    if total <= 0:
+        return None
+    return ((total - free) / total) * 100.0
+
+
+def _disk_lifecycle_root_used_bytes() -> int | None:
+    try:
+        stats = os.statvfs("/")
+    except OSError:
+        return None
+    return (stats.f_blocks - stats.f_bavail) * stats.f_frsize
+
+
+def _disk_lifecycle_mount_table() -> tuple[dict[str, Any], ...]:
+    try:
+        text = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
+    except OSError:
+        return ()
+    return tuple(dict(item) for item in _parse_disk_lifecycle_mountinfo(text))
+
+
+def _disk_lifecycle_context(*, surface: DiskLifecycleSurface, work_kind: DiskLifecycleWorkKind, path: str) -> DiskLifecycleContext:
+    hermes_home = str(get_hermes_home())
+    return DiskLifecycleContext(
+        active_profile=os.getenv("HERMES_PROFILE", "default"),
+        hermes_home=hermes_home,
+        cwd=path or os.getcwd(),
+        data_root=os.getenv("HERMES_DISK_DATA_ROOT", "/mnt/hermes-data"),
+        extra_root=os.getenv("HERMES_DISK_EXTRA_ROOT", "/mnt/hermes-extra"),
+        sandbox_root=os.getenv("TERMINAL_SANDBOX_DIR", str(Path(hermes_home) / "sandboxes")),
+        workspace_root=os.getenv("HERMES_WORKSPACE_ROOT") or os.getenv("GJC_WORKSPACE_ROOT", ""),
+        cache_root=os.getenv("HERMES_CACHE_ROOT", ""),
+        toolchain_root=os.getenv("HERMES_TOOLCHAIN_ROOT", ""),
+        state_db_path=str(Path(hermes_home) / "state.db"),
+        logs_path=str(Path(hermes_home) / "logs"),
+        cron_output_path=str(Path(hermes_home) / "cron" / "output"),
+        surface=surface,
+        work_kind=work_kind,
+        rollout=_disk_lifecycle_rollout_flags_from_env(os.environ),
+        mount_table=_disk_lifecycle_mount_table(),
+        root_used_percent=_disk_lifecycle_root_used_percent(),
+    )
+
+
+def _disk_lifecycle_preflight_path(path: str, *, background: bool, env_type: str) -> dict[str, Any] | None:
+    work_kind = DiskLifecycleWorkKind.HEAVY_WORK if background or env_type in {"docker", "singularity", "modal", "daytona"} else DiskLifecycleWorkKind.UNKNOWN
+    surface = DiskLifecycleSurface.BACKGROUND if background else DiskLifecycleSurface.TERMINAL
+    decision = _evaluate_disk_lifecycle_path(
+        path,
+        _disk_lifecycle_context(surface=surface, work_kind=work_kind, path=path),
+    )
+    if decision.decision == DiskLifecycleDecision.BLOCK:
+        return {
+            "status": "blocked",
+            "error": "Disk lifecycle policy blocked this command path.",
+            "disk_lifecycle": decision.to_dict(),
+        }
+    if decision.decision in {DiskLifecycleDecision.WARN, DiskLifecycleDecision.OBSERVE} or decision.warnings:
+        return {"disk_lifecycle": decision.to_dict()}
+    return None
+
+
+def _disk_lifecycle_post_run_note(before_root_bytes: int | None) -> dict[str, Any] | None:
+    if before_root_bytes is None:
+        return None
+    after_root_bytes = _disk_lifecycle_root_used_bytes()
+    if after_root_bytes is None:
+        return None
+    mode = _disk_lifecycle_rollout_flags_from_env(os.environ).post_run_root_delta
+    decision = _evaluate_disk_lifecycle_root_delta(before_root_bytes, after_root_bytes, mode=mode)
+    if decision.decision in {DiskLifecycleDecision.WARN, DiskLifecycleDecision.OBSERVE, DiskLifecycleDecision.BLOCK}:
+        return decision.to_dict()
+    return None
 
 
 def _validate_workdir(workdir: str) -> str | None:
@@ -2154,6 +2247,31 @@ def terminal_tool(
                     "status": "error",
                 }, ensure_ascii=False)
 
+        # Validate model-supplied workdir and run lifecycle preflight before
+        # creating/reusing heavyweight execution environments. This keeps block
+        # mode from materializing sandbox/container state on disallowed roots.
+        if workdir:
+            workdir_error = _validate_workdir(workdir)
+            if workdir_error:
+                logger.warning("Blocked dangerous workdir: %s (command: %s)",
+                               workdir[:200], _safe_command_preview(command))
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": workdir_error,
+                    "status": "blocked"
+                }, ensure_ascii=False)
+
+        disk_lifecycle_note = _disk_lifecycle_preflight_path(workdir or cwd, background=background, env_type=env_type)
+        if disk_lifecycle_note and disk_lifecycle_note.get("status") == "blocked":
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": disk_lifecycle_note["error"],
+                "status": "blocked",
+                "disk_lifecycle": disk_lifecycle_note["disk_lifecycle"],
+            }, ensure_ascii=False)
+
         # Start cleanup thread
         _start_cleanup_thread()
 
@@ -2366,19 +2484,6 @@ def terminal_tool(
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
 
-        # Validate workdir against shell injection
-        if workdir:
-            workdir_error = _validate_workdir(workdir)
-            if workdir_error:
-                logger.warning("Blocked dangerous workdir: %s (command: %s)",
-                               workdir[:200], _safe_command_preview(command))
-                return json.dumps({
-                    "output": "",
-                    "exit_code": -1,
-                    "error": workdir_error,
-                    "status": "blocked"
-                }, ensure_ascii=False)
-
         # Prepare command for execution
         pty_disabled_reason = None
         effective_pty = pty
@@ -2450,6 +2555,8 @@ def terminal_tool(
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:
                     result_data["pty_note"] = pty_disabled_reason
+                if disk_lifecycle_note:
+                    result_data["disk_lifecycle"] = disk_lifecycle_note["disk_lifecycle"]
 
                 # Nudge: background=True without notify_on_complete=True OR
                 # watch_patterns is a silent process. The agent has NO way to
@@ -2670,6 +2777,8 @@ def terminal_tool(
                 from tools.interrupt import clear_current_thread_interrupt
                 clear_current_thread_interrupt()
 
+            disk_lifecycle_root_before = _disk_lifecycle_root_used_bytes()
+
             while retry_count <= max_retries:
                 try:
                     command_cwd = _resolve_command_cwd(
@@ -2830,6 +2939,11 @@ def terminal_tool(
                 result_dict["sudo_auth_failed"] = True
             if sudo_cache_cleared:
                 result_dict["sudo_cache_cleared"] = True
+            if disk_lifecycle_note:
+                result_dict["disk_lifecycle"] = disk_lifecycle_note["disk_lifecycle"]
+            post_run_lifecycle = _disk_lifecycle_post_run_note(disk_lifecycle_root_before)
+            if post_run_lifecycle:
+                result_dict["disk_lifecycle_post_run"] = post_run_lifecycle
 
             return json.dumps(result_dict, ensure_ascii=False)
 

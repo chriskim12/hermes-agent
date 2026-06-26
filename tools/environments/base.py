@@ -22,6 +22,15 @@ from typing import IO, Callable, Protocol
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_disk_lifecycle import (
+    Decision as DiskLifecycleDecision,
+    LifecycleContext as DiskLifecycleContext,
+    Surface as DiskLifecycleSurface,
+    WorkKind as DiskLifecycleWorkKind,
+    evaluate_path_request as _evaluate_disk_lifecycle_path,
+    parse_mountinfo as _parse_disk_lifecycle_mountinfo,
+    rollout_flags_from_env as _disk_lifecycle_rollout_flags_from_env,
+)
 from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
@@ -79,6 +88,14 @@ def touch_activity_if_due(
         pass
 
 
+def _disk_lifecycle_mount_table() -> tuple[dict[str, object], ...]:
+    try:
+        text = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
+    except OSError:
+        return ()
+    return tuple(dict(item) for item in _parse_disk_lifecycle_mountinfo(text))
+
+
 def get_sandbox_dir() -> Path:
     """Return the host-side root for all sandbox storage (Docker workspaces,
     Singularity overlays/SIF cache, etc.).
@@ -90,6 +107,30 @@ def get_sandbox_dir() -> Path:
         p = Path(custom)
     else:
         p = get_hermes_home() / "sandboxes"
+
+    decision = _evaluate_disk_lifecycle_path(
+        str(p),
+        DiskLifecycleContext(
+            active_profile=os.getenv("HERMES_PROFILE", "default"),
+            hermes_home=str(get_hermes_home()),
+            sandbox_root=str(p),
+            surface=DiskLifecycleSurface.SANDBOX,
+            work_kind=DiskLifecycleWorkKind.HEAVY_WORK,
+            rollout=_disk_lifecycle_rollout_flags_from_env(os.environ),
+            mount_table=_disk_lifecycle_mount_table(),
+        ),
+    )
+    if decision.decision == DiskLifecycleDecision.BLOCK:
+        raise RuntimeError(
+            "Disk lifecycle policy blocked sandbox root "
+            f"{p}: {', '.join(decision.blockers)}"
+        )
+    if decision.warnings:
+        logger.warning(
+            "Disk lifecycle warning for sandbox root %s: %s",
+            p,
+            ", ".join(decision.warnings),
+        )
     p.mkdir(parents=True, exist_ok=True)
     return p
 

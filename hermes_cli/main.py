@@ -12915,9 +12915,11 @@ def main():
     # Lazy import — only pays for itself when this subcommand is actually used.
     from hermes_cli import secrets_cli as _secrets_cli
     from hermes_cli import onepassword_secrets_cli as _op_secrets_cli
+    from hermes_cli import secrets_governance as _secrets_governance
 
     _secrets_cli.register_cli(secrets_bw)
     _op_secrets_cli.register_cli(secrets_op)
+    _secrets_governance.register_cli(secrets_subparsers)
 
     def _dispatch_secrets(args):  # noqa: ANN001
         sub = getattr(args, "secrets_command", None)
@@ -12926,6 +12928,8 @@ def main():
         if sub in ("bitwarden", "bw") and bw_sub is not None:
             return args.func(args)
         if sub in ("onepassword", "op", "1password") and op_sub is not None:
+            return args.func(args)
+        if sub == "governance-check":
             return args.func(args)
         secrets_parser.print_help()
         return 0
