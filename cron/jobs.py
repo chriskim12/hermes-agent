@@ -32,6 +32,15 @@ except ImportError:  # pragma: no cover - non-Windows
 from datetime import datetime, timedelta
 from pathlib import Path
 from hermes_constants import get_hermes_home
+from hermes_disk_lifecycle import (
+    Decision as DiskLifecycleDecision,
+    LifecycleContext as DiskLifecycleContext,
+    Surface as DiskLifecycleSurface,
+    WorkKind as DiskLifecycleWorkKind,
+    evaluate_path_request as _evaluate_disk_lifecycle_path,
+    parse_mountinfo as _parse_disk_lifecycle_mountinfo,
+    rollout_flags_from_env as _disk_lifecycle_rollout_flags_from_env,
+)
 from typing import Optional, Dict, List, Any, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
@@ -154,6 +163,45 @@ def _jobs_lock():
                         lock_fd.close()
         finally:
             _jobs_lock_state.depth = 0
+
+def _disk_lifecycle_mount_table() -> tuple[dict[str, Any], ...]:
+    try:
+        text = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
+    except OSError:
+        return ()
+    return tuple(dict(item) for item in _parse_disk_lifecycle_mountinfo(text))
+
+
+def _cron_disk_lifecycle_decision(path: Path):
+    return _evaluate_disk_lifecycle_path(
+        str(path),
+        DiskLifecycleContext(
+            active_profile=os.getenv("HERMES_PROFILE", "default"),
+            hermes_home=str(HERMES_DIR),
+            cron_output_path=str(OUTPUT_DIR),
+            surface=DiskLifecycleSurface.CRON,
+            work_kind=DiskLifecycleWorkKind.DURABLE_EVIDENCE,
+            rollout=_disk_lifecycle_rollout_flags_from_env(os.environ),
+            mount_table=_disk_lifecycle_mount_table(),
+        ),
+    )
+
+
+def _enforce_cron_disk_lifecycle(path: Path) -> dict[str, Any]:
+    decision = _cron_disk_lifecycle_decision(path)
+    if decision.decision == DiskLifecycleDecision.BLOCK:
+        raise RuntimeError(
+            "Disk lifecycle policy blocked cron output path "
+            f"{path}: {', '.join(decision.blockers)}"
+        )
+    if decision.warnings:
+        logger.warning(
+            "Disk lifecycle warning for cron output path %s: %s",
+            path,
+            ", ".join(decision.warnings),
+        )
+    return decision.to_dict()
+
 
 # Fields on a cron job that must never change after creation. ``id`` is used
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
@@ -282,6 +330,7 @@ def _secure_file(path: Path):
 
 def ensure_dirs():
     """Ensure cron directories exist with secure permissions."""
+    _enforce_cron_disk_lifecycle(OUTPUT_DIR)
     CRON_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     _secure_dir(CRON_DIR)
