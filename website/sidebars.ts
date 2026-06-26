@@ -725,6 +725,7 @@ const sidebars: SidebarsConfig = {
             'developer-guide/context-compression-and-caching',
             'developer-guide/gateway-internals',
             'developer-guide/session-storage',
+            'developer-guide/disk-lifecycle',
             'developer-guide/provider-runtime',
             'developer-guide/programmatic-integration',
           ],
