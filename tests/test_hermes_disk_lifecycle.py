@@ -14,12 +14,14 @@ from hermes_disk_lifecycle import (
     TruthSurface,
     classify_path,
     evaluate_path_request,
+    evaluate_command_request,
     evaluate_root_delta,
     lifecycle_report,
     mount_identity_for,
     parse_mountinfo,
     resolver_contract,
     rollout_flags_from_env,
+    infer_command_output_paths,
     validate_manifest,
 )
 
@@ -48,6 +50,104 @@ def test_classifies_data_extra_root_and_profile_paths():
     assert root_cache.mount_role == MountRole.ROOT
     assert root_cache.path_class == PathClass.UNKNOWN_ROOT_MASS
 
+def test_classifies_historical_root_build_outputs_as_rebuildable_mass():
+    ctx = _context(hermes_home="/home/ubuntu/.hermes")
+    target = classify_path("/home/ubuntu/apps/gajae-code/target", ctx)
+    assert target.mount_role == MountRole.ROOT
+    assert target.path_class == PathClass.UNKNOWN_ROOT_MASS
+    assert target.truth_surface == TruthSurface.REBUILDABLE
+    assert BlockerCode.ROOT_HEAVY_WORK.value in target.blockers
+
+    next_dir = classify_path("/home/ubuntu/repos/hermes/web/.next", ctx)
+    assert next_dir.path_class == PathClass.UNKNOWN_ROOT_MASS
+    assert BlockerCode.ROOT_HEAVY_WORK.value in next_dir.blockers
+
+    node_modules = classify_path("/home/ubuntu/repos/hermes/node_modules", ctx)
+    assert node_modules.path_class == PathClass.UNKNOWN_ROOT_MASS
+    assert BlockerCode.ROOT_HEAVY_WORK.value in node_modules.blockers
+
+
+def test_command_preflight_infers_root_heavy_outputs_from_cwd_and_command():
+    ctx = _context(
+        rollout=RolloutFlags(mode=EnforcementMode.BLOCK, host_mode=HostMode.REQUIRED_HERMES_HOST, block_new_root_heavy=True),
+        root_used_percent=82.0,
+    )
+
+    assert infer_command_output_paths("cargo build", "/home/ubuntu/apps/gajae-code") == (
+        "/home/ubuntu/apps/gajae-code/target",
+    )
+
+    cargo = evaluate_command_request("cargo build", "/home/ubuntu/apps/gajae-code", ctx)
+    assert cargo.decision == Decision.BLOCK
+    assert cargo.classification is not None
+    assert cargo.classification.path == "/home/ubuntu/apps/gajae-code/target"
+    assert BlockerCode.ROOT_HEAVY_WORK.value in cargo.blockers
+
+    npm = evaluate_command_request("npm run build", "/home/ubuntu/repos/hermes/web", ctx)
+    assert npm.decision == Decision.BLOCK
+    assert BlockerCode.ROOT_HEAVY_WORK.value in npm.blockers
+    assert ".next" in npm.message
+    assert "node_modules" in npm.message
+
+
+def test_root_override_metadata_controls_root_heavy_blocking():
+    incomplete = _context(
+        rollout=RolloutFlags(
+            mode=EnforcementMode.BLOCK,
+            host_mode=HostMode.REQUIRED_HERMES_HOST,
+            block_new_root_heavy=True,
+            allow_root_override=True,
+            approval_id="APPROVED-1",
+            owner="ops",
+            reason="   ",
+            remove_by="2026-07-01T00:00:00Z",
+        )
+    )
+    blocked = evaluate_path_request("/home/ubuntu/apps/gajae-code/target", incomplete)
+    assert blocked.decision == Decision.BLOCK
+    assert BlockerCode.ROOT_HEAVY_WORK.value in blocked.blockers
+    assert BlockerCode.UNAPPROVED_ROOT_OVERRIDE.value in blocked.blockers
+
+    complete = _context(
+        rollout=RolloutFlags(
+            mode=EnforcementMode.BLOCK,
+            host_mode=HostMode.REQUIRED_HERMES_HOST,
+            block_new_root_heavy=True,
+            allow_root_override=True,
+            approval_id="APPROVED-1",
+            owner="ops",
+            reason="bounded rebuild smoke",
+            remove_by="2026-07-01T00:00:00Z",
+        )
+    )
+    overridden = evaluate_path_request("/home/ubuntu/apps/gajae-code/target", complete)
+    assert overridden.decision == Decision.WARN
+    assert BlockerCode.ROOT_HEAVY_WORK.value in overridden.warnings
+    assert BlockerCode.UNAPPROVED_ROOT_OVERRIDE.value not in overridden.blockers
+
+
+def test_command_preflight_preserves_observe_warn_block_modes():
+    root_cwd = "/home/ubuntu/apps/gajae-code"
+
+    observe = evaluate_command_request("cargo build", root_cwd, _context())
+    assert observe.decision == Decision.OBSERVE
+    assert BlockerCode.ROOT_HEAVY_WORK.value in observe.warnings
+
+    warn = evaluate_command_request(
+        "cargo build",
+        root_cwd,
+        _context(rollout=RolloutFlags(mode=EnforcementMode.WARN, block_new_root_heavy=True)),
+    )
+    assert warn.decision == Decision.WARN
+    assert BlockerCode.ROOT_HEAVY_WORK.value in warn.blockers
+
+    block = evaluate_command_request(
+        "cargo build",
+        root_cwd,
+        _context(rollout=RolloutFlags(mode=EnforcementMode.BLOCK, block_new_root_heavy=True)),
+    )
+    assert block.decision == Decision.BLOCK
+    assert BlockerCode.ROOT_HEAVY_WORK.value in block.blockers
 
 def test_fake_mount_directory_is_not_valid_mount_identity():
     mounts = (
