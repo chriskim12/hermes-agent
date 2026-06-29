@@ -8,6 +8,7 @@ receive policy decisions, blockers, and manifest validation results back.
 from __future__ import annotations
 
 import os
+import shlex
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -257,8 +258,31 @@ _REQUIRED_MANIFEST_FIELDS = (
 _SCHEMA = "hermes_artifact_manifest.v1"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
-_HEAVY_NAMES = {"workspaces", "workspace", "build", "dist", "node_modules", ".cache", "cache", "toolchains", "docker", "sandboxes"}
+_HEAVY_NAMES = {
+    "workspaces",
+    "workspace",
+    "build",
+    "dist",
+    "node_modules",
+    ".cache",
+    ".next",
+    ".pytest_cache",
+    ".turbo",
+    "cache",
+    "target",
+    "toolchains",
+    "docker",
+    "sandboxes",
+    "venv",
+    ".venv",
+}
 _DATA_NAMES = {"state.db", "sessions", "logs", "cron", "audit", "evidence", "final-evidence", "final_evidence"}
+_BUILD_OUTPUT_NAMES = ("target", "node_modules", ".next", ".turbo", "dist", "build", ".pytest_cache")
+_INSTALL_OUTPUT_NAMES = ("node_modules", ".venv", "venv")
+_CARGO_COMMANDS = {"cargo"}
+_JS_PACKAGE_MANAGERS = {"bun", "npm", "pnpm", "yarn"}
+_JS_BUILD_COMMANDS = {"build", "dev", "start", "preview", "tauri", "test:e2e", "test:red-team"}
+_NATIVE_BUILD_COMMANDS = {"make", "cmake", "ninja", "meson", "pip", "python", "python3"}
 
 
 def _clean_path(value: str | os.PathLike[str] | None) -> str:
@@ -431,6 +455,86 @@ def classify_path(path: str, context: LifecycleContext | None = None) -> PathCla
     return PathClassification(clean, PathClass.INVALID_MOUNT, MountRole.INVALID, TruthSurface.NONE, (BlockerCode.MOUNT_IDENTITY_INVALID.value,))
 
 
+def infer_command_output_paths(command: str, cwd: str) -> tuple[str, ...]:
+    """Infer root-heavy outputs a command is likely to create before it runs."""
+    clean_cwd = _clean_path(cwd) or os.getcwd()
+    try:
+        tokens = shlex.split(command or "", posix=True)
+    except ValueError:
+        tokens = (command or "").split()
+    normalized = [token.strip() for token in tokens if token.strip()]
+    if not normalized:
+        return ()
+
+    executable = PurePosixPath(normalized[0]).name
+    lowered = [token.lower() for token in normalized]
+    outputs: set[str] = set()
+
+    if executable in _CARGO_COMMANDS and any(token in {"build", "test", "bench", "run", "check"} for token in lowered[1:]):
+        outputs.add("target")
+
+    if executable in _JS_PACKAGE_MANAGERS:
+        if any(token in {"install", "add", "ci"} for token in lowered[1:]):
+            outputs.update(_INSTALL_OUTPUT_NAMES)
+        if "run" in lowered:
+            run_index = lowered.index("run")
+            script = lowered[run_index + 1] if run_index + 1 < len(lowered) else ""
+            if script in _JS_BUILD_COMMANDS or any(name in script for name in ("build", "next", "tauri", "napi")):
+                outputs.update(("node_modules", ".next", ".turbo", "dist", "build"))
+        if any(token in {"build", "dev", "start", "preview", "test", "test:e2e"} for token in lowered[1:]):
+            outputs.update(("node_modules", ".next", ".turbo", "dist", "build"))
+
+    if executable == "next" and any(token in {"build", "dev", "start"} for token in lowered[1:]):
+        outputs.update((".next", "node_modules"))
+
+    if executable in _NATIVE_BUILD_COMMANDS:
+        if executable in {"make", "cmake", "ninja", "meson"}:
+            outputs.update(("build", "dist"))
+        elif any(token in {"install", "wheel", "build"} for token in lowered[1:]):
+            outputs.update((".venv", "venv", "build", "dist", ".pytest_cache"))
+
+    ordered = _BUILD_OUTPUT_NAMES + tuple(name for name in _INSTALL_OUTPUT_NAMES if name not in _BUILD_OUTPUT_NAMES)
+    return tuple(os.path.join(clean_cwd, name) for name in ordered if name in outputs)
+
+
+def _decision_rank(decision: Decision) -> int:
+    return {
+        Decision.ALLOW: 0,
+        Decision.OBSERVE: 1,
+        Decision.WARN: 2,
+        Decision.REQUIRES_APPROVAL: 3,
+        Decision.REROUTE: 4,
+        Decision.BLOCK: 5,
+    }[decision]
+
+
+def evaluate_command_request(command: str, cwd: str, context: LifecycleContext | None = None) -> LifecycleDecision:
+    """Evaluate a command plus cwd by preflighting its likely generated outputs."""
+    context = context or LifecycleContext(cwd=cwd)
+    inferred_paths = infer_command_output_paths(command, cwd)
+    if not inferred_paths:
+        return evaluate_path_request(cwd, context)
+
+    decisions = [evaluate_path_request(path, context) for path in inferred_paths]
+    worst = max(decisions, key=lambda item: _decision_rank(item.decision))
+    blockers = tuple(dict.fromkeys(blocker for item in decisions for blocker in item.blockers))
+    warnings = tuple(dict.fromkeys(warning for item in decisions for warning in item.warnings))
+    message = (
+        "disk lifecycle command decision: "
+        f"{worst.decision.value}; inferred outputs="
+        + ",".join(inferred_paths)
+    )
+    return LifecycleDecision(
+        worst.decision,
+        worst.enforcement_mode,
+        worst.host_mode,
+        blockers,
+        warnings,
+        worst.classification,
+        worst.mount_identities,
+        message,
+    )
+
 def _escalate(base: Decision, mode: EnforcementMode) -> Decision:
     if mode == EnforcementMode.OFF:
         return Decision.ALLOW
@@ -439,6 +543,10 @@ def _escalate(base: Decision, mode: EnforcementMode) -> Decision:
     if mode == EnforcementMode.WARN and base in {Decision.BLOCK, Decision.REROUTE}:
         return Decision.WARN
     return base
+
+
+def _has_complete_root_override(rollout: RolloutFlags) -> bool:
+    return all(str(value or "").strip() for value in (rollout.approval_id, rollout.owner, rollout.reason, rollout.remove_by))
 
 
 def evaluate_path_request(path: str, context: LifecycleContext | None = None) -> LifecycleDecision:
@@ -482,8 +590,15 @@ def evaluate_path_request(path: str, context: LifecycleContext | None = None) ->
         TruthSurface.CRON_OUTPUT,
         TruthSurface.FINAL_EVIDENCE,
     }
+    root_override_requested = root_heavy and rollout.allow_root_override
+    root_override_complete = root_override_requested and _has_complete_root_override(rollout)
+    if root_override_complete:
+        blockers = [blocker for blocker in blockers if blocker != BlockerCode.ROOT_HEAVY_WORK.value]
     if root_heavy and (rollout.block_new_root_heavy or rollout.host_mode == HostMode.REQUIRED_HERMES_HOST):
-        blockers.append(BlockerCode.ROOT_HEAVY_WORK.value)
+        if root_override_complete:
+            warnings.append(BlockerCode.ROOT_HEAVY_WORK.value)
+        else:
+            blockers.append(BlockerCode.ROOT_HEAVY_WORK.value)
     elif root_heavy:
         warnings.append(BlockerCode.ROOT_HEAVY_WORK.value)
     if root_durable_truth and rollout.host_mode == HostMode.REQUIRED_HERMES_HOST:
@@ -491,9 +606,8 @@ def evaluate_path_request(path: str, context: LifecycleContext | None = None) ->
     elif root_durable_truth:
         warnings.append(BlockerCode.DATA_MOUNT_MISSING.value)
 
-    if classification.mount_role == MountRole.ROOT and classification.truth_surface == TruthSurface.REBUILDABLE and rollout.allow_root_override:
-        if not (rollout.approval_id and rollout.owner and rollout.reason and rollout.remove_by):
-            blockers.append(BlockerCode.UNAPPROVED_ROOT_OVERRIDE.value)
+    if root_override_requested and not root_override_complete:
+        blockers.append(BlockerCode.UNAPPROVED_ROOT_OVERRIDE.value)
 
     base = Decision.BLOCK if blockers else (Decision.WARN if warnings else Decision.ALLOW)
     decision = _escalate(base, rollout.mode)
