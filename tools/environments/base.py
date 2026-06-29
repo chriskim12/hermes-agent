@@ -104,9 +104,9 @@ def get_sandbox_dir() -> Path:
     """
     custom = os.getenv("TERMINAL_SANDBOX_DIR")
     if custom:
-        p = Path(custom)
+        p = Path(custom).expanduser().resolve(strict=False)
     else:
-        p = get_hermes_home() / "sandboxes"
+        p = (get_hermes_home() / "sandboxes").resolve(strict=False)
 
     decision = _evaluate_disk_lifecycle_path(
         str(p),
@@ -125,11 +125,12 @@ def get_sandbox_dir() -> Path:
             "Disk lifecycle policy blocked sandbox root "
             f"{p}: {', '.join(decision.blockers)}"
         )
-    if decision.warnings:
+    diagnostics = tuple(dict.fromkeys((*decision.blockers, *decision.warnings)))
+    if diagnostics:
         logger.warning(
             "Disk lifecycle warning for sandbox root %s: %s",
             p,
-            ", ".join(decision.warnings),
+            ", ".join(diagnostics),
         )
     p.mkdir(parents=True, exist_ok=True)
     return p

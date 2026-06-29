@@ -52,6 +52,7 @@ from hermes_disk_lifecycle import (
     LifecycleContext as DiskLifecycleContext,
     Surface as DiskLifecycleSurface,
     WorkKind as DiskLifecycleWorkKind,
+    evaluate_command_request as _evaluate_disk_lifecycle_command,
     evaluate_path_request as _evaluate_disk_lifecycle_path,
     evaluate_root_delta as _evaluate_disk_lifecycle_root_delta,
     parse_mountinfo as _parse_disk_lifecycle_mountinfo,
@@ -347,6 +348,10 @@ def _disk_lifecycle_mount_table() -> tuple[dict[str, Any], ...]:
     return tuple(dict(item) for item in _parse_disk_lifecycle_mountinfo(text))
 
 
+def _normalize_disk_lifecycle_root(value: str) -> str:
+    return str(Path(value).expanduser().resolve(strict=False))
+
+
 def _disk_lifecycle_context(*, surface: DiskLifecycleSurface, work_kind: DiskLifecycleWorkKind, path: str) -> DiskLifecycleContext:
     hermes_home = str(get_hermes_home())
     return DiskLifecycleContext(
@@ -355,7 +360,7 @@ def _disk_lifecycle_context(*, surface: DiskLifecycleSurface, work_kind: DiskLif
         cwd=path or os.getcwd(),
         data_root=os.getenv("HERMES_DISK_DATA_ROOT", "/mnt/hermes-data"),
         extra_root=os.getenv("HERMES_DISK_EXTRA_ROOT", "/mnt/hermes-extra"),
-        sandbox_root=os.getenv("TERMINAL_SANDBOX_DIR", str(Path(hermes_home) / "sandboxes")),
+        sandbox_root=_normalize_disk_lifecycle_root(os.getenv("TERMINAL_SANDBOX_DIR", str(Path(hermes_home) / "sandboxes"))),
         workspace_root=os.getenv("HERMES_WORKSPACE_ROOT") or os.getenv("GJC_WORKSPACE_ROOT", ""),
         cache_root=os.getenv("HERMES_CACHE_ROOT", ""),
         toolchain_root=os.getenv("HERMES_TOOLCHAIN_ROOT", ""),
@@ -370,12 +375,14 @@ def _disk_lifecycle_context(*, surface: DiskLifecycleSurface, work_kind: DiskLif
     )
 
 
-def _disk_lifecycle_preflight_path(path: str, *, background: bool, env_type: str) -> dict[str, Any] | None:
+def _disk_lifecycle_preflight_path(path: str, *, background: bool, env_type: str, command: str = "") -> dict[str, Any] | None:
     work_kind = DiskLifecycleWorkKind.HEAVY_WORK if background or env_type in {"docker", "singularity", "modal", "daytona"} else DiskLifecycleWorkKind.UNKNOWN
     surface = DiskLifecycleSurface.BACKGROUND if background else DiskLifecycleSurface.TERMINAL
-    decision = _evaluate_disk_lifecycle_path(
-        path,
-        _disk_lifecycle_context(surface=surface, work_kind=work_kind, path=path),
+    context = _disk_lifecycle_context(surface=surface, work_kind=work_kind, path=path)
+    decision = (
+        _evaluate_disk_lifecycle_command(command, path, context)
+        if command
+        else _evaluate_disk_lifecycle_path(path, context)
     )
     if decision.decision == DiskLifecycleDecision.BLOCK:
         return {
@@ -2161,6 +2168,7 @@ def terminal_tool(
         # every delegate_task child share one container; only task_ids with
         # a registered env override (RL benchmarks) get isolated sandboxes.
         effective_task_id = _resolve_container_task_id(task_id)
+        env: Any = None
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config. ``resolve_task_overrides``
@@ -2243,15 +2251,6 @@ def terminal_tool(
                     "status": "blocked"
                 }, ensure_ascii=False)
 
-        disk_lifecycle_note = _disk_lifecycle_preflight_path(workdir or cwd, background=background, env_type=env_type)
-        if disk_lifecycle_note and disk_lifecycle_note.get("status") == "blocked":
-            return json.dumps({
-                "output": "",
-                "exit_code": -1,
-                "error": disk_lifecycle_note["error"],
-                "status": "blocked",
-                "disk_lifecycle": disk_lifecycle_note["disk_lifecycle"],
-            }, ensure_ascii=False)
 
         # Start cleanup thread
         _start_cleanup_thread()
@@ -2276,6 +2275,16 @@ def terminal_tool(
                 needs_creation = False
             else:
                 needs_creation = True
+        preflight_cwd = _resolve_command_cwd(workdir=workdir, env=env, default_cwd=cwd)
+        disk_lifecycle_note = _disk_lifecycle_preflight_path(preflight_cwd, background=background, env_type=env_type, command=command)
+        if disk_lifecycle_note and disk_lifecycle_note.get("status") == "blocked":
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": disk_lifecycle_note["error"],
+                "status": "blocked",
+                "disk_lifecycle": disk_lifecycle_note["disk_lifecycle"],
+            }, ensure_ascii=False)
 
         if needs_creation:
             # Per-task lock: only one thread creates the sandbox, others wait

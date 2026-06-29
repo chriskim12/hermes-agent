@@ -194,11 +194,12 @@ def _enforce_cron_disk_lifecycle(path: Path) -> dict[str, Any]:
             "Disk lifecycle policy blocked cron output path "
             f"{path}: {', '.join(decision.blockers)}"
         )
-    if decision.warnings:
+    diagnostics = tuple(dict.fromkeys((*decision.blockers, *decision.warnings)))
+    if diagnostics:
         logger.warning(
             "Disk lifecycle warning for cron output path %s: %s",
             path,
-            ", ".join(decision.warnings),
+            ", ".join(diagnostics),
         )
     return decision.to_dict()
 

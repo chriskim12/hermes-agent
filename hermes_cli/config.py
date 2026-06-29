@@ -1088,6 +1088,20 @@ DEFAULT_CONFIG = {
         "disabled_toolsets": [],
     },
     
+    "disk_lifecycle": {
+        "mode": "observe",
+        "host_mode": "compatibility_host",
+        "block_new_root_heavy": False,
+        "post_run_root_delta": "observe",
+        "allow_root_override": False,
+        "mount_identity_required": False,
+        "data_root": "/mnt/hermes-data",
+        "extra_root": "/mnt/hermes-extra",
+        "sandbox_root": "",
+        "workspace_root": "",
+        "cache_root": "",
+        "toolchain_root": "",
+    },
     "terminal": {
         "backend": "local",
         "modal_mode": "auto",
