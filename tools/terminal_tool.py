@@ -353,26 +353,74 @@ def _normalize_disk_lifecycle_root(value: str) -> str:
 
 
 def _disk_lifecycle_context(*, surface: DiskLifecycleSurface, work_kind: DiskLifecycleWorkKind, path: str) -> DiskLifecycleContext:
-    hermes_home = str(get_hermes_home())
-    return DiskLifecycleContext(
-        active_profile=os.getenv("HERMES_PROFILE", "default"),
-        hermes_home=hermes_home,
-        cwd=path or os.getcwd(),
-        data_root=os.getenv("HERMES_DISK_DATA_ROOT", "/mnt/hermes-data"),
-        extra_root=os.getenv("HERMES_DISK_EXTRA_ROOT", "/mnt/hermes-extra"),
-        sandbox_root=_normalize_disk_lifecycle_root(os.getenv("TERMINAL_SANDBOX_DIR", str(Path(hermes_home) / "sandboxes"))),
-        workspace_root=os.getenv("HERMES_WORKSPACE_ROOT") or os.getenv("GJC_WORKSPACE_ROOT", ""),
-        cache_root=os.getenv("HERMES_CACHE_ROOT", ""),
-        toolchain_root=os.getenv("HERMES_TOOLCHAIN_ROOT", ""),
-        state_db_path=str(Path(hermes_home) / "state.db"),
-        logs_path=str(Path(hermes_home) / "logs"),
-        cron_output_path=str(Path(hermes_home) / "cron" / "output"),
-        surface=surface,
-        work_kind=work_kind,
-        rollout=_disk_lifecycle_rollout_flags_from_env(os.environ),
-        mount_table=_disk_lifecycle_mount_table(),
-        root_used_percent=_disk_lifecycle_root_used_percent(),
-    )
+    """Build disk lifecycle context from config-backed resolver, not env alone.
+
+    Disk lifecycle policy is stored in config.yaml. Environment variables are
+    only a runtime projection. Reading os.environ directly lets a live gateway
+    silently stay in observe mode after config says block, which turns the guard
+    into fake progress. Normal runtime therefore resolves the config-backed
+    context first and only falls back to raw env for early import/test cases.
+    """
+    if any(
+        key in os.environ
+        for key in {
+            "HERMES_DISK_LIFECYCLE_MODE",
+            "HERMES_DISK_HOST_MODE",
+            "HERMES_DISK_BLOCK_NEW_ROOT_HEAVY",
+            "HERMES_DISK_POST_RUN_ROOT_DELTA",
+            "HERMES_DISK_ALLOW_ROOT_OVERRIDE",
+            "HERMES_DISK_MOUNT_IDENTITY_REQUIRED",
+            "TERMINAL_SANDBOX_DIR",
+        }
+    ):
+        hermes_home = str(get_hermes_home())
+        return DiskLifecycleContext(
+            active_profile=os.getenv("HERMES_PROFILE", "default"),
+            hermes_home=hermes_home,
+            cwd=path or os.getcwd(),
+            data_root=os.getenv("HERMES_DISK_DATA_ROOT", "/mnt/hermes-data"),
+            extra_root=os.getenv("HERMES_DISK_EXTRA_ROOT", "/mnt/hermes-extra"),
+            sandbox_root=_normalize_disk_lifecycle_root(os.getenv("TERMINAL_SANDBOX_DIR", str(Path(hermes_home) / "sandboxes"))),
+            workspace_root=os.getenv("HERMES_WORKSPACE_ROOT") or os.getenv("GJC_WORKSPACE_ROOT", ""),
+            cache_root=os.getenv("HERMES_CACHE_ROOT", ""),
+            toolchain_root=os.getenv("HERMES_TOOLCHAIN_ROOT", ""),
+            state_db_path=str(Path(hermes_home) / "state.db"),
+            logs_path=str(Path(hermes_home) / "logs"),
+            cron_output_path=str(Path(hermes_home) / "cron" / "output"),
+            surface=surface,
+            work_kind=work_kind,
+            rollout=_disk_lifecycle_rollout_flags_from_env(os.environ),
+            mount_table=_disk_lifecycle_mount_table(),
+            root_used_percent=_disk_lifecycle_root_used_percent(),
+        )
+
+    try:
+        from dataclasses import replace
+        from hermes_cli.disk_lifecycle import build_context
+
+        base = build_context(surface=surface)
+        return replace(base, cwd=path or os.getcwd(), work_kind=work_kind)
+    except Exception:
+        hermes_home = str(get_hermes_home())
+        return DiskLifecycleContext(
+            active_profile=os.getenv("HERMES_PROFILE", "default"),
+            hermes_home=hermes_home,
+            cwd=path or os.getcwd(),
+            data_root=os.getenv("HERMES_DISK_DATA_ROOT", "/mnt/hermes-data"),
+            extra_root=os.getenv("HERMES_DISK_EXTRA_ROOT", "/mnt/hermes-extra"),
+            sandbox_root=_normalize_disk_lifecycle_root(os.getenv("TERMINAL_SANDBOX_DIR", str(Path(hermes_home) / "sandboxes"))),
+            workspace_root=os.getenv("HERMES_WORKSPACE_ROOT") or os.getenv("GJC_WORKSPACE_ROOT", ""),
+            cache_root=os.getenv("HERMES_CACHE_ROOT", ""),
+            toolchain_root=os.getenv("HERMES_TOOLCHAIN_ROOT", ""),
+            state_db_path=str(Path(hermes_home) / "state.db"),
+            logs_path=str(Path(hermes_home) / "logs"),
+            cron_output_path=str(Path(hermes_home) / "cron" / "output"),
+            surface=surface,
+            work_kind=work_kind,
+            rollout=_disk_lifecycle_rollout_flags_from_env(os.environ),
+            mount_table=_disk_lifecycle_mount_table(),
+            root_used_percent=_disk_lifecycle_root_used_percent(),
+        )
 
 
 def _disk_lifecycle_preflight_path(path: str, *, background: bool, env_type: str, command: str = "") -> dict[str, Any] | None:
@@ -401,7 +449,7 @@ def _disk_lifecycle_post_run_note(before_root_bytes: int | None) -> dict[str, An
     after_root_bytes = _disk_lifecycle_root_used_bytes()
     if after_root_bytes is None:
         return None
-    mode = _disk_lifecycle_rollout_flags_from_env(os.environ).post_run_root_delta
+    mode = _disk_lifecycle_context(surface=DiskLifecycleSurface.TERMINAL, work_kind=DiskLifecycleWorkKind.UNKNOWN, path=os.getcwd()).rollout.post_run_root_delta
     decision = _evaluate_disk_lifecycle_root_delta(before_root_bytes, after_root_bytes, mode=mode)
     if decision.decision in {DiskLifecycleDecision.WARN, DiskLifecycleDecision.OBSERVE, DiskLifecycleDecision.BLOCK}:
         return decision.to_dict()
