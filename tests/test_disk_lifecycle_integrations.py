@@ -237,17 +237,81 @@ def test_default_config_exposes_disk_lifecycle_settings():
     assert settings["extra_root"] == "/mnt/hermes-extra"
 
 
-def test_terminal_lifecycle_preflight_observes_by_default(monkeypatch):
+def test_terminal_lifecycle_preflight_uses_config_when_env_projection_missing(monkeypatch):
+    import hermes_cli.config as config_mod
     import tools.terminal_tool as terminal_tool
 
-    monkeypatch.delenv("HERMES_DISK_LIFECYCLE_MODE", raising=False)
-    note = terminal_tool._disk_lifecycle_preflight_path(
-        "/home/test/.hermes/profiles/default/sandboxes/build",
-        background=True,
-        env_type="local",
+    for key in [
+        "HERMES_DISK_LIFECYCLE_MODE",
+        "HERMES_DISK_HOST_MODE",
+        "HERMES_DISK_BLOCK_NEW_ROOT_HEAVY",
+        "HERMES_DISK_POST_RUN_ROOT_DELTA",
+        "HERMES_DISK_ALLOW_ROOT_OVERRIDE",
+        "HERMES_DISK_MOUNT_IDENTITY_REQUIRED",
+    ]:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(terminal_tool, "_disk_lifecycle_root_used_percent", lambda: 82.0)
+    monkeypatch.setattr(
+        config_mod,
+        "load_config_readonly",
+        lambda: {
+            "disk_lifecycle": {
+                "mode": "block",
+                "host_mode": "compatibility_host",
+                "block_new_root_heavy": True,
+                "post_run_root_delta": "warn",
+                "data_root": "/mnt/hermes-data",
+                "extra_root": "/mnt/hermes-extra",
+                "workspace_root": "/mnt/hermes-extra/workspaces/default",
+            }
+        },
     )
+
+    note = terminal_tool._disk_lifecycle_preflight_path(
+        "/home/ubuntu/repos/dailychingu",
+        background=False,
+        env_type="local",
+        command="npm install",
+    )
+
     assert note is not None
-    assert note["disk_lifecycle"]["decision"] == "observe"
+    assert note["status"] == "blocked"
+    assert note["disk_lifecycle"]["enforcement_mode"] == "block"
+    assert note["disk_lifecycle"]["classification"]["path"] == "/home/ubuntu/repos/dailychingu/node_modules"
+    assert "root_heavy_work" in note["disk_lifecycle"]["blockers"]
+
+
+def test_root_emergency_does_not_block_extra_workspace_reroute():
+    from hermes_disk_lifecycle import (
+        EnforcementMode,
+        LifecycleContext,
+        RolloutFlags,
+        Surface,
+        evaluate_command_request,
+        parse_mountinfo,
+    )
+
+    mount_table = parse_mountinfo(
+        "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n"
+        "2 0 8:32 / /mnt/hermes-extra rw - ext4 /dev/sdc rw\n"
+        "3 0 8:16 / /mnt/hermes-data rw - ext4 /dev/sdb rw\n"
+    )
+    ctx = LifecycleContext(
+        data_root="/mnt/hermes-data",
+        extra_root="/mnt/hermes-extra",
+        workspace_root="/mnt/hermes-extra/workspaces/default",
+        surface=Surface.TERMINAL,
+        rollout=RolloutFlags(mode=EnforcementMode.BLOCK, block_new_root_heavy=True),
+        mount_table=mount_table,
+        root_used_percent=98.0,
+    )
+
+    decision = evaluate_command_request("npm install", "/mnt/hermes-extra/workspaces/default/demo", ctx)
+
+    assert decision.allowed is True
+    assert decision.decision.value == "warn"
+    assert "root_above_emergency" in decision.warnings
+    assert "root_above_emergency" not in decision.blockers
 
 
 def test_cron_lifecycle_blocks_output_path_in_block_mode(monkeypatch, tmp_path):

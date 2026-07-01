@@ -573,15 +573,6 @@ def evaluate_path_request(path: str, context: LifecycleContext | None = None) ->
             if not extra_id.real_mount:
                 warnings.append(BlockerCode.EXTRA_MOUNT_MISSING.value)
 
-    root_used = context.root_used_percent
-    if root_used is not None:
-        if root_used >= context.thresholds.root_emergency_percent:
-            blockers.append(BlockerCode.ROOT_ABOVE_EMERGENCY.value)
-        elif root_used >= context.thresholds.root_block_percent:
-            blockers.append(BlockerCode.ROOT_ABOVE_BLOCK.value)
-        elif root_used >= context.thresholds.root_warn_percent:
-            warnings.append(BlockerCode.ROOT_ABOVE_WARN.value)
-
     root_heavy = classification.mount_role == MountRole.ROOT and classification.path_class in {PathClass.UNKNOWN_ROOT_MASS, PathClass.HEAVY_WORKBENCH, PathClass.REBUILDABLE_CACHE}
     root_durable_truth = classification.mount_role == MountRole.ROOT and classification.truth_surface in {
         TruthSurface.RUNTIME_STATE,
@@ -590,6 +581,21 @@ def evaluate_path_request(path: str, context: LifecycleContext | None = None) ->
         TruthSurface.CRON_OUTPUT,
         TruthSurface.FINAL_EVIDENCE,
     }
+    root_used = context.root_used_percent
+    if root_used is not None:
+        if root_used >= context.thresholds.root_emergency_percent:
+            if classification.mount_role == MountRole.ROOT:
+                blockers.append(BlockerCode.ROOT_ABOVE_EMERGENCY.value)
+            else:
+                warnings.append(BlockerCode.ROOT_ABOVE_EMERGENCY.value)
+        elif root_used >= context.thresholds.root_block_percent:
+            if classification.mount_role == MountRole.ROOT:
+                blockers.append(BlockerCode.ROOT_ABOVE_BLOCK.value)
+            else:
+                warnings.append(BlockerCode.ROOT_ABOVE_BLOCK.value)
+        elif root_used >= context.thresholds.root_warn_percent:
+            warnings.append(BlockerCode.ROOT_ABOVE_WARN.value)
+
     root_override_requested = root_heavy and rollout.allow_root_override
     root_override_complete = root_override_requested and _has_complete_root_override(rollout)
     if root_override_complete:
