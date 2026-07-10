@@ -203,4 +203,5 @@ def test_insane_provider_is_explicitly_selectable_but_not_auto_selected(monkeypa
 
     monkeypatch.setattr(web_tools, "_load_web_config", lambda: {})
     assert get_active_search_provider() is None
+    assert web_tools._get_backend() == "firecrawl"
     _reset_for_tests()

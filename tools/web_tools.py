@@ -220,6 +220,18 @@ def _list_registered_web_providers():
         return []
 
 
+def _provider_auto_selectable(provider) -> bool:
+    """Return whether a provider may participate in implicit fallback."""
+    probe = getattr(provider, "auto_selectable", None)
+    if not callable(probe):
+        return True
+    try:
+        return bool(probe())
+    except Exception as exc:  # noqa: BLE001 — a broken opt-in probe fails closed
+        logger.debug("web provider %r.auto_selectable() raised: %s", provider.name, exc)
+        return False
+
+
 def _get_backend() -> str:
     """Determine which web backend to use (shared fallback).
 
@@ -259,7 +271,7 @@ def _get_backend() -> str:
     # object already, so probe it directly rather than round-tripping through
     # _is_backend_available() (which would re-do the registry lookup).
     for provider in _list_registered_web_providers():
-        if provider.name in _LEGACY_WEB_BACKENDS:
+        if provider.name in _LEGACY_WEB_BACKENDS or not _provider_auto_selectable(provider):
             continue
         try:
             if provider.is_available():
