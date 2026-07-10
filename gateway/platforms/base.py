@@ -2915,6 +2915,22 @@ class BasePlatformAdapter(ABC):
     # property) so the stream consumer knows not to short-circuit.
     REQUIRES_EDIT_FINALIZE: bool = False
 
+    async def rename_chat(
+        self,
+        chat_id: str,
+        name: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Rename a chat, channel, or thread when the platform supports it.
+
+        ``metadata`` may provide platform-specific routing context such as a
+        thread identifier. The default implementation fails closed so callers
+        can use one capability surface without assuming every adapter supports
+        mutable chat names.
+        """
+        return SendResult(success=False, error="Not supported")
+
     async def create_handoff_thread(
         self,
         parent_chat_id: str,

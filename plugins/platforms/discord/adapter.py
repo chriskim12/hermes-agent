@@ -2308,6 +2308,50 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
+    async def rename_chat(
+        self,
+        chat_id: str,
+        name: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Rename a Discord thread or channel."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        if not isinstance(name, str):
+            return SendResult(success=False, error="Name must be text")
+        if not name.strip() or any(ord(char) < 32 or ord(char) == 127 for char in name):
+            return SendResult(success=False, error="Name must contain printable characters")
+        if len(name) > 100:
+            return SendResult(success=False, error="Name must be 100 characters or fewer")
+
+        target_id = metadata.get("thread_id") if metadata else None
+        target_id = target_id or chat_id
+        try:
+            channel = self._client.get_channel(int(target_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(target_id))
+            if not channel:
+                return SendResult(success=False, error=f"Channel or thread {target_id} not found")
+            edit = getattr(channel, "edit", None)
+            if not callable(edit):
+                return SendResult(success=False, error="Target cannot be renamed")
+            await edit(name=name)
+            return SendResult(
+                success=True,
+                message_id=str(target_id),
+                raw_response={"channel_id": str(target_id), "name": name},
+            )
+        except Exception as exc:
+            logger.error(
+                "[%s] Failed to rename Discord channel or thread %s: %s",
+                self.name,
+                target_id,
+                exc,
+                exc_info=True,
+            )
+            return SendResult(success=False, error=str(exc))
+
     @staticmethod
     def _is_length_overflow_error(err: Exception) -> bool:
         """True when a Discord edit/send failed because text exceeded 2,000.

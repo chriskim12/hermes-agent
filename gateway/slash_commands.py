@@ -3526,6 +3526,38 @@ class GatewaySlashCommandsMixin:
             else:
                 return t("gateway.title.current_no_title", session_id=session_id)
 
+    async def _handle_rename_command(self, event: MessageEvent) -> str:
+        """Handle /rename — rename the current platform thread or channel."""
+        source = event.source
+        name = event.get_command_args().strip()
+        if not name:
+            return "Usage: /rename <new thread or channel name>"
+
+        name = re.sub(r"[\x00-\x1f\x7f]", "", name).strip()
+        if not name:
+            return "Rename name is empty after removing control characters."
+        if len(name) > 100:
+            return "Rename name is too long; use 100 characters or fewer."
+
+        adapter = self.adapters.get(source.platform) if source.platform else None
+        if adapter is None:
+            return "This platform is not connected, so the chat cannot be renamed."
+
+        rename_chat = getattr(adapter, "rename_chat", None)
+        if not callable(rename_chat):
+            return "This platform does not support renaming chats."
+
+        metadata = {"thread_id": source.thread_id} if source.thread_id else None
+        try:
+            result = await rename_chat(source.chat_id, name, metadata=metadata)
+        except Exception:
+            logger.exception("Platform adapter raised while handling /rename")
+            return "Rename failed because the platform adapter returned an unexpected error."
+        if getattr(result, "success", False):
+            return f"Renamed this thread or channel to: **{name}**"
+        error = getattr(result, "error", None) or "unknown platform error"
+        return f"Rename failed: {error}"
+
     async def _handle_resume_command(self, event: MessageEvent) -> str:
         """Handle /resume command — list or switch to a previous session."""
         if not self._session_db:

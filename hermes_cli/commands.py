@@ -84,6 +84,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[N]"),
     CommandDef("title", "Set a title for the current session", "Session",
                args_hint="[name]"),
+    CommandDef("rename", "Rename the current messaging thread or channel", "Session",
+               args_hint="<name>", gateway_only=True),
     CommandDef("handoff", "Hand off this session to a messaging platform (Telegram, Discord, etc.)", "Session",
                args_hint="<platform>", cli_only=True),
     CommandDef("branch", "Branch the current session (explore a different path)", "Session",
@@ -1163,7 +1165,9 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug"})
+#   - rename: currently implemented by the Discord adapter; keep it reachable
+#     through /hermes on Slack without consuming a native slash slot.
+_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug", "rename"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
