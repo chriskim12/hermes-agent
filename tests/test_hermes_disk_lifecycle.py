@@ -283,3 +283,62 @@ def test_mountinfo_parser_extracts_device_and_mount_point():
     parsed = parse_mountinfo("26 22 8:1 / / rw,relatime - ext4 /dev/root rw\n27 22 8:2 / /mnt/hermes-extra rw - xfs /dev/extra rw")
     assert parsed[0]["mount_point"] == "/"
     assert parsed[1]["device_id"] == "8:2"
+
+
+def test_containerd_root_is_root_heavy_mass_not_control_plane():
+    # B/C classifier fix #2: /var/lib/containerd was misclassified CONTROL_PLANE,
+    # letting the largest runtime data-root growth escape enforcement.
+    ctx = _context(hermes_home="/home/ubuntu/.hermes")
+    for path in ("/var/lib/containerd", "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs"):
+        c = classify_path(path, ctx)
+        assert c.path_class == PathClass.UNKNOWN_ROOT_MASS, path
+        assert c.mount_role == MountRole.ROOT, path
+        assert BlockerCode.ROOT_HEAVY_WORK.value in c.blockers, path
+        assert c.path_class != PathClass.CONTROL_PLANE, path
+
+
+def test_docker_root_still_root_heavy_mass_regression():
+    # docker was already heavy; adding containerd must not regress it.
+    ctx = _context(hermes_home="/home/ubuntu/.hermes")
+    c = classify_path("/var/lib/docker/overlay2", ctx)
+    assert c.path_class == PathClass.UNKNOWN_ROOT_MASS
+    assert BlockerCode.ROOT_HEAVY_WORK.value in c.blockers
+
+
+def test_root_worktrees_are_root_heavy_mass_not_control_plane():
+    # B/C classifier fix #1: root-resident worktree trees were misrouted to
+    # CONTROL_PLANE, escaping workbench/enforcement classification.
+    ctx = _context(hermes_home="/home/ubuntu/.hermes")
+    for path in (
+        "/home/ubuntu/worktrees/dailychingu-dc087",
+        "/home/ubuntu/repos/.worktrees/oh-my-codex/task-owned-worktree-guard",
+    ):
+        c = classify_path(path, ctx)
+        assert c.path_class == PathClass.UNKNOWN_ROOT_MASS, path
+        assert BlockerCode.ROOT_HEAVY_WORK.value in c.blockers, path
+        assert c.path_class != PathClass.CONTROL_PLANE, path
+
+
+def test_hermes_home_worktrees_route_to_heavy_mass():
+    # A worktrees subtree under ~/.hermes should now be heavy mass, not control plane.
+    ctx = _context(hermes_home="/home/ubuntu/.hermes")
+    c = classify_path("/home/ubuntu/.hermes/worktrees/task-abc", ctx)
+    assert c.path_class == PathClass.UNKNOWN_ROOT_MASS
+    assert c.mount_role == MountRole.ROOT
+
+
+def test_heavy_name_additions_do_not_overmatch_control_paths():
+    # Over-match guard: containerd config and Git's linked-worktree metadata are
+    # control-plane paths, and filename substrings are not heavy components.
+    ctx = _context(hermes_home="/home/ubuntu/.hermes")
+    for path in (
+        "/etc/systemd/journald.conf.d",
+        "/etc/containerd/config.toml",
+        "/var/lib/postgresql",
+        "/home/ubuntu/repos/project/.git/worktrees/feature",
+        "/home/ubuntu/config/worktrees.yaml",
+        "/home/ubuntu/repos/containerd-notes.md",
+    ):
+        c = classify_path(path, ctx)
+        assert c.path_class == PathClass.CONTROL_PLANE, path
+        assert BlockerCode.ROOT_HEAVY_WORK.value not in c.blockers, path

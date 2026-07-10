@@ -308,6 +308,27 @@ def _parts(path: str) -> tuple[str, ...]:
     return tuple(part for part in PurePosixPath(path).parts if part not in {"/", ""})
 
 
+def _is_root_heavy_path(path: str) -> bool:
+    """Return whether ``path`` names rebuildable mass on the root disk.
+
+    Most heavy outputs have an unambiguous component name. Containerd is
+    location-sensitive because ``/etc/containerd`` is configuration while
+    ``/var/lib/containerd`` is the large runtime data root. Git's
+    ``.git/worktrees`` directory is metadata, unlike user-facing ``worktrees``
+    and ``.worktrees`` directories that contain complete checkouts.
+    """
+    parts = _parts(path)
+    if _HEAVY_NAMES & set(parts):
+        return True
+    if _under(path, "/var/lib/containerd"):
+        return True
+    return any(
+        part in {"worktrees", ".worktrees"}
+        and not (part == "worktrees" and index > 0 and parts[index - 1] == ".git")
+        for index, part in enumerate(parts)
+    )
+
+
 def _enum_value(enum: type[_StrEnum], value: Any, default: _StrEnum) -> _StrEnum:
     text = str(value or "").strip().lower().replace("-", "_")
     for item in enum:
@@ -440,14 +461,13 @@ def classify_path(path: str, context: LifecycleContext | None = None) -> PathCla
         parts = set(_parts(clean))
         if _DATA_NAMES & parts:
             return PathClassification(clean, PathClass.DURABLE_TRUTH, MountRole.ROOT, TruthSurface.RUNTIME_STATE)
-        if _HEAVY_NAMES & parts:
+        if _is_root_heavy_path(clean):
             return PathClassification(clean, PathClass.UNKNOWN_ROOT_MASS, MountRole.ROOT, TruthSurface.REBUILDABLE)
         return PathClassification(clean, PathClass.CONTROL_PLANE, MountRole.ROOT, TruthSurface.CONTROL_METADATA)
 
-    parts = set(_parts(clean))
     if clean.startswith("/tmp") or clean.startswith("/var/tmp"):
         return PathClassification(clean, PathClass.TEMPORARY, MountRole.ROOT, TruthSurface.TEMPORARY)
-    if _HEAVY_NAMES & parts:
+    if _is_root_heavy_path(clean):
         blockers.append(BlockerCode.ROOT_HEAVY_WORK.value)
         return PathClassification(clean, PathClass.UNKNOWN_ROOT_MASS, MountRole.ROOT, TruthSurface.REBUILDABLE, tuple(blockers))
     if clean.startswith("/"):
