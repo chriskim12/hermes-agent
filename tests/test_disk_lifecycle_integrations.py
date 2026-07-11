@@ -327,6 +327,51 @@ def test_cron_lifecycle_blocks_output_path_in_block_mode(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="Disk lifecycle policy blocked cron output path"):
         jobs.ensure_dirs()
 
+
+def test_cron_lifecycle_classifies_against_active_profile_store(monkeypatch, tmp_path):
+    """A profile-scoped cron store (via use_cron_store) must classify its own
+    output path as durable cron-output-under-hermes-home, not against the
+    frozen default-profile HERMES_DIR/OUTPUT_DIR module globals (#profile
+    cron lifecycle carry bug: dashboard's _call_cron_for_profile scopes
+    storage to a non-active profile's home via use_cron_store, but disk
+    lifecycle classification kept anchoring on the import-time default)."""
+    import cron.jobs as jobs
+
+    # Leave HERMES_DIR/OUTPUT_DIR pointed at an unrelated default-profile home
+    # so a bug that reads those globals instead of the active store would
+    # misclassify the profile's cron output as outside any known hermes_home
+    # (falling through to /tmp-temporary or root-heavy/unknown-mass) instead
+    # of recognizing it as durable truth under its own profile home.
+    monkeypatch.setattr(jobs, "HERMES_DIR", tmp_path / "default-home")
+    monkeypatch.setattr(jobs, "CRON_DIR", tmp_path / "default-home" / "cron")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", tmp_path / "default-home" / "cron" / "output")
+
+    profile_home = tmp_path / "profiles" / "coder"
+    with jobs.use_cron_store(profile_home):
+        decision = jobs._cron_disk_lifecycle_decision(profile_home / "cron" / "output")
+
+    assert decision.classification is not None
+    assert decision.classification.path_class.value == "durable_truth"
+    assert decision.classification.mount_role.value == "root"
+    assert "root_heavy_work" not in decision.blockers
+
+
+def test_cron_store_hermes_home_matches_output_dir(tmp_path):
+    """use_cron_store must scope hermes_home alongside cron_dir/output_dir so
+    downstream disk-lifecycle classification stays consistent with the active
+    profile, not just the storage paths."""
+    import cron.jobs as jobs
+
+    profile_home = tmp_path / "profiles" / "writer"
+    with jobs.use_cron_store(profile_home):
+        store = jobs._current_cron_store()
+        assert store.hermes_home == profile_home.resolve()
+        assert store.output_dir == profile_home.resolve() / "cron" / "output"
+
+    # Outside the context manager, the store reverts to the process default.
+    default_store = jobs._current_cron_store()
+    assert default_store.hermes_home == jobs.HERMES_DIR
+
 # Kanban closeout integration from the original local carry is intentionally
 # omitted in this port. Chris explicitly chose not to revive Kanban governance
 # core extensions; disk lifecycle stays on terminal/cron/read-only CLI surfaces.

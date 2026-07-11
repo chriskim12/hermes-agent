@@ -116,6 +116,7 @@ class _CronStorePaths:
     cron_dir: Path
     jobs_file: Path
     output_dir: Path
+    hermes_home: Path
 
 
 _cron_store_override: ContextVar[Optional[_CronStorePaths]] = ContextVar(
@@ -129,18 +130,20 @@ def _current_cron_store() -> _CronStorePaths:
     override = _cron_store_override.get()
     if override is not None:
         return override
-    return _CronStorePaths(CRON_DIR, JOBS_FILE, OUTPUT_DIR)
+    return _CronStorePaths(CRON_DIR, JOBS_FILE, OUTPUT_DIR, HERMES_DIR)
 
 
 @contextlib.contextmanager
 def use_cron_store(home: Union[str, Path]):
     """Route cron storage to ``home`` without mutating process globals."""
-    cron_dir = Path(home).expanduser().resolve() / "cron"
+    hermes_home = Path(home).expanduser().resolve()
+    cron_dir = hermes_home / "cron"
     token = _cron_store_override.set(
         _CronStorePaths(
             cron_dir=cron_dir,
             jobs_file=cron_dir / "jobs.json",
             output_dir=cron_dir / "output",
+            hermes_home=hermes_home,
         )
     )
     try:
@@ -332,12 +335,21 @@ def _disk_lifecycle_mount_table() -> tuple[dict[str, Any], ...]:
 
 
 def _cron_disk_lifecycle_decision(path: Path):
+    # Anchor classification on the ACTIVE cron store's home, not the
+    # module-level HERMES_DIR/OUTPUT_DIR frozen at import time. Callers that
+    # inspect/create jobs for a non-active profile (e.g. the dashboard's
+    # `_call_cron_for_profile`) scope storage with `use_cron_store(home)`;
+    # using the frozen default here would classify that profile's paths
+    # against the WRONG hermes_home, causing `classify_path` to miss the
+    # `_under(clean, context.hermes_home)` match and misclassify legitimate
+    # profile-scoped cron output as root-heavy/unknown mass.
+    store = _current_cron_store()
     return _evaluate_disk_lifecycle_path(
         str(path),
         DiskLifecycleContext(
             active_profile=os.getenv("HERMES_PROFILE", "default"),
-            hermes_home=str(HERMES_DIR),
-            cron_output_path=str(OUTPUT_DIR),
+            hermes_home=str(store.hermes_home),
+            cron_output_path=str(store.output_dir),
             surface=DiskLifecycleSurface.CRON,
             work_kind=DiskLifecycleWorkKind.DURABLE_EVIDENCE,
             rollout=_disk_lifecycle_rollout_flags_from_env(os.environ),

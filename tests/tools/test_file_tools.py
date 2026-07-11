@@ -494,11 +494,35 @@ class TestWindowsMsysPathResolution:
 # Tool result hint tests (#722)
 # ---------------------------------------------------------------------------
 
+def _bypass_protected_checkout_for_relative_path_tests():
+    """Authorize patch_tool mutations against this module's bare relative
+    paths (e.g. ``"foo.py"``), which resolve against ``os.getcwd()`` -- this
+    checkout -- landing squarely inside
+    ``tools/protected_checkout_policy.py``'s protected canonical root while
+    this repo's tests run on ``main`` (not a ``gjc/``/``wt/`` task branch).
+    Without this, the guard BLOCKs the mocked ``patch_replace`` call before
+    the hint-surfacing behavior under test ever runs. Point the policy's
+    config-driven registry at a root that cannot match any real path instead
+    of touching the production guard -- the same authorized-bypass shape
+    used by ``tests/tools/test_file_tools_protected_checkout_guard.py``.
+    """
+    return patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={
+            "protected_checkouts": {
+                "canonical_roots": ["/nonexistent-protected-checkout-root-for-tests"],
+                "allowed_worktree_prefixes": [],
+            }
+        },
+    )
+
+
 class TestPatchHints:
     """Patch tool should hint when old_string is not found."""
 
+    @_bypass_protected_checkout_for_relative_path_tests()
     @patch("tools.file_tools._get_file_ops")
-    def test_no_match_includes_hint(self, mock_get):
+    def test_no_match_includes_hint(self, mock_get, _mock_config):
         mock_ops = MagicMock()
         result_obj = MagicMock()
         result_obj.to_dict.return_value = {
@@ -514,8 +538,9 @@ class TestPatchHints:
         assert "_hint" in raw
         assert "read_file" in raw
 
+    @_bypass_protected_checkout_for_relative_path_tests()
     @patch("tools.file_tools._get_file_ops")
-    def test_success_no_hint(self, mock_get):
+    def test_success_no_hint(self, mock_get, _mock_config):
         mock_ops = MagicMock()
         result_obj = MagicMock()
         result_obj.to_dict.return_value = {"success": True, "diff": "--- a\n+++ b"}

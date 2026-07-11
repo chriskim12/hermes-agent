@@ -59,6 +59,33 @@ def _make_safe_tempdir(prefix: str) -> str:
     return tempfile.mkdtemp(prefix=prefix, dir=os.getcwd())
 
 
+def _bypass_protected_checkout_for_tests():
+    """Authorize write_file_tool/patch_tool mutations against this module's
+    ``_make_safe_tempdir`` fixtures (created under ``os.getcwd()``, i.e. this
+    checkout, to dodge a macOS ``/private/var`` symlink issue -- see
+    ``_make_safe_tempdir`` above).
+
+    That choice of directory means these fixture paths land squarely inside
+    ``tools/protected_checkout_policy.py``'s protected canonical root, and
+    this repo runs its own tests on ``main`` (not a ``gjc/``/``wt/`` task
+    branch), so the guard would otherwise BLOCK every mocked write before the
+    behavior under test ever runs. Point the policy's config-driven registry
+    at a root that cannot match any real path instead of touching the
+    production guard -- the same authorized-bypass shape already used by
+    ``tests/tools/test_file_tools_protected_checkout_guard.py``'s
+    ``allowed_worktree_dir``/``protected_canonical_dir`` fixtures.
+    """
+    return patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={
+            "protected_checkouts": {
+                "canonical_roots": ["/nonexistent-protected-checkout-root-for-tests"],
+                "allowed_worktree_prefixes": [],
+            }
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Device path blocking
 # ---------------------------------------------------------------------------
@@ -369,8 +396,11 @@ class TestFileDedup(unittest.TestCase):
         self._tmpfile = os.path.join(self._tmpdir, "dedup_test.txt")
         with open(self._tmpfile, "w") as f:
             f.write("line one\nline two\n")
+        self._checkout_patch = _bypass_protected_checkout_for_tests()
+        self._checkout_patch.start()
 
     def tearDown(self):
+        self._checkout_patch.stop()
         _read_tracker.clear()
         try:
             os.unlink(self._tmpfile)
@@ -837,8 +867,11 @@ class TestWriteInvalidatesDedup(unittest.TestCase):
         self._tmpfile = os.path.join(self._tmpdir, "write_dedup.txt")
         with open(self._tmpfile, "w") as f:
             f.write("original content\n")
+        self._checkout_patch = _bypass_protected_checkout_for_tests()
+        self._checkout_patch.start()
 
     def tearDown(self):
+        self._checkout_patch.stop()
         _read_tracker.clear()
         try:
             os.unlink(self._tmpfile)

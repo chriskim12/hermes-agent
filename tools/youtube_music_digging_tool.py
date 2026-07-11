@@ -408,6 +408,7 @@ def _run_google_setup(args: list[str], timeout: int = 60) -> subprocess.Complete
     return subprocess.run(
         [_skill_python(), str(script), *args],
         text=True,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=timeout,
@@ -459,7 +460,14 @@ def _remote_ytdlp_auth_args() -> str:
 
 
 def _run(args: list[str], timeout: int = 120) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, text=True, capture_output=True, timeout=timeout, check=False)
+    return subprocess.run(
+        args,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
 
 
 def _yt_error_text(exc: Exception) -> str:
